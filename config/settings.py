@@ -1,12 +1,24 @@
 import os
 from pathlib import Path
-from decouple import config, Csv
+from dotenv import load_dotenv, find_dotenv
+
+# Загружаем переменные из .env
+load_dotenv(find_dotenv())
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = config('SECRET_KEY')
-DEBUG = config('DEBUG', default=False, cast=bool)
-ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='', cast=Csv())
+# Базовые настройки Django
+SECRET_KEY = os.getenv('SECRET_KEY')
+if not SECRET_KEY:
+    raise ValueError("SECRET_KEY is not set in environment")
+
+DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
+
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS')
+if ALLOWED_HOSTS:
+    ALLOWED_HOSTS = [host.strip() for host in ALLOWED_HOSTS.split(',')]
+else:
+    ALLOWED_HOSTS = []
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -49,14 +61,18 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 ASGI_APPLICATION = 'config.asgi.application'
 
+# База данных
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': config('POSTGRES_DB'),
-        'USER': config('POSTGRES_USER'),
-        'PASSWORD': config('POSTGRES_PASSWORD'),
-        'HOST': config('POSTGRES_HOST'),
-        'PORT': config('POSTGRES_PORT'),
+        'NAME': os.getenv('POSTGRES_DB'),
+        'USER': os.getenv('POSTGRES_USER'),
+        'PASSWORD': os.getenv('POSTGRES_PASSWORD'),
+        'HOST': os.getenv('POSTGRES_HOST'),
+        'PORT': os.getenv('POSTGRES_PORT'),
+        'OPTIONS': {
+            'client_encoding': 'UTF8',
+        },
     }
 }
 
@@ -79,27 +95,23 @@ MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# Redis & Celery
-REDIS_URL = config('REDIS_URL')
-CELERY_BROKER_URL = config('CELERY_BROKER_URL')
-CELERY_RESULT_BACKEND = config('CELERY_RESULT_BACKEND')
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = TIME_ZONE
-
 # Qdrant
-QDRANT_URL = config('QDRANT_URL')
-QDRANT_API_KEY = config('QDRANT_API_KEY', default=None)
+QDRANT_URL = os.getenv('QDRANT_URL', 'http://localhost:6333')
+QDRANT_API_KEY = os.getenv('QDRANT_API_KEY', None)
 
-# Telegram Bot
-TELEGRAM_BOT_TOKEN = config('TELEGRAM_BOT_TOKEN')
+# Redis и Celery
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', REDIS_URL)
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', REDIS_URL)
+
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 
 # LLM API
-LLM_API_KEY = config('LLM_API_KEY')
-LLM_API_BASE_URL = config('LLM_API_BASE_URL')
-LLM_MODEL_NAME = config('LLM_MODEL_NAME')
-EMBEDDING_MODEL = config('EMBEDDING_MODEL', default='text-embedding-ada-002')
+LLM_API_KEY = os.getenv('LLM_API_KEY', '')
+LLM_API_BASE_URL = os.getenv('LLM_API_BASE_URL', 'https://api.openai.com/v1')
+LLM_MODEL_NAME = os.getenv('LLM_MODEL_NAME', 'gpt-3.5-turbo')
+EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'text-embedding-ada-002')
 
 # Logging
 LOGGING = {
