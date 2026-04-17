@@ -1,40 +1,36 @@
 import asyncio
 from datetime import datetime, timedelta
-from aiogram import Router, types
+from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 from django.utils import timezone
+from asgiref.sync import sync_to_async
 from core.models import Topic, Summary
 from core.services.summary_service import SummaryService
-
 from bot.utils import get_chat_context
-
 
 router = Router()
 summary_service = SummaryService()
 
 
 async def send_summary_response(message: Message, summary: Summary):
-    """Отправляет саммари пользователю"""
-    if summary:
-        text = (
-            f"📊 <b>Саммари за период {summary.period_start.date()} — {summary.period_end.date()}</b>\n\n"
-            f"{summary.content}"
-        )
-        # Если сообщение длинное, разбиваем на части
-        if len(text) > 4000:
-            for i in range(0, len(text), 4000):
-                await message.answer(text[i:i+4000], parse_mode="HTML")
-        else:
-            await message.answer(text, parse_mode="HTML")
+    text = (
+        f"📊 <b>Саммари за период {summary.period_start.date()} — {summary.period_end.date()}</b>\n\n"
+        f"{summary.content}"
+    )
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await message.answer(text[i:i+4000], parse_mode="HTML")
     else:
-        await message.answer("Не удалось сгенерировать саммари. Возможно, нет сообщений за этот период.")
+        await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("summary"))
-async def cmd_summary(message: Message, chat, topic):
-    """Обработчик команды /summary с параметрами"""
+async def cmd_summary(message: Message):
     chat, topic, db_user = await get_chat_context(message)
+    if not chat:
+        return
+
     args = message.text.split()
     if len(args) < 2:
         await message.answer(
@@ -46,21 +42,13 @@ async def cmd_summary(message: Message, chat, topic):
         )
         return
 
-    if not chat and not topic:
-        await message.answer("Эту команду нужно выполнять в группе или в теме форума.")
-        return
-
-    # Если чат есть, но темы нет, а это форум - просим указать тему
-    if chat and chat.is_forum and not topic and message.chat.type == "supergroup":
-        await message.answer("Пожалуйста, используйте команду внутри темы форума.")
-        return
-
+    # Определяем целевую тему
     target_topic = topic
     if not target_topic:
-        # Для обычной группы без тем создаём фиктивную тему? Лучше создать дефолтную тему
-        target_topic, _ = Topic.objects.get_or_create(
+        # Для обычной группы без тем создаём дефолтную тему с thread_id=0
+        target_topic, _ = await sync_to_async(Topic.objects.get_or_create)(
             chat=chat,
-            thread_id=0,  # общий чат
+            thread_id=0,
             defaults={'is_active': True}
         )
 
@@ -74,13 +62,11 @@ async def cmd_summary(message: Message, chat, topic):
         start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
     elif period == "week":
-        # Прошлая неделя (пн-вс)
         today = now.date()
         start_of_this_week = today - timedelta(days=today.weekday())
         start = datetime.combine(start_of_this_week - timedelta(days=7), datetime.min.time())
         end = start + timedelta(days=7)
     else:
-        # Пользовательский период
         if len(args) >= 3:
             try:
                 start = datetime.strptime(args[1], "%Y-%m-%d")
@@ -92,21 +78,23 @@ async def cmd_summary(message: Message, chat, topic):
             await message.answer("Укажите начальную и конечную дату: /summary 2025-01-01 2025-01-07")
             return
 
-    # Проверяем, нет ли уже готового саммари
-    existing = Summary.objects.filter(
+    # Проверяем существующее саммари
+    existing = await sync_to_async(Summary.objects.filter(
         topic=target_topic,
         period_start__date=start.date(),
         period_end__date=end.date()
-    ).first()
+    ).first)()
 
     if existing:
         await send_summary_response(message, existing)
         return
 
-    # Генерируем новое
     await message.answer("⏳ Генерирую саммари, это может занять некоторое время...")
     try:
         summary = await summary_service.generate_summary_for_period(target_topic, start, end)
-        await send_summary_response(message, summary)
+        if summary:
+            await send_summary_response(message, summary)
+        else:
+            await message.answer("Не удалось сгенерировать саммари. Возможно, нет сообщений за этот период.")
     except Exception as e:
         await message.answer(f"Ошибка при генерации саммари: {str(e)}")

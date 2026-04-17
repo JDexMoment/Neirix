@@ -13,7 +13,6 @@ class MeetingService:
         self.llm = LLMClient()
 
     async def extract_meeting_from_message(self, message: Message) -> Optional[Meeting]:
-        """Извлекает информацию о встрече из сообщения и сохраняет в БД"""
         meeting_data = await self.llm.extract_meeting_from_message(message.text)
         if not meeting_data:
             return None
@@ -26,7 +25,6 @@ class MeetingService:
                 start_at=start_at,
                 source_message=message
             )
-            # Добавляем участников (поиск по именам)
             participants = meeting_data.get('participants', [])
             for name in participants:
                 user = TelegramUser.objects.filter(full_name__icontains=name).first()
@@ -39,7 +37,6 @@ class MeetingService:
             return None
 
     def get_upcoming_meetings(self, hours_ahead: int = 24) -> list:
-        """Возвращает встречи в ближайшие N часов"""
         now = timezone.now()
         end_time = now + timedelta(hours=hours_ahead)
         return Meeting.objects.filter(
@@ -49,6 +46,5 @@ class MeetingService:
         ).select_related('topic').prefetch_related('participants')
 
     def mark_reminder_sent(self, meeting: Meeting) -> None:
-        """Отмечает, что напоминание отправлено"""
         meeting.reminder_sent = True
         meeting.save()

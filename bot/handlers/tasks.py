@@ -1,10 +1,10 @@
-from aiogram import Router, types, F
+from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from core.models import Task, TelegramUser
+from asgiref.sync import sync_to_async
+from core.models import Task
 from core.services.task_service import TaskService
-
 from bot.utils import get_chat_context
 
 router = Router()
@@ -18,8 +18,11 @@ def get_task_keyboard(task_id: int):
 
 
 @router.message(Command("task"))
-async def cmd_task(message: Message, db_user):
+async def cmd_task(message: Message):
     chat, topic, db_user = await get_chat_context(message)
+    if not chat:
+        return  # пользователь получил сообщение с инструкцией
+
     args = message.text.split(maxsplit=2)
     if len(args) < 2:
         await message.answer(
@@ -31,9 +34,15 @@ async def cmd_task(message: Message, db_user):
 
     subcommand = args[1].lower()
     if subcommand == "list":
-        tasks = task_service.get_user_tasks(db_user, status='open')
+        # Получаем задачи пользователя в рамках привязанного чата (или текущего)
+        tasks = await sync_to_async(task_service.get_user_tasks)(db_user, status='open')
+        # Дополнительно фильтруем по чату/теме, если находимся в группе
+        if chat:
+            tasks = [t for t in tasks if t.topic.chat_id == chat.id]
+            if topic:
+                tasks = [t for t in tasks if t.topic_id == topic.id]
         if not tasks:
-            await message.answer("У вас нет открытых задач. 🎉")
+            await message.answer("У вас нет открытых задач в этом чате. 🎉")
             return
         for i, task in enumerate(tasks, 1):
             due = f"до {task.due_date.strftime('%d.%m.%Y')}" if task.due_date else "без срока"
@@ -45,10 +54,15 @@ async def cmd_task(message: Message, db_user):
             return
         try:
             task_num = int(args[2]) - 1
-            tasks = list(task_service.get_user_tasks(db_user, status='open'))
+            # Получаем список задач аналогично list
+            tasks = await sync_to_async(task_service.get_user_tasks)(db_user, status='open')
+            if chat:
+                tasks = [t for t in tasks if t.topic.chat_id == chat.id]
+                if topic:
+                    tasks = [t for t in tasks if t.topic_id == topic.id]
             if 0 <= task_num < len(tasks):
                 task = tasks[task_num]
-                success = task_service.mark_task_done(task.id, db_user)
+                success = await sync_to_async(task_service.mark_task_done)(task.id, db_user)
                 if success:
                     await message.answer(f"Задача '{task.title}' отмечена выполненной. ✅")
                 else:
@@ -60,12 +74,15 @@ async def cmd_task(message: Message, db_user):
 
 
 @router.callback_query(F.data.startswith("task_done:"))
-async def callback_task_done(callback: CallbackQuery, db_user):
+async def callback_task_done(callback: CallbackQuery):
+    # Получаем пользователя и чат из callback (можно упростить, но нужно проверить права)
+    from core.models import TelegramUser
+    db_user = await sync_to_async(TelegramUser.objects.get)(telegram_id=callback.from_user.id)
     task_id = int(callback.data.split(":")[1])
-    success = task_service.mark_task_done(task_id, db_user)
+    success = await sync_to_async(task_service.mark_task_done)(task_id, db_user)
     if success:
         await callback.answer("Задача выполнена!")
-        await callback.message.edit_reply_markup(reply_markup=None)  # убираем кнопку
+        await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.reply("✅ Задача отмечена как выполненная.")
     else:
         await callback.answer("Ошибка: задача не найдена или нет прав.")

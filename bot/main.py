@@ -25,7 +25,8 @@ django.setup()
 
 
 # Импортируем роутеры из handlers
-from bot.handlers import summary, tasks, meetings, chat_link, chat_events
+from bot.handlers import summary, tasks, meetings, chat_link, chat_events, messages
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
 
     # Подключаем роутеры
+    dp.include_router(messages.router)
     dp.include_router(chat_events.router)
     dp.include_router(chat_link.router)
     dp.include_router(summary.router)

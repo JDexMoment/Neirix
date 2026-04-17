@@ -5,4 +5,6 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 
 app = Celery('Neirix')
 app.config_from_object('django.conf:settings', namespace='CELERY')
-app.autodiscover_tasks()
+
+# Явно указываем модули с задачами для автообнаружения
+app.autodiscover_tasks(['celery_app.tasks'])
