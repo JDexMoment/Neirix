@@ -7,6 +7,9 @@ from django.utils import timezone
 from core.models import Topic, Summary
 from core.services.summary_service import SummaryService
 
+from bot.utils import get_chat_context
+
+
 router = Router()
 summary_service = SummaryService()
 
@@ -31,6 +34,7 @@ async def send_summary_response(message: Message, summary: Summary):
 @router.message(Command("summary"))
 async def cmd_summary(message: Message, chat, topic):
     """Обработчик команды /summary с параметрами"""
+    chat, topic, db_user = await get_chat_context(message)
     args = message.text.split()
     if len(args) < 2:
         await message.answer(

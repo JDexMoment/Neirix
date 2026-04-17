@@ -1,22 +1,20 @@
-from aiogram import Router, types
+from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
-from core.services.meeting_service import MeetingService
+from django.utils import timezone
+from core.models import Meeting
+from bot.utils import get_chat_context
 
 router = Router()
-meeting_service = MeetingService()
 
 
 @router.message(Command("meetings"))
-async def cmd_meetings(message: Message, chat, topic):
-    """Показывает предстоящие встречи в этом чате/теме"""
+async def cmd_meetings(message: Message):
+    chat, topic, db_user = await get_chat_context(message)
     if not chat:
-        await message.answer("Эту команду нужно выполнять в группе.")
-        return
+        return  # пользователь уже получил сообщение с инструкцией
 
-    from core.models import Meeting
-    from django.utils import timezone
-
+    # Формируем фильтр для встреч
     filters = {'topic__chat': chat}
     if topic:
         filters['topic'] = topic

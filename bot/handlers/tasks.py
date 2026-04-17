@@ -5,6 +5,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from core.models import Task, TelegramUser
 from core.services.task_service import TaskService
 
+from bot.utils import get_chat_context
+
 router = Router()
 task_service = TaskService()
 
@@ -17,6 +19,7 @@ def get_task_keyboard(task_id: int):
 
 @router.message(Command("task"))
 async def cmd_task(message: Message, db_user):
+    chat, topic, db_user = await get_chat_context(message)
     args = message.text.split(maxsplit=2)
     if len(args) < 2:
         await message.answer(
