@@ -2,11 +2,12 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 from django.utils import timezone
+from asgiref.sync import sync_to_async
+from django.utils import timezone as dj_timezone
 from core.models import Meeting, Topic, TelegramUser, Message
 from core.utils.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
-
 
 class MeetingService:
     def __init__(self):
@@ -18,18 +19,23 @@ class MeetingService:
             return None
 
         try:
-            start_at = datetime.fromisoformat(meeting_data['start_at'])
-            meeting = Meeting.objects.create(
+            start_at = dj_timezone.make_aware(datetime.fromisoformat(meeting_data['start_at']))
+            # Создаём встречу через sync_to_async
+            meeting = await sync_to_async(Meeting.objects.create)(
                 title=meeting_data['title'],
                 topic=message.topic,
                 start_at=start_at,
                 source_message=message
             )
+            # Добавляем участников
             participants = meeting_data.get('participants', [])
             for name in participants:
-                user = TelegramUser.objects.filter(full_name__icontains=name).first()
+                # Поиск пользователя тоже асинхронно
+                user = await sync_to_async(
+                    lambda: TelegramUser.objects.filter(full_name__icontains=name).first()
+                )()
                 if user:
-                    meeting.participants.add(user)
+                    await sync_to_async(meeting.participants.add)(user)
             logger.info(f"Created meeting {meeting.id} from message {message.id}")
             return meeting
         except Exception as e:
@@ -47,4 +53,4 @@ class MeetingService:
 
     def mark_reminder_sent(self, meeting: Meeting) -> None:
         meeting.reminder_sent = True
-        meeting.save()
+        meeting.save()  

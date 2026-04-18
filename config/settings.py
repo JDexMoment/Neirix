@@ -96,23 +96,31 @@ MEDIA_ROOT = BASE_DIR / 'media'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Qdrant
-QDRANT_URL = os.getenv('QDRANT_URL', 'http://localhost:6333')
-QDRANT_API_KEY = os.getenv('QDRANT_API_KEY', None)
+QDRANT_URL = os.getenv('QDRANT_URL')
+QDRANT_API_KEY = os.getenv('QDRANT_API_KEY')
 
 # Redis и Celery
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', REDIS_URL)
-CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', REDIS_URL)
+REDIS_URL = os.getenv('REDIS_URL')
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND')
 CELERY_IMPORTS = ('celery_app.tasks',)
 
+CELERY_IMPORTS = (
+    'celery_app.tasks.process_messages',
+    'celery_app.tasks.generate_summary',
+    'celery_app.tasks.send_reminders',
+)
+
 # Telegram
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
 # LLM API
-LLM_API_KEY = os.getenv('LLM_API_KEY', '')
-LLM_API_BASE_URL = os.getenv('LLM_API_BASE_URL', 'https://api.openai.com/v1')
-LLM_MODEL_NAME = os.getenv('LLM_MODEL_NAME', 'gpt-3.5-turbo')
-EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'text-embedding-ada-002')
+LLM_API_KEY = os.getenv('LLM_API_KEY')
+LLM_API_BASE_URL = os.getenv('LLM_API_BASE_URL')
+LLM_MODEL_NAME = os.getenv('LLM_MODEL_NAME')
+EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL')
+EMBEDDING_API_KEY = os.getenv('EMBEDDING_API_KEY')
+EMBEDDING_API_URL = os.getenv('EMBEDDING_API_URL')
 
 # Logging
 LOGGING = {

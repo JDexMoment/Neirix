@@ -23,22 +23,28 @@ async def handle_text_message(message: Message):
             }
         )
 
-        # Получаем или создаём чат
         chat, _ = TelegramChat.objects.get_or_create(
-            chat_id=message.chat.id,
-            defaults={
-                'title': message.chat.title or '',
-                'type': message.chat.type,
-                'is_forum': getattr(message.chat, 'is_forum', False)
-            }
-        )
+        chat_id=message.chat.id,
+        defaults={
+            'title': message.chat.title or '',
+            'type': message.chat.type,
+            'is_forum': getattr(message.chat, 'is_forum', False) if message.chat.type != 'private' else False
+        }
+)
 
-        # Определяем тему, если это форум
+        # Определяем тему
         topic = None
         if chat.is_forum and message.message_thread_id:
             topic, _ = Topic.objects.get_or_create(
                 chat=chat,
                 thread_id=message.message_thread_id,
+                defaults={'is_active': True}
+            )
+        else:
+            # Для обычных групп создаём дефолтную тему с thread_id=0
+            topic, _ = Topic.objects.get_or_create(
+                chat=chat,
+                thread_id=0,
                 defaults={'is_active': True}
             )
 

@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import List, Optional
 from django.db.models import Q
 from django.utils import timezone
+from asgiref.sync import sync_to_async
 from core.models import Task, Topic, TelegramUser, Message
 from core.utils.llm_client import LLMClient
 
@@ -20,10 +21,12 @@ class TaskService:
             try:
                 assignee = None
                 if task_data.get('assignee'):
-                    assignee = TelegramUser.objects.filter(
-                        Q(username__iexact=task_data['assignee']) |
-                        Q(full_name__icontains=task_data['assignee'])
-                    ).first()
+                    assignee = await sync_to_async(
+                        lambda: TelegramUser.objects.filter(
+                            Q(username__iexact=task_data['assignee']) |
+                            Q(full_name__icontains=task_data['assignee'])
+                        ).first()
+                    )()
 
                 due_date = None
                 if task_data.get('due_date'):
@@ -32,7 +35,7 @@ class TaskService:
                     except ValueError:
                         pass
 
-                task = Task.objects.create(
+                task = await sync_to_async(Task.objects.create)(
                     title=task_data['title'],
                     description=task_data.get('description', ''),
                     topic=message.topic,

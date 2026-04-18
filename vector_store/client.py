@@ -17,8 +17,6 @@ logger = logging.getLogger(__name__)
 
 
 class VectorStoreClient:
-    """Клиент для работы с Qdrant"""
-
     COLLECTION_NAME = "telegram_messages"
 
     def __init__(self):
@@ -29,18 +27,15 @@ class VectorStoreClient:
         self._ensure_collection()
 
     def _ensure_collection(self):
-        """Создаёт коллекцию, если её нет"""
         collections = self.client.get_collections().collections
         exists = any(c.name == self.COLLECTION_NAME for c in collections)
         if not exists:
-            # Размерность вектора (1536 для text-embedding-ada-002)
-            vector_size = 1536
+            vector_size = 384
             self.client.create_collection(
                 collection_name=self.COLLECTION_NAME,
                 vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
                 on_disk_payload=True
             )
-            # Создаём индексы для фильтрации
             self.client.create_payload_index(
                 collection_name=self.COLLECTION_NAME,
                 field_name="chat_id",
@@ -58,13 +53,12 @@ class VectorStoreClient:
             )
             logger.info(f"Created collection '{self.COLLECTION_NAME}' with indexes")
 
-    async def upsert_message(
-            self,
-            message_id: int,
-            embedding: List[float],
-            payload: Dict[str, Any]
+    def upsert_message(
+        self,
+        message_id: int,
+        embedding: List[float],
+        payload: Dict[str, Any]
     ):
-        """Добавляет или обновляет вектор сообщения"""
         point = PointStruct(
             id=message_id,
             vector=embedding,
@@ -76,15 +70,14 @@ class VectorStoreClient:
         )
         logger.debug(f"Upserted message {message_id} to Qdrant")
 
-    async def search_similar(
-            self,
-            query_embedding: List[float],
-            chat_id: int,
-            topic_id: Optional[int] = None,
-            limit: int = 10,
-            time_range_days: Optional[int] = None
+    def search_similar(
+        self,
+        query_embedding: List[float],
+        chat_id: int,
+        topic_id: Optional[int] = None,
+        limit: int = 10,
+        time_range_days: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """Ищет похожие сообщения с фильтрацией"""
         must_conditions = [
             FieldCondition(key="chat_id", match=MatchValue(value=chat_id))
         ]

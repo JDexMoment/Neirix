@@ -38,13 +38,20 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
 
+    original_send = bot.send_message
+    async def logged_send(chat_id, text, **kwargs):
+        logger.info(f"Sending to {chat_id}: {text[:50]}")
+        return await original_send(chat_id, text, **kwargs)
+    bot.send_message = logged_send
+
     # Подключаем роутеры
-    dp.include_router(messages.router)
     dp.include_router(chat_events.router)
     dp.include_router(chat_link.router)
     dp.include_router(summary.router)
     dp.include_router(tasks.router)
     dp.include_router(meetings.router)
+    dp.include_router(messages.router)
+
 
     # Можно добавить простые команды /start и /help прямо здесь
     from aiogram.filters import Command

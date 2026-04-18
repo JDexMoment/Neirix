@@ -1,7 +1,9 @@
 import uuid
 from typing import Optional, Tuple
+import logging
 from core.models import TelegramChat, Topic, TelegramUser, UserRole
 
+logger = logging.getLogger(__name__)
 
 def get_chat_context_sync(
     telegram_user_id: int,
@@ -15,6 +17,7 @@ def get_chat_context_sync(
     message_thread_id: Optional[int] = None
 ) -> Tuple[Optional[TelegramChat], Optional[Topic], TelegramUser, Optional[str]]:
     """Синхронное определение контекста чата."""
+    logger.info(f"sync: user {telegram_user_id}, chat_type={chat_type}, chat_id={chat_id}")
     db_user, _ = TelegramUser.objects.get_or_create(
         telegram_id=telegram_user_id,
         defaults={
@@ -25,6 +28,7 @@ def get_chat_context_sync(
     )
 
     if chat_type in ["group", "supergroup"]:
+        logger.info("sync: group chat detected")
         chat, _ = TelegramChat.objects.get_or_create(
             chat_id=chat_id,
             defaults={
@@ -43,8 +47,10 @@ def get_chat_context_sync(
         return chat, topic, db_user, None
 
     else:
+        logger.info("sync: private chat")
         linked_roles = UserRole.objects.filter(user=db_user).select_related('chat')
         if not linked_roles.exists():
+            logger.warning("sync: no linked chats")
             error_msg = (
                 "У вас нет привязанных рабочих чатов.\n\n"
                 "Чтобы я мог работать с контекстом группы, выполните два шага:\n"
@@ -56,6 +62,7 @@ def get_chat_context_sync(
             return None, None, db_user, error_msg
 
         chat = linked_roles.first().chat
+        logger.info(f"sync: using linked chat {chat.id}")
         return chat, None, db_user, None
 
 

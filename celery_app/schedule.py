@@ -8,7 +8,7 @@ app.conf.beat_schedule = {
     },
     'send-meeting-reminders': {
         'task': 'celery_app.tasks.send_reminders.send_meeting_reminders',
-        'schedule': 300.0,  # каждые 5 минут
+        'schedule': 30.0,  # каждые 5 минут
     },
     'send-daily-task-reminders': {
         'task': 'celery_app.tasks.send_reminders.send_task_reminders',

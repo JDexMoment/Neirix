@@ -1,68 +1,51 @@
+import asyncio
 import json
 import logging
 from typing import List, Optional, Dict, Any
-from openai import AsyncOpenAI
+from gigachat import GigaChat
+from gigachat.models import Chat
+from sentence_transformers import SentenceTransformer
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
 
 class LLMClient:
-    """Асинхронный клиент для OpenAI-совместимого API"""
+    """Клиент: GigaChat для чата + локальная SentenceTransformer для эмбеддингов"""
 
     def __init__(self):
-        self.client = AsyncOpenAI(
-            api_key=settings.LLM_API_KEY,
-            base_url=settings.LLM_API_BASE_URL
+        self._chat_client = GigaChat(
+            credentials=settings.LLM_API_KEY,
+            scope="GIGACHAT_API_PERS",
+            model=settings.LLM_MODEL_NAME,
+            verify_ssl_certs=False,
         )
-        self.model = settings.LLM_MODEL_NAME
-        self.embedding_model = settings.EMBEDDING_MODEL
+        self._embed_model = SentenceTransformer(settings.EMBEDDING_MODEL)
+
+    async def _run_sync(self, func, *args, **kwargs):
+        return await asyncio.to_thread(func, *args, **kwargs)
 
     async def chat_completion(
-            self,
-            messages: List[Dict[str, str]],
-            model: Optional[str] = None,
-            temperature: float = 0.7,
-            max_tokens: int = 2000,
-            response_format: Optional[Dict[str, str]] = None
+        self,
+        messages: List[Dict[str, str]],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2000,
+        response_format: Optional[Dict[str, str]] = None,
     ) -> str:
-        """Отправляет запрос к LLM и возвращает текст ответа"""
-        try:
-            response = await self.client.chat.completions.create(
-                model=model or self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                response_format=response_format
-            )
-            content = response.choices[0].message.content
-            logger.debug(f"LLM response received, length={len(content)}")
-            return content
-        except Exception as e:
-            logger.error(f"LLM chat completion failed: {e}")
-            raise
+        # Прямая передача списка словарей в Chat
+        response = await self._run_sync(
+            self._chat_client.chat,
+            Chat(messages=messages)
+        )
+        return response.choices[0].message.content
 
     async def generate_embedding(self, text: str) -> List[float]:
-        """Генерирует эмбеддинг для переданного текста"""
-        try:
-            # Очищаем текст от лишних пробелов и обрезаем до разумной длины
-            text = text.strip()
-            if len(text) > 8000:
-                text = text[:8000]  # ограничение для многих моделей эмбеддингов
+        embedding = await self._run_sync(self._embed_model.encode, text)
+        return embedding.tolist()
 
-            response = await self.client.embeddings.create(
-                model=self.embedding_model,
-                input=text
-            )
-            embedding = response.data[0].embedding
-            logger.debug(f"Embedding generated, size={len(embedding)}")
-            return embedding
-        except Exception as e:
-            logger.error(f"Embedding generation failed: {e}")
-            raise
-
+    # ---------- Методы для извлечения сущностей ----------
     async def extract_tasks_from_message(self, message_text: str) -> List[Dict[str, Any]]:
-        """Извлекает задачи из текста сообщения через LLM"""
         prompt = f"""Проанализируй следующее сообщение из рабочего чата.
 Извлеки все задачи, которые были поставлены.
 Для каждой задачи укажи:
@@ -86,19 +69,12 @@ class LLMClient:
 
 Сообщение:
 {message_text}"""
-
         messages = [
             {"role": "system", "content": "Ты — помощник для извлечения задач из текста."},
             {"role": "user", "content": prompt}
         ]
-
         try:
-            response = await self.chat_completion(
-                messages=messages,
-                temperature=0.2,
-                max_tokens=1000,
-                response_format={"type": "json_object"}
-            )
+            response = await self.chat_completion(messages=messages)
             data = json.loads(response)
             return data.get("tasks", [])
         except json.JSONDecodeError:
@@ -109,7 +85,6 @@ class LLMClient:
             return []
 
     async def extract_meeting_from_message(self, message_text: str) -> Optional[Dict[str, Any]]:
-        """Извлекает информацию о встрече из сообщения"""
         prompt = f"""Проанализируй сообщение и определи, содержится ли в нём информация о запланированной встрече/созвоне.
 Если да, извлеки:
 - Название встречи
@@ -128,19 +103,12 @@ class LLMClient:
 
 Сообщение:
 {message_text}"""
-
         messages = [
             {"role": "system", "content": "Ты — помощник для извлечения информации о встречах."},
             {"role": "user", "content": prompt}
         ]
-
         try:
-            response = await self.chat_completion(
-                messages=messages,
-                temperature=0.2,
-                max_tokens=800,
-                response_format={"type": "json_object"}
-            )
+            response = await self.chat_completion(messages=messages)
             data = json.loads(response)
             return data.get("meeting")
         except Exception as e:
@@ -148,12 +116,11 @@ class LLMClient:
             return None
 
     async def generate_summary(
-            self,
-            messages_context: str,
-            tasks_context: str = "",
-            meetings_context: str = ""
+        self,
+        messages_context: str,
+        tasks_context: str = "",
+        meetings_context: str = ""
     ) -> str:
-        """Генерирует структурированное саммари рабочей переписки"""
         prompt = f"""Ты — помощник для создания саммари рабочих обсуждений.
 Проанализируй переписку за указанный период и создай структурированное саммари.
 
@@ -175,14 +142,8 @@ class LLMClient:
 
 Информация о встречах:
 {meetings_context if meetings_context else "Нет данных"}"""
-
         messages = [
             {"role": "system", "content": "Ты — профессиональный ассистент для создания итогов встреч."},
             {"role": "user", "content": prompt}
         ]
-
-        return await self.chat_completion(
-            messages=messages,
-            temperature=0.5,
-            max_tokens=2000
-        )
+        return await self.chat_completion(messages=messages)
