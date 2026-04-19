@@ -47,40 +47,40 @@ class LLMClient:
 
     # ---------- Методы для извлечения сущностей ----------
     async def extract_tasks_from_message(self, message_text: str) -> List[Dict[str, Any]]:
-        prompt = f"""Проанализируй следующее сообщение из рабочего чата.
-Извлеки все задачи, которые были поставлены.
-Для каждой задачи укажи:
-- Название задачи
-- Ответственного (username или имя, если упомянут)
-- Дедлайн (если указан, в формате YYYY-MM-DD)
-- Описание
+        prompt = f"""Проанализируй сообщение из рабочего чата. Извлеки все поставленные задачи.
+    Для каждой задачи определи:
+    - Название задачи (кратко)
+    - Ответственного (если указан через @username или слова "ответственный", "отв.", "assignee", "исполнитель" и т.п.)
+    - Дедлайн в формате YYYY-MM-DD (если указан)
+    - Описание (если есть)
 
-Если ничего не найдено, верни пустой массив.
-Ответ верни в формате JSON:
-{{
-  "tasks": [
+    Если ответственный не указан, оставь поле assignee пустым.
+    Если ничего не найдено, верни пустой список.
+
+    Ответ верни строго в JSON:
     {{
-      "title": "...",
-      "assignee": "...",
-      "due_date": "YYYY-MM-DD",
-      "description": "..."
+    "tasks": [
+        {{
+        "title": "...",
+        "assignee": "...",
+        "due_date": "YYYY-MM-DD",
+        "description": "..."
+        }}
+    ]
     }}
-  ]
-}}
 
-Сообщение:
-{message_text}"""
+    Сообщение:
+    {message_text}"""
         messages = [
-            {"role": "system", "content": "Ты — помощник для извлечения задач из текста."},
+            {"role": "system", "content": "Ты — помощник для извлечения задач. Возвращай только JSON."},
             {"role": "user", "content": prompt}
         ]
         try:
-            response = await self.chat_completion(messages=messages)
-            data = json.loads(response)
+            response = await self.chat_completion(messages=messages, temperature=0.1)
+            # Очищаем возможные markdown-обёртки
+            clean = response.strip().replace('```json', '').replace('```', '')
+            data = json.loads(clean)
             return data.get("tasks", [])
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse JSON from LLM task extraction")
-            return []
         except Exception as e:
             logger.error(f"Task extraction failed: {e}")
             return []

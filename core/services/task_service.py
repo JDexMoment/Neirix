@@ -21,10 +21,13 @@ class TaskService:
             try:
                 assignee = None
                 if task_data.get('assignee'):
+                    # Очищаем от @ и лишних пробелов
+                    clean_assignee = task_data['assignee'].lstrip('@').strip()
+                    # Ищем пользователя по username (без @) или по полному имени
                     assignee = await sync_to_async(
                         lambda: TelegramUser.objects.filter(
-                            Q(username__iexact=task_data['assignee']) |
-                            Q(full_name__icontains=task_data['assignee'])
+                            Q(username__iexact=clean_assignee) |
+                            Q(full_name__icontains=clean_assignee)
                         ).first()
                     )()
 
