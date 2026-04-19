@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import logging
 from typing import List, Optional, Dict, Any
@@ -84,32 +85,40 @@ class LLMClient:
             logger.error(f"Task extraction failed: {e}")
             return []
 
-    async def extract_meeting_from_message(self, message_text: str) -> Optional[Dict[str, Any]]:
-        prompt = f"""Проанализируй сообщение и определи, содержится ли в нём информация о запланированной встрече/созвоне.
-Если да, извлеки:
-- Название встречи
-- Дату и время начала (в формате ISO 8601: YYYY-MM-DDTHH:MM:SS)
-- Участников (список имён или username)
+    async def extract_meeting_from_message(self, message_text: str, current_context: str) -> Optional[Dict[str, Any]]:
+        # current_context содержит текущую дату и время сервера
+        prompt = f"""Сегодняшняя дата и время: {current_context}.
+    Проанализируй сообщение из рабочего чата. Определи, есть ли в нём информация о встрече/созвоне.
+    Если в тексте указано "завтра", "послезавтра", "в среду" и т.д., вычисли точную дату относительно сегодняшней.
+    Если точное время не указано, по умолчанию используй 09:00:00.
 
-Если встречи нет, верни null.
-Ответ верни в формате JSON:
-{{
-  "meeting": {{
-    "title": "...",
-    "start_at": "2025-01-15T14:30:00",
-    "participants": ["имя1", "имя2"]
-  }}
-}} или {{ "meeting": null }}
+    Извлеки:
+    - Название встречи
+    - Дата и время начала (в формате ISO 8601: YYYY-MM-DDTHH:MM:SS)
+    - Участники (список имен или @username)
 
-Сообщение:
-{message_text}"""
+    Если встречи нет, верни null.
+    Ответ верни строго в формате JSON:
+    {{
+    "meeting": {{
+        "title": "...",
+        "start_at": "YYYY-MM-DDTHH:MM:SS",
+        "participants": ["имя1", "@username"]
+    }}
+    }} или {{ "meeting": null }}
+
+    Сообщение:
+    {message_text}"""
+    
         messages = [
-            {"role": "system", "content": "Ты — помощник для извлечения информации о встречах."},
+            {"role": "system", "content": "Ты — помощник для извлечения информации о встречах. Используй текущий контекст времени для вычисления относительных дат."},
             {"role": "user", "content": prompt}
         ]
         try:
             response = await self.chat_completion(messages=messages)
-            data = json.loads(response)
+            # Очистка от markdown-блоков, если LLM их добавила
+            clean_json = response.strip().replace('```json', '').replace('```', '')
+            data = json.loads(clean_json)
             return data.get("meeting")
         except Exception as e:
             logger.error(f"Meeting extraction failed: {e}")
