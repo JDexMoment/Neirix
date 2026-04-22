@@ -1,15 +1,91 @@
 import logging
+from typing import List, Optional
+
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
-from django.utils import timezone
-from django.db.models import Q
 from asgiref.sync import sync_to_async
+from django.db.models import Q
+from django.utils import timezone
+
 from core.models import Meeting
 from bot.utils import get_chat_context
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+
+def _get_upcoming_meetings_for_private(db_user, chat=None) -> List[Meeting]:
+    """
+    Для лички:
+    - встречи, где пользователь указан участником
+    - плюс встречи привязанного чата, если chat есть
+    """
+    now = timezone.now()
+
+    query = Q(participants=db_user)
+    if chat is not None:
+        query |= Q(topic__chat=chat)
+
+    return list(
+        Meeting.objects.filter(
+            query,
+            start_at__gte=now,
+        )
+        .select_related("topic", "topic__chat")
+        .prefetch_related("participants")
+        .order_by("start_at", "id")
+        .distinct()
+    )
+
+
+def _get_upcoming_meetings_for_chat(chat, topic=None) -> List[Meeting]:
+    """
+    Для группы:
+    - встречи этого чата
+    - если команда вызвана внутри topic/thread, то только встречи этого topic
+    """
+    now = timezone.now()
+
+    filters = {
+        "topic__chat": chat,
+        "start_at__gte": now,
+    }
+    if topic is not None:
+        filters["topic"] = topic
+
+    return list(
+        Meeting.objects.filter(**filters)
+        .select_related("topic", "topic__chat")
+        .prefetch_related("participants")
+        .order_by("start_at", "id")
+        .distinct()
+    )
+
+
+def _format_participants(meeting: Meeting) -> str:
+    participants = list(meeting.participants.all())
+    if not participants:
+        return "Все участники"
+
+    names = []
+    for p in participants:
+        if p.username:
+            names.append(f"@{p.username}")
+        elif p.full_name:
+            names.append(p.full_name)
+        else:
+            names.append(f"id={p.id}")
+
+    return ", ".join(names)
+
+
+def _format_meeting_time(meeting: Meeting) -> str:
+    dt = meeting.start_at
+    if timezone.is_aware(dt):
+        dt = timezone.localtime(dt)
+    return dt.strftime("%d.%m.%Y %H:%M")
+
 
 @router.message(Command("meetings"))
 async def cmd_meetings(message: Message):
@@ -18,52 +94,31 @@ async def cmd_meetings(message: Message):
         await message.answer("Не удалось определить пользователя.")
         return
 
-    now = timezone.now()
-
     if message.chat.type == "private":
-        # Личка: встречи, где пользователь участник, плюс встречи привязанного чата
-        def fetch_func():
-            return list(
-                Meeting.objects.filter(
-                    Q(participants=db_user) | Q(topic__chat=chat),
-                    start_at__gte=now
-                )
-                .order_by('start_at')
-                .select_related('topic__chat')
-                .prefetch_related('participants')
-            )
-        header = "📅 Ваши встречи (личные и из чата):\n"
+        meetings = await sync_to_async(_get_upcoming_meetings_for_private)(db_user, chat)
+        header = "📅 Ваши встречи:"
     else:
-        # Группа: только встречи этого чата
-        def fetch_func():
-            return list(
-                Meeting.objects.filter(
-                    topic__chat=chat,
-                    start_at__gte=now
-                )
-                .order_by('start_at')
-                .prefetch_related('participants')
-            )
-        header = f"📅 Встречи чата {chat.title}:\n"
+        if not chat:
+            await message.answer("Не удалось определить чат.")
+            return
 
-    meetings = await sync_to_async(fetch_func)()
+        meetings = await sync_to_async(_get_upcoming_meetings_for_chat)(chat, topic)
+        header = f"📅 Встречи чата {chat.title}:"
 
     if not meetings:
         await message.answer("Нет предстоящих встреч.")
         return
 
-    lines = [header]
+    lines = [header, ""]
     for m in meetings:
-        p_list = []
-        for p in m.participants.all():
-            name = f"@{p.username}" if p.username else p.full_name
-            p_list.append(name)
-        mentions = ", ".join(p_list) if p_list else "Все участники"
-        local_time = timezone.localtime(m.start_at).strftime('%d.%m.%Y %H:%M')
+        mentions = _format_participants(m)
+        local_time = _format_meeting_time(m)
+        title = (m.title or "Без названия").strip()
+
         lines.append(
-            f"• {m.title}\n"
+            f"• {title}\n"
             f"  ⏰ {local_time}\n"
             f"  👥 {mentions}\n"
         )
 
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer("\n".join(lines))

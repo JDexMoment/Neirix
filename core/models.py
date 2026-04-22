@@ -84,7 +84,6 @@ class Task(models.Model):
     title = models.CharField(max_length=300)
     description = models.TextField(blank=True)
     topic = models.ForeignKey(Topic, on_delete=models.CASCADE)
-    assignee = models.ForeignKey(TelegramUser, on_delete=models.SET_NULL, null=True, blank=True)
     due_date = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, default='open', choices=[
         ('open', 'В работе'),
@@ -96,13 +95,24 @@ class Task(models.Model):
 
     class Meta:
         indexes = [
-            models.Index(fields=['assignee', 'status']),
             models.Index(fields=['topic', 'status']),
             models.Index(fields=['due_date', 'status']),
         ]
 
     def __str__(self):
         return self.title
+    
+
+class TaskAssignee(models.Model):
+    task = models.ForeignKey('Task', on_delete=models.CASCADE, related_name='assignees')
+    user = models.ForeignKey(TelegramUser, on_delete=models.CASCADE)
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('task', 'user')
+
+    def __str__(self):
+        return f"{self.user} -> {self.task}"
 
 
 class Meeting(models.Model):

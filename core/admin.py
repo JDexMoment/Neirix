@@ -1,7 +1,7 @@
 from django.contrib import admin
 from .models import (
     Department, TelegramChat, Topic, TelegramUser,
-    UserRole, Message, Task, Meeting, Summary
+    UserRole, Message, Task, Meeting, Summary, TaskAssignee
 )
 
 
@@ -46,12 +46,24 @@ class MessageAdmin(admin.ModelAdmin):
     date_hierarchy = 'timestamp'
 
 
+class TaskAssigneeInline(admin.TabularInline):
+    model = TaskAssignee
+    extra = 1
+
 @admin.register(Task)
 class TaskAdmin(admin.ModelAdmin):
-    list_display = ('title', 'topic', 'assignee', 'due_date', 'status', 'created_at')
+    list_display = ('title', 'topic', 'get_assignees', 'due_date', 'status', 'created_at')
     list_filter = ('status', 'topic')
-    search_fields = ('title', 'description', 'assignee__username')
+    search_fields = ('title', 'description')
     date_hierarchy = 'due_date'
+    inlines = [TaskAssigneeInline]
+
+    def get_assignees(self, obj):
+        assignees = obj.assignees.select_related('user').all()
+        if assignees:
+            return ", ".join([f"@{a.user.username}" if a.user.username else a.user.full_name for a in assignees])
+        return "—"
+    get_assignees.short_description = "Ответственные"
 
 
 @admin.register(Meeting)

@@ -1,11 +1,14 @@
 import logging
+from typing import List, Optional
+
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from asgiref.sync import sync_to_async
 from django.utils import timezone
-from core.models import Task
+
+from core.models import Task, TelegramUser
 from core.services.task_service import TaskService
 from bot.utils import get_chat_context
 
@@ -15,15 +18,67 @@ task_service = TaskService()
 
 
 def get_task_keyboard(task_id: int):
-    """Создаёт inline-клавиатуру с кнопкой 'Выполнено'."""
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Выполнено", callback_data=f"task_done:{task_id}")
     return builder.as_markup()
 
 
+def _get_open_tasks_for_private(db_user: TelegramUser) -> List[Task]:
+    return list(
+        Task.objects.filter(
+            assignees__user=db_user,
+            status="open",
+        )
+        .select_related("topic__chat")
+        .prefetch_related("assignees__user")
+        .order_by("due_date", "id")
+        .distinct()
+    )
+
+
+def _get_open_tasks_for_chat(chat, topic=None) -> List[Task]:
+    filters = {
+        "topic__chat": chat,
+        "status": "open",
+    }
+    if topic:
+        filters["topic"] = topic
+
+    return list(
+        Task.objects.filter(**filters)
+        .prefetch_related("assignees__user")
+        .order_by("due_date", "id")
+        .distinct()
+    )
+
+
+def _get_telegram_user_by_telegram_id(telegram_id: int) -> Optional[TelegramUser]:
+    return TelegramUser.objects.filter(telegram_id=telegram_id).first()
+
+
+def _format_due_date(task: Task) -> str:
+    if not task.due_date:
+        return "без срока"
+
+    dt = task.due_date
+    if timezone.is_aware(dt):
+        dt = timezone.localtime(dt)
+    return f"📅 до {dt.strftime('%d.%m.%Y')}"
+
+
+def _format_assignees(task: Task) -> str:
+    assignee_list = [a.user for a in task.assignees.all()]
+    if not assignee_list:
+        return "не назначен"
+
+    return ", ".join(
+        f"@{u.username}" if u.username else (u.full_name or f"id={u.id}")
+        for u in assignee_list
+    )
+
+
 @router.message(Command("task"))
 async def cmd_task(message: Message):
-    """Обработчик команд /task list и /task done <номер>."""
     chat, topic, db_user = await get_chat_context(message)
     if not db_user:
         await message.answer("Не удалось определить пользователя.")
@@ -41,114 +96,87 @@ async def cmd_task(message: Message):
     subcommand = args[1].lower()
 
     if subcommand == "list":
-        # Выбираем задачи в зависимости от типа чата
         if message.chat.type == "private":
-            # ЛС: только задачи, назначенные пользователю
-            get_tasks = sync_to_async(lambda: list(
-                Task.objects.filter(
-                    assignee=db_user,
-                    status='open'
-                ).select_related('topic__chat', 'assignee').order_by('due_date')
-            ))
-            tasks = await get_tasks()
-            header = "📋 Ваши задачи:\n"
+            tasks = await sync_to_async(_get_open_tasks_for_private)(db_user)
+            header = "📋 Ваши задачи:"
         else:
-            # Группа: все открытые задачи чата (и возможно темы)
-            filters = {
-                'topic__chat': chat,
-                'status': 'open'
-            }
-            if topic:
-                filters['topic'] = topic
-            get_tasks = sync_to_async(lambda: list(
-                Task.objects.filter(**filters)
-                .select_related('topic__chat', 'assignee')
-                .order_by('due_date')
-            ))
-            tasks = await get_tasks()
-            header = f"📋 Задачи чата {chat.title}:\n"
+            tasks = await sync_to_async(_get_open_tasks_for_chat)(chat, topic)
+            header = f"📋 Задачи чата {chat.title}:"
 
         if not tasks:
             await message.answer("Нет открытых задач.")
             return
 
-        lines = [header]
+        await message.answer(header)
+
         for i, task in enumerate(tasks, 1):
-            # Форматируем ответственного
-            assignee_str = f"@{task.assignee.username}" if task.assignee and task.assignee.username else (
-                task.assignee.full_name if task.assignee else "не назначен"
-            )
-            due_str = f"📅 до {timezone.localtime(task.due_date).strftime('%d.%m.%Y')}" if task.due_date else "без срока"
-            lines.append(
-                f"{i}. <b>{task.title}</b>\n"
-                f"   👤 {assignee_str}\n"
-                f"   {due_str}\n"
-            )
-            # Отправляем каждую задачу отдельным сообщением с кнопкой
+            assignee_str = _format_assignees(task)
+            due_str = _format_due_date(task)
+
             await message.answer(
                 f"{i}. <b>{task.title}</b>\n"
                 f"👤 {assignee_str}\n"
                 f"{due_str}",
                 parse_mode="HTML",
-                reply_markup=get_task_keyboard(task.id)
+                reply_markup=get_task_keyboard(task.id),
             )
-        # Если задач много, лучше отправлять по одной, как выше.
-        # Можно и одним сообщением, но тогда кнопка будет одна на все.
 
     elif subcommand == "done":
         if len(args) < 3:
             await message.answer("Укажите номер задачи: /task done 1")
             return
+
         try:
             task_num = int(args[2]) - 1
-            # Получаем тот же список, что и в list
-            if message.chat.type == "private":
-                get_tasks = sync_to_async(lambda: list(
-                    Task.objects.filter(
-                        assignee=db_user,
-                        status='open'
-                    ).select_related('topic__chat', 'assignee').order_by('due_date')
-                ))
-            else:
-                filters = {'topic__chat': chat, 'status': 'open'}
-                if topic:
-                    filters['topic'] = topic
-                get_tasks = sync_to_async(lambda: list(
-                    Task.objects.filter(**filters)
-                    .select_related('topic__chat', 'assignee')
-                    .order_by('due_date')
-                ))
-            tasks = await get_tasks()
-
-            if 0 <= task_num < len(tasks):
-                task = tasks[task_num]
-                success = await sync_to_async(task_service.mark_task_done)(task.id, db_user)
-                if success:
-                    await message.answer(f"✅ Задача '{task.title}' отмечена выполненной.")
-                else:
-                    await message.answer("❌ Не удалось отметить задачу.")
-            else:
-                await message.answer("Неверный номер задачи.")
         except ValueError:
             await message.answer("Номер задачи должен быть числом.")
+            return
+
+        if message.chat.type == "private":
+            tasks = await sync_to_async(_get_open_tasks_for_private)(db_user)
+        else:
+            tasks = await sync_to_async(_get_open_tasks_for_chat)(chat, topic)
+
+        if not (0 <= task_num < len(tasks)):
+            await message.answer("Неверный номер задачи.")
+            return
+
+        task = tasks[task_num]
+
+        # ВАЖНО: mark_task_done уже async, поэтому без sync_to_async
+        success = await task_service.mark_task_done(task.id, db_user)
+
+        if success:
+            await message.answer(f"✅ Задача '{task.title}' отмечена выполненной.")
+        else:
+            await message.answer("❌ Не удалось отметить задачу.")
+
     else:
         await message.answer("Неизвестная подкоманда. Используйте list или done.")
 
 
 @router.callback_query(F.data.startswith("task_done:"))
 async def callback_task_done(callback: CallbackQuery):
-    """Обработчик нажатия на кнопку 'Выполнено'."""
-    # Получаем пользователя из callback
-    from core.models import TelegramUser
-    db_user = await sync_to_async(TelegramUser.objects.get)(telegram_id=callback.from_user.id)
+    try:
+        task_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор задачи.", show_alert=True)
+        return
 
-    task_id = int(callback.data.split(":")[1])
-    success = await sync_to_async(task_service.mark_task_done)(task_id, db_user)
+    db_user = await sync_to_async(_get_telegram_user_by_telegram_id)(callback.from_user.id)
+    if not db_user:
+        await callback.answer("Пользователь не найден в базе.", show_alert=True)
+        return
+
+    # ВАЖНО: mark_task_done уже async, поэтому без sync_to_async
+    success = await task_service.mark_task_done(task_id, db_user)
 
     if success:
         await callback.answer("✅ Задача выполнена!")
-        # Убираем кнопку из сообщения
-        await callback.message.edit_reply_markup(reply_markup=None)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception as e:
+            logger.warning("Failed to remove task inline keyboard: %s", e)
         await callback.message.reply("✅ Задача отмечена как выполненная.")
     else:
-        await callback.answer("❌ Ошибка: задача не найдена или нет прав.")
+        await callback.answer("❌ Ошибка: задача не найдена или нет прав.", show_alert=True)
