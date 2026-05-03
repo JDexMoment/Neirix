@@ -17,6 +17,9 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+from aiogram.filters import Command
+from aiogram.types import Message
 from django.conf import settings
 
 # Настройка Django
@@ -30,6 +33,33 @@ from bot.middlewares.fsm_timeout import FSMTimeoutMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+async def set_bot_commands(bot: Bot):
+    """Регистрирует команды бота в меню Telegram."""
+
+    # Команды для всех чатов (и личных, и групповых)
+    commands = [
+        BotCommand(command="tasks", description="📋 Список открытых задач"),
+        BotCommand(command="meetings", description="📅 Предстоящие встречи"),
+        BotCommand(command="summary", description="📊 Саммари обсуждений"),
+        BotCommand(command="link_chat", description="🔗 Получить код привязки чата"),
+        BotCommand(command="help", description="📖 Справка по командам"),
+    ]
+
+    # Устанавливаем для личных чатов
+    await bot.set_my_commands(
+        commands=commands,
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+
+    # Устанавливаем для групповых чатов
+    await bot.set_my_commands(
+        commands=commands,
+        scope=BotCommandScopeAllGroupChats(),
+    )
+
+    # Дефолтный список (fallback)
+    await bot.set_my_commands(commands=commands)
 
 async def main():
     bot = Bot(
@@ -52,11 +82,6 @@ async def main():
     dp.include_router(tasks.router)
     dp.include_router(meetings.router)
     dp.include_router(messages.router)
-
-
-    # Можно добавить простые команды /start и /help прямо здесь
-    from aiogram.filters import Command
-    from aiogram.types import Message
 
     @dp.message(Command("start"))
     async def cmd_start(message: Message):
@@ -97,6 +122,7 @@ async def main():
 
     logger.info("Бот запущен")
     try:
+        await set_bot_commands(bot)
         await dp.start_polling(bot)
     finally:
         await bot.session.close()

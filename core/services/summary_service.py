@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, List
+import re
 
 from asgiref.sync import sync_to_async
 from django.utils import timezone
@@ -74,6 +75,12 @@ class SummaryService:
             logger.exception("Failed to generate summary for topic=%s", getattr(topic, "id", None))
             raise
 
+    def _is_bot_username(self, username: str) -> bool:
+        """Проверяет, является ли username ботом (заканчивается на _bot или Bot)."""
+        if not username:
+            return False
+        return bool(re.search(r'[_]?[Bb]ot$', username))
+
     def _get_messages_for_period(self, topic: Topic, period_start: datetime, period_end: datetime) -> List[Message]:
         return list(
             Message.objects.filter(
@@ -110,10 +117,38 @@ class SummaryService:
     def _format_messages_context(self, messages: List[Message]) -> str:
         lines = []
         for msg in messages:
-            author = msg.author.full_name or msg.author.username or str(msg.author.telegram_id)
-            time_str = timezone.localtime(msg.timestamp).strftime("%Y-%m-%d %H:%M") if timezone.is_aware(msg.timestamp) else msg.timestamp.strftime("%Y-%m-%d %H:%M")
-            lines.append(f"[{time_str}] {author}: {msg.text}")
+            # Пропускаем сообщения от ботов
+            author = msg.author
+            if hasattr(author, 'is_bot') and author.is_bot:
+                continue
+            if author.username and self._is_bot_username(author.username):
+                continue
+
+            name = author.full_name or author.username or str(author.telegram_id)
+            time_str = (
+                timezone.localtime(msg.timestamp).strftime("%Y-%m-%d %H:%M")
+                if timezone.is_aware(msg.timestamp)
+                else msg.timestamp.strftime("%Y-%m-%d %H:%M")
+            )
+            lines.append(f"[{time_str}] {name}: {msg.text}")
         return "\n".join(lines)
+
+    def _format_user_link(self, user) -> str:
+        """
+        Форматирует пользователя как ссылку.
+        Боты пропускаются (возвращается None).
+        """
+        if hasattr(user, 'is_bot') and user.is_bot:
+            return None
+        if user.username and self._is_bot_username(user.username):
+            return None
+
+        if user.username:
+            return f"@{user.username}"
+        elif user.full_name:
+            return f'<a href="tg://user?id={user.telegram_id}">{user.full_name}</a>'
+        else:
+            return f"id={user.telegram_id}"
 
     def _format_tasks_context(self, tasks: List[Task]) -> str:
         if not tasks:
@@ -126,7 +161,9 @@ class SummaryService:
                 user = getattr(assignee_link, "user", None)
                 if not user:
                     continue
-                assignee_names.append(user.full_name or (f"@{user.username}" if user.username else str(user.telegram_id)))
+                link = self._format_user_link(user)
+                if link:  # None означает что это бот — пропускаем
+                    assignee_names.append(link)
 
             assignee_str = ", ".join(assignee_names) if assignee_names else "не назначен"
             due_str = task.due_date.strftime("%Y-%m-%d") if task.due_date else "без срока"
@@ -150,10 +187,16 @@ class SummaryService:
         for meeting in meetings:
             participants = []
             for p in meeting.participants.all():
-                participants.append(p.full_name or (f"@{p.username}" if p.username else str(p.telegram_id)))
+                link = self._format_user_link(p)
+                if link:  # пропускаем ботов
+                    participants.append(link)
 
             participants_str = ", ".join(participants) if participants else "Все участники"
-            meeting_time = timezone.localtime(meeting.start_at).strftime("%Y-%m-%d %H:%M") if timezone.is_aware(meeting.start_at) else meeting.start_at.strftime("%Y-%m-%d %H:%M")
+            meeting_time = (
+                timezone.localtime(meeting.start_at).strftime("%Y-%m-%d %H:%M")
+                if timezone.is_aware(meeting.start_at)
+                else meeting.start_at.strftime("%Y-%m-%d %H:%M")
+            )
             lines.append(f"- {meeting.title} в {meeting_time} (участники: {participants_str})")
 
         return "\n".join(lines)
