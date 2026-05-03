@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Chat, User, Message
+from django.conf import settings
 
 @pytest.fixture
 def mock_bot():
@@ -42,3 +43,16 @@ def group_chat():
 @pytest.fixture
 def telegram_user():
     return User(id=999, is_bot=False, first_name="Test", username="testuser")
+
+import pytest
+from django.conf import settings
+
+@pytest.fixture(autouse=True)
+def use_test_database(monkeypatch):
+    test_db = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': ':memory:',
+        }
+    }
+    monkeypatch.setattr(settings, 'DATABASES', test_db)
