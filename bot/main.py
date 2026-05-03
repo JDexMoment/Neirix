@@ -26,7 +26,7 @@ django.setup()
 
 # Импортируем роутеры из handlers
 from bot.handlers import summary, tasks, meetings, chat_link, chat_events, messages
-
+from bot.middlewares.fsm_timeout import FSMTimeoutMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,6 +37,7 @@ async def main():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
     dp = Dispatcher(storage=MemoryStorage())
+    dp.message.middleware(FSMTimeoutMiddleware())
 
     original_send = bot.send_message
     async def logged_send(chat_id, text, **kwargs):
@@ -77,10 +78,21 @@ async def main():
     @dp.message(Command("help"))
     async def cmd_help(message: Message):
         await message.answer(
-            "/summary [today|yesterday|week|YYYY-MM-DD YYYY-MM-DD] — саммари переписки\n"
-            "/task list — список ваших задач\n"
-            "/task done &lt;номер&gt; — отметить задачу выполненной\n"
-            "/meetings — предстоящие встречи"
+            "📖 <b>Доступные команды:</b>\n\n"
+            "📋 <b>Задачи:</b>\n"
+            "/tasks — список открытых задач\n\n"
+            "📅 <b>Встречи:</b>\n"
+            "/meetings — список предстоящих встреч\n\n"
+            "📊 <b>Саммари:</b>\n"
+            "/summary today — саммари за сегодня\n"
+            "/summary yesterday — за вчера\n"
+            "/summary week — за прошлую неделю\n"
+            "/summary YYYY-MM-DD YYYY-MM-DD — за период\n\n"
+            "🔗 <b>Привязка:</b>\n"
+            "/link_chat — получить код привязки чата\n\n"
+            "💡 Задачи и встречи распознаются автоматически из сообщений.\n"
+            "Используйте кнопки под задачами и встречами для управления.",
+            parse_mode="HTML",
         )
 
     logger.info("Бот запущен")

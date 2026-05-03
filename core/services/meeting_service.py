@@ -133,6 +133,43 @@ class MeetingService:
             )
 
         return await sync_to_async(_query)()
+    
+    def _get_upcoming_meetings_for_private(db_user, chat=None) -> List[Meeting]:
+        now = timezone.now()
+        query = Q(participants=db_user)
+        if chat is not None:
+            query |= Q(topic__chat=chat)
+
+        return list(
+            Meeting.objects.filter(
+                query,
+                start_at__gte=now,
+                status='active',     
+            )
+            .select_related("topic", "topic__chat")
+            .prefetch_related("participants")
+            .order_by("start_at", "id")
+            .distinct()
+        )
+
+
+    def _get_upcoming_meetings_for_chat(chat, topic=None) -> List[Meeting]:
+        now = timezone.now()
+        filters = {
+            "topic__chat": chat,
+            "start_at__gte": now,
+            "status": "active",     
+        }
+        if topic is not None:
+            filters["topic"] = topic
+
+        return list(
+            Meeting.objects.filter(**filters)
+            .select_related("topic", "topic__chat")
+            .prefetch_related("participants")
+            .order_by("start_at", "id")
+            .distinct()
+        )
 
     async def mark_reminder_sent(self, meeting: Meeting) -> None:
         """
@@ -144,3 +181,42 @@ class MeetingService:
 
         await sync_to_async(_update)()
         logger.info("Meeting id=%s: reminder marked as sent", meeting.id)
+
+    async def cancel_meeting(self, meeting_id: int) -> bool:
+        def _cancel():
+            try:
+                meeting = Meeting.objects.get(id=meeting_id)
+                meeting.status = 'cancelled'
+                meeting.save(update_fields=['status'])
+                logger.info("Meeting id=%s cancelled", meeting_id)
+                return True
+            except Meeting.DoesNotExist:
+                logger.warning("cancel_meeting: meeting_id=%s not found", meeting_id)
+                return False
+
+        return await sync_to_async(_cancel)()
+
+    async def reschedule_meeting(self, meeting_id: int, new_start_at: datetime) -> Optional[Meeting]:
+        def _reschedule():
+            try:
+                meeting = Meeting.objects.get(id=meeting_id)
+                old_time = meeting.start_at
+                meeting.start_at = new_start_at
+                meeting.status = 'active'
+                meeting.save(update_fields=['start_at', 'status'])
+                logger.info(
+                    "Meeting id=%s rescheduled: %s -> %s",
+                    meeting_id, old_time, new_start_at,
+                )
+                return meeting
+            except Meeting.DoesNotExist:
+                logger.warning("reschedule_meeting: meeting_id=%s not found", meeting_id)
+                return None
+
+        return await sync_to_async(_reschedule)()
+
+    async def get_meeting_by_id(self, meeting_id: int) -> Optional[Meeting]:
+        def _get():
+            return Meeting.objects.filter(id=meeting_id).select_related('topic__chat').prefetch_related('participants').first()
+
+        return await sync_to_async(_get)()

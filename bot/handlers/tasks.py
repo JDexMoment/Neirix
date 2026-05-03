@@ -17,7 +17,7 @@ router = Router()
 task_service = TaskService()
 
 
-def get_task_keyboard(task_id: int):
+def _get_task_keyboard(task_id: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Выполнено", callback_data=f"task_done:{task_id}")
     return builder.as_markup()
@@ -59,7 +59,6 @@ def _get_telegram_user_by_telegram_id(telegram_id: int) -> Optional[TelegramUser
 def _format_due_date(task: Task) -> str:
     if not task.due_date:
         return "без срока"
-
     dt = task.due_date
     if timezone.is_aware(dt):
         dt = timezone.localtime(dt)
@@ -70,89 +69,43 @@ def _format_assignees(task: Task) -> str:
     assignee_list = [a.user for a in task.assignees.all()]
     if not assignee_list:
         return "не назначен"
-
     return ", ".join(
         f"@{u.username}" if u.username else (u.full_name or f"id={u.id}")
         for u in assignee_list
     )
 
 
-@router.message(Command("task"))
-async def cmd_task(message: Message):
+@router.message(Command("tasks"))
+async def cmd_tasks(message: Message):
     chat, topic, db_user = await get_chat_context(message)
     if not db_user:
         await message.answer("Не удалось определить пользователя.")
         return
 
-    args = message.text.split(maxsplit=2)
-    if len(args) < 2:
-        await message.answer(
-            "Используйте:\n"
-            "/task list — список задач\n"
-            "/task done <номер> — отметить задачу выполненной"
-        )
+    if message.chat.type == "private":
+        tasks = await sync_to_async(_get_open_tasks_for_private)(db_user)
+        header = "📋 Ваши задачи:"
+    else:
+        tasks = await sync_to_async(_get_open_tasks_for_chat)(chat, topic)
+        header = f"📋 Задачи чата {chat.title}:"
+
+    if not tasks:
+        await message.answer("Нет открытых задач.")
         return
 
-    subcommand = args[1].lower()
+    await message.answer(header)
 
-    if subcommand == "list":
-        if message.chat.type == "private":
-            tasks = await sync_to_async(_get_open_tasks_for_private)(db_user)
-            header = "📋 Ваши задачи:"
-        else:
-            tasks = await sync_to_async(_get_open_tasks_for_chat)(chat, topic)
-            header = f"📋 Задачи чата {chat.title}:"
+    for i, task in enumerate(tasks, 1):
+        assignee_str = _format_assignees(task)
+        due_str = _format_due_date(task)
 
-        if not tasks:
-            await message.answer("Нет открытых задач.")
-            return
-
-        await message.answer(header)
-
-        for i, task in enumerate(tasks, 1):
-            assignee_str = _format_assignees(task)
-            due_str = _format_due_date(task)
-
-            await message.answer(
-                f"{i}. <b>{task.title}</b>\n"
-                f"👤 {assignee_str}\n"
-                f"{due_str}",
-                parse_mode="HTML",
-                reply_markup=get_task_keyboard(task.id),
-            )
-
-    elif subcommand == "done":
-        if len(args) < 3:
-            await message.answer("Укажите номер задачи: /task done 1")
-            return
-
-        try:
-            task_num = int(args[2]) - 1
-        except ValueError:
-            await message.answer("Номер задачи должен быть числом.")
-            return
-
-        if message.chat.type == "private":
-            tasks = await sync_to_async(_get_open_tasks_for_private)(db_user)
-        else:
-            tasks = await sync_to_async(_get_open_tasks_for_chat)(chat, topic)
-
-        if not (0 <= task_num < len(tasks)):
-            await message.answer("Неверный номер задачи.")
-            return
-
-        task = tasks[task_num]
-
-        # ВАЖНО: mark_task_done уже async, поэтому без sync_to_async
-        success = await task_service.mark_task_done(task.id, db_user)
-
-        if success:
-            await message.answer(f"✅ Задача '{task.title}' отмечена выполненной.")
-        else:
-            await message.answer("❌ Не удалось отметить задачу.")
-
-    else:
-        await message.answer("Неизвестная подкоманда. Используйте list или done.")
+        await message.answer(
+            f"{i}. <b>{task.title}</b>\n"
+            f"👤 {assignee_str}\n"
+            f"{due_str}",
+            parse_mode="HTML",
+            reply_markup=_get_task_keyboard(task.id),
+        )
 
 
 @router.callback_query(F.data.startswith("task_done:"))
@@ -168,7 +121,6 @@ async def callback_task_done(callback: CallbackQuery):
         await callback.answer("Пользователь не найден в базе.", show_alert=True)
         return
 
-    # ВАЖНО: mark_task_done уже async, поэтому без sync_to_async
     success = await task_service.mark_task_done(task_id, db_user)
 
     if success:

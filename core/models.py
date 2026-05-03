@@ -116,6 +116,17 @@ class TaskAssignee(models.Model):
 
 
 class Meeting(models.Model):
+    STATUS_CHOICES = [
+        ('active', 'Активна'),
+        ('cancelled', 'Отменена'),
+        ('rescheduled', 'Перенесена'),
+    ]
+    status = models.CharField(
+        max_length=20,
+        default='active',
+        choices=STATUS_CHOICES,
+    )
+
     title = models.CharField(max_length=300)
     topic = models.ForeignKey(Topic, on_delete=models.CASCADE)
     start_at = models.DateTimeField()

@@ -69,13 +69,18 @@ async def test_meetings_private_with_meetings(
 
     await cmd_meetings(msg)
 
-    msg.answer.assert_called_once()
-    text = msg.answer.call_args[0][0] if msg.answer.call_args[0] else ""
-    assert "📅 Ваши встречи" in text
-    assert "Daily Standup" in text
-    assert "Sprint Review" in text
-    assert "@user1" in text
-    assert "User Two" in text
+    # 1 заголовок + 2 встречи (каждая отдельным сообщением с кнопками)
+    assert msg.answer.call_count == 3
+    texts = [
+        call.args[0] if call.args else call.kwargs.get("text", "")
+        for call in msg.answer.call_args_list
+    ]
+
+    assert "📅 Ваши встречи" in texts[0]
+    assert "Daily Standup" in texts[1]
+    assert "@user1" in texts[1]
+    assert "Sprint Review" in texts[2]
+    assert "User Two" in texts[2]
 
 
 @pytest.mark.asyncio
@@ -115,10 +120,15 @@ async def test_meetings_group_with_meetings(
 
     await cmd_meetings(msg)
 
-    msg.answer.assert_called_once()
-    text = msg.answer.call_args[0][0] if msg.answer.call_args[0] else ""
-    assert "📅 Встречи чата Test Group" in text
-    assert "Daily Standup" in text
+    assert msg.answer.call_count == 3
+    texts = [
+        call.args[0] if call.args else call.kwargs.get("text", "")
+        for call in msg.answer.call_args_list
+    ]
+
+    assert "📅 Встречи чата Test Group" in texts[0]
+    assert "Daily Standup" in texts[1]
+    assert "Sprint Review" in texts[2]
 
 
 @pytest.mark.asyncio
@@ -159,9 +169,16 @@ async def test_meetings_all_participants_shown(
 
     await cmd_meetings(msg)
 
-    msg.answer.assert_called_once()
-    text = msg.answer.call_args[0][0] if msg.answer.call_args[0] else ""
-    assert "Все участники" in text
+    # 1 заголовок + 1 встреча
+    assert msg.answer.call_count == 2
+    texts = [
+        call.args[0] if call.args else call.kwargs.get("text", "")
+        for call in msg.answer.call_args_list
+    ]
+
+    assert "📅 Встречи чата Test Group" in texts[0]
+    assert "General Meeting" in texts[1]
+    assert "Все участники" in texts[1]
 
 
 @pytest.mark.asyncio
