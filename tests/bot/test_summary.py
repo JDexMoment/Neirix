@@ -65,6 +65,12 @@ def mock_default_topic():
         mock.return_value = (topic, False)
         yield mock, topic
 
+def _texts(msg):
+    return " ".join(
+        c.args[0] if c.args else c.kwargs.get("text", "")
+        for c in msg.answer.call_args_list
+    )
+
 
 def _get_answer_texts(msg_mock) -> str:
     texts = []
@@ -467,3 +473,163 @@ async def test_summary_week_period_is_last_week(
             end = call_args[2]
             assert (end - start).days == 7
             assert start.weekday() == 0
+
+# ──────────────────────────────────────────────────────────────────
+# Жёсткие тесты
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_summary_html_in_content(
+    summary_message, mock_get_chat_context_summary,
+    mock_summary_service, mock_sync_summary, mock_existing_summary,
+):
+    from bot.handlers.summary import cmd_summary
+
+    summary_message.text = "/summary today"
+    mock_get_chat_context_summary.return_value = (
+        summary_message.chat, MagicMock(id=1), summary_message.from_user,
+    )
+    mock_existing_summary.return_value = None
+
+    s = MagicMock()
+    s.content = "<script>alert('xss')</script> & test <b>bold</b>"
+    s.period_start = datetime.now()
+    s.period_end = datetime.now() + timedelta(days=1)
+    mock_summary_service.generate_summary_for_period.return_value = s
+
+    try:
+        await cmd_summary(summary_message)
+    except Exception:
+        pytest.fail("HTML-спецсимволы в саммари не должны ломать бота")
+
+
+@pytest.mark.asyncio
+async def test_summary_empty_content(
+    summary_message, mock_get_chat_context_summary,
+    mock_summary_service, mock_sync_summary, mock_existing_summary,
+):
+    from bot.handlers.summary import cmd_summary
+
+    summary_message.text = "/summary today"
+    mock_get_chat_context_summary.return_value = (
+        summary_message.chat, MagicMock(id=1), summary_message.from_user,
+    )
+    mock_existing_summary.return_value = None
+
+    s = MagicMock()
+    s.content = ""
+    s.period_start = datetime.now()
+    s.period_end = datetime.now() + timedelta(days=1)
+    mock_summary_service.generate_summary_for_period.return_value = s
+
+    try:
+        await cmd_summary(summary_message)
+    except Exception:
+        pytest.fail("Пустое саммари не должно ломать бота")
+
+
+@pytest.mark.asyncio
+async def test_summary_unicode_content(
+    summary_message, mock_get_chat_context_summary,
+    mock_summary_service, mock_sync_summary, mock_existing_summary,
+):
+    from bot.handlers.summary import cmd_summary
+
+    summary_message.text = "/summary today"
+    mock_get_chat_context_summary.return_value = (
+        summary_message.chat, MagicMock(id=1), summary_message.from_user,
+    )
+    mock_existing_summary.return_value = None
+
+    s = MagicMock()
+    s.content = "Обсуждение 🔥💯 эмодзи и кириллица Ёё Щщ"
+    s.period_start = datetime.now()
+    s.period_end = datetime.now() + timedelta(days=1)
+    mock_summary_service.generate_summary_for_period.return_value = s
+
+    await cmd_summary(summary_message)
+
+    text = _get_answer_texts(summary_message)
+    assert "🔥" in text
+    assert "кириллица" in text
+
+
+@pytest.mark.asyncio
+async def test_summary_future_dates(
+    summary_message, mock_get_chat_context_summary,
+    mock_summary_service, mock_sync_summary, mock_existing_summary,
+):
+    from bot.handlers.summary import cmd_summary
+
+    summary_message.text = "/summary 2030-01-01 2030-12-31"
+    mock_get_chat_context_summary.return_value = (
+        summary_message.chat, MagicMock(id=1), summary_message.from_user,
+    )
+    mock_existing_summary.return_value = None
+    mock_summary_service.generate_summary_for_period.return_value = None
+
+    try:
+        await cmd_summary(summary_message)
+    except Exception:
+        pytest.fail("Будущие даты не должны ломать бота")
+
+
+@pytest.mark.asyncio
+async def test_summary_same_start_end_date(
+    summary_message, mock_get_chat_context_summary,
+    mock_summary_service, mock_sync_summary, mock_existing_summary,
+):
+    from bot.handlers.summary import cmd_summary
+
+    summary_message.text = "/summary 2025-06-01 2025-06-01"
+    mock_get_chat_context_summary.return_value = (
+        summary_message.chat, MagicMock(id=1), summary_message.from_user,
+    )
+    mock_existing_summary.return_value = None
+    mock_summary_service.generate_summary_for_period.return_value = None
+
+    try:
+        await cmd_summary(summary_message)
+    except Exception:
+        pytest.fail("Одинаковые даты не должны ломать бота")
+
+
+@pytest.mark.asyncio
+async def test_summary_very_old_dates(
+    summary_message, mock_get_chat_context_summary,
+    mock_summary_service, mock_sync_summary, mock_existing_summary,
+):
+    from bot.handlers.summary import cmd_summary
+
+    summary_message.text = "/summary 2000-01-01 2000-01-02"
+    mock_get_chat_context_summary.return_value = (
+        summary_message.chat, MagicMock(id=1), summary_message.from_user,
+    )
+    mock_existing_summary.return_value = None
+    mock_summary_service.generate_summary_for_period.return_value = None
+
+    try:
+        await cmd_summary(summary_message)
+    except Exception:
+        pytest.fail("Старые даты не должны ломать бота")
+
+
+@pytest.mark.asyncio
+async def test_summary_three_args_ignored(
+    summary_message, mock_get_chat_context_summary,
+    mock_summary_service, mock_sync_summary, mock_existing_summary,
+):
+    from bot.handlers.summary import cmd_summary
+
+    summary_message.text = "/summary 2025-01-01 2025-01-02 extra"
+    mock_get_chat_context_summary.return_value = (
+        summary_message.chat, MagicMock(id=1), summary_message.from_user,
+    )
+    mock_existing_summary.return_value = None
+    mock_summary_service.generate_summary_for_period.return_value = None
+
+    try:
+        await cmd_summary(summary_message)
+    except Exception:
+        pytest.fail("Лишние аргументы не должны ломать бота")

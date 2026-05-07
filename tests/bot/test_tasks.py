@@ -5,23 +5,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from tests.conftest import make_message
 
 
-def _make_mock_task(title, task_id, due_date=None, assignees=None):
+def _make_mock_task(key, title, task_id=1, due_date=None, assignees=None):
     task = MagicMock()
     task.id = task_id
     task.title = title
     task.due_date = due_date
     task.status = "open"
 
-    if assignees is None:
-        assignees = []
-
-    mock_assignee_links = []
-    for user in assignees:
+    links = []
+    for user in (assignees or []):
         link = MagicMock()
         link.user = user
-        mock_assignee_links.append(link)
-
-    task.assignees.all.return_value = mock_assignee_links
+        links.append(link)
+    task.assignees.all.return_value = links
     return task
 
 
@@ -39,15 +35,14 @@ def tasks_with_assignees():
     u2 = _make_mock_user(username=None, full_name="User Two")
     return [
         _make_mock_task(
-            "Сделать отчёт",
+            "report", "Сделать отчёт",
             task_id=1,
             due_date=datetime.now(dt_timezone.utc) + timedelta(days=2),
             assignees=[u1],
         ),
         _make_mock_task(
-            "Подготовить презентацию",
+            "pres", "Подготовить презентацию",
             task_id=2,
-            due_date=None,
             assignees=[u1, u2],
         ),
     ]
@@ -55,9 +50,7 @@ def tasks_with_assignees():
 
 @pytest.fixture
 def tasks_no_assignees():
-    return [
-        _make_mock_task("Общая задача", task_id=3, due_date=None, assignees=[]),
-    ]
+    return [_make_mock_task("common", "Общая задача", task_id=3)]
 
 
 @pytest.fixture
@@ -213,15 +206,13 @@ async def test_tasks_due_date_formatted(
     from bot.handlers.tasks import cmd_tasks
 
     task = _make_mock_task(
-        "Задача со сроком",
+        "dated", "Задача со сроком",
         task_id=10,
         due_date=datetime(2026, 5, 15, 12, 0, 0, tzinfo=dt_timezone.utc),
-        assignees=[],
     )
 
     msg = make_message(private_chat, telegram_user, "/tasks", now_dt)
-    mock_db_user = MagicMock()
-    mock_get_chat_context_tasks.return_value = (MagicMock(), None, mock_db_user)
+    mock_get_chat_context_tasks.return_value = (MagicMock(), None, MagicMock())
     _setup_sync_mock(mock_sync_tasks, [task])
 
     await cmd_tasks(msg)
@@ -239,11 +230,10 @@ async def test_tasks_no_due_date(
 ):
     from bot.handlers.tasks import cmd_tasks
 
-    task = _make_mock_task("Задача без срока", task_id=11, due_date=None, assignees=[])
+    task = _make_mock_task("nodate", "Задача без срока", task_id=11)
 
     msg = make_message(private_chat, telegram_user, "/tasks", now_dt)
-    mock_db_user = MagicMock()
-    mock_get_chat_context_tasks.return_value = (MagicMock(), None, mock_db_user)
+    mock_get_chat_context_tasks.return_value = (MagicMock(), None, MagicMock())
     _setup_sync_mock(mock_sync_tasks, [task])
 
     await cmd_tasks(msg)
@@ -325,3 +315,159 @@ async def test_task_done_user_not_found():
 
     callback.answer.assert_called_once()
     assert "не найден" in callback.answer.call_args[0][0].lower()
+
+# ──────────────────────────────────────────────────────────────────
+# Жёсткие тесты
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_tasks_very_long_title(
+    group_chat, telegram_user, now_dt,
+    mock_get_chat_context_tasks, mock_sync_tasks,
+):
+    from bot.handlers.tasks import cmd_tasks
+
+    long_title = "А" * 1000
+    task = _make_mock_task("long", long_title, task_id=1)
+
+    msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
+    mock_get_chat_context_tasks.return_value = (MagicMock(title="Chat"), None, MagicMock())
+    _setup_sync_mock(mock_sync_tasks, [task])
+
+    try:
+        await cmd_tasks(msg)
+    except Exception:
+        pytest.fail("Не должно падать на длинном title")
+
+
+@pytest.mark.asyncio
+async def test_tasks_special_chars_in_title(
+    group_chat, telegram_user, now_dt,
+    mock_get_chat_context_tasks, mock_sync_tasks,
+):
+    from bot.handlers.tasks import cmd_tasks
+
+    task = _make_mock_task(
+        "xss", "<script>alert('xss')</script> & <b>test</b>", task_id=1
+    )
+
+    msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
+    mock_get_chat_context_tasks.return_value = (MagicMock(title="Chat"), None, MagicMock())
+    _setup_sync_mock(mock_sync_tasks, [task])
+
+    try:
+        await cmd_tasks(msg)
+    except Exception:
+        pytest.fail("HTML-спецсимволы не должны ломать бота")
+
+
+@pytest.mark.asyncio
+async def test_tasks_many_assignees(
+    group_chat, telegram_user, now_dt,
+    mock_get_chat_context_tasks, mock_sync_tasks,
+):
+    from bot.handlers.tasks import cmd_tasks
+
+    users = [_make_mock_user(username=f"user{i}", user_id=i) for i in range(10)]
+    task = _make_mock_task("mass", "Массовая задача", task_id=1, assignees=users)
+
+    msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
+    mock_get_chat_context_tasks.return_value = (MagicMock(title="Chat"), None, MagicMock())
+    _setup_sync_mock(mock_sync_tasks, [task])
+
+    await cmd_tasks(msg)
+
+    texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
+    combined = " ".join(texts)
+    assert "@user0" in combined
+    assert "@user9" in combined
+
+
+@pytest.mark.asyncio
+async def test_tasks_assignee_no_username_no_fullname(
+    group_chat, telegram_user, now_dt,
+    mock_get_chat_context_tasks, mock_sync_tasks,
+):
+    from bot.handlers.tasks import cmd_tasks
+
+    user = MagicMock()
+    user.id = 42
+    user.username = None
+    user.full_name = None
+    task = _make_mock_task("noname", "Задача", task_id=1, assignees=[user])
+
+    msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
+    mock_get_chat_context_tasks.return_value = (MagicMock(title="Chat"), None, MagicMock())
+    _setup_sync_mock(mock_sync_tasks, [task])
+
+    try:
+        await cmd_tasks(msg)
+    except Exception:
+        pytest.fail("Не должно падать если у assignee нет username и full_name")
+
+
+@pytest.mark.asyncio
+async def test_tasks_due_date_in_past(
+    private_chat, telegram_user, now_dt,
+    mock_get_chat_context_tasks, mock_sync_tasks,
+):
+    from bot.handlers.tasks import cmd_tasks
+
+    past_date = datetime.now(dt_timezone.utc) - timedelta(days=30)
+    task = _make_mock_task("old", "Старая задача", task_id=1, due_date=past_date)
+
+    msg = make_message(private_chat, telegram_user, "/tasks", now_dt)
+    mock_get_chat_context_tasks.return_value = (MagicMock(), None, MagicMock())
+    _setup_sync_mock(mock_sync_tasks, [task])
+
+    await cmd_tasks(msg)
+
+    texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
+    combined = " ".join(texts)
+    assert "Старая задача" in combined
+
+
+@pytest.mark.asyncio
+async def test_tasks_empty_title_skipped(
+    group_chat, telegram_user, now_dt,
+    mock_get_chat_context_tasks, mock_sync_tasks,
+):
+    from bot.handlers.tasks import cmd_tasks
+
+    task_ok = _make_mock_task("ok", "Нормальная задача", task_id=1)
+    task_empty = _make_mock_task("empty", "", task_id=2)
+
+    msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
+    mock_get_chat_context_tasks.return_value = (MagicMock(title="Chat"), None, MagicMock())
+    _setup_sync_mock(mock_sync_tasks, [task_ok, task_empty])
+
+    await cmd_tasks(msg)
+    assert msg.answer.call_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_task_done_invalid_callback_data():
+    from bot.handlers.tasks import callback_task_done
+
+    callback = AsyncMock()
+    callback.data = "task_done:abc"
+    callback.answer = AsyncMock()
+
+    await callback_task_done(callback)
+
+    callback.answer.assert_called_once()
+    assert "некорректн" in callback.answer.call_args[0][0].lower()
+
+
+@pytest.mark.asyncio
+async def test_task_done_empty_callback_data():
+    from bot.handlers.tasks import callback_task_done
+
+    callback = AsyncMock()
+    callback.data = "task_done:"
+    callback.answer = AsyncMock()
+
+    await callback_task_done(callback)
+
+    callback.answer.assert_called_once()

@@ -214,3 +214,199 @@ async def test_meetings_no_chat(
     msg.answer.assert_called_once()
     text = msg.answer.call_args[0][0] if msg.answer.call_args[0] else ""
     assert "Не удалось определить чат" in text
+
+# ──────────────────────────────────────────────────────────────────
+# Жёсткие тесты
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_meeting_empty_title(
+    group_chat, telegram_user, now_dt,
+    mock_get_chat_context_meetings, mock_sync_meetings,
+):
+    from bot.handlers.meetings import cmd_meetings
+
+    meeting = _make_mock_meeting("", hours_ahead=1)
+    msg = make_message(group_chat, telegram_user, "/meetings", now_dt)
+    mock_get_chat_context_meetings.return_value = (MagicMock(title="Chat"), None, MagicMock())
+    _setup_sync_mock(mock_sync_meetings, [meeting])
+
+    await cmd_meetings(msg)
+
+    texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
+    combined = " ".join(texts)
+    assert "Без названия" in combined
+
+
+@pytest.mark.asyncio
+async def test_meeting_html_in_title(
+    group_chat, telegram_user, now_dt,
+    mock_get_chat_context_meetings, mock_sync_meetings,
+):
+    from bot.handlers.meetings import cmd_meetings
+
+    meeting = _make_mock_meeting("<b>Injection</b> & <script>")
+    msg = make_message(group_chat, telegram_user, "/meetings", now_dt)
+    mock_get_chat_context_meetings.return_value = (MagicMock(title="Chat"), None, MagicMock())
+    _setup_sync_mock(mock_sync_meetings, [meeting])
+
+    try:
+        await cmd_meetings(msg)
+    except Exception:
+        pytest.fail("HTML в title не должен ломать бота")
+
+
+@pytest.mark.asyncio
+async def test_meeting_many_participants(
+    group_chat, telegram_user, now_dt,
+    mock_get_chat_context_meetings, mock_sync_meetings,
+):
+    from bot.handlers.meetings import cmd_meetings
+
+    participants = [_make_participant(username=f"user{i}", user_id=i) for i in range(20)]
+    meeting = _make_mock_meeting("Большая встреча", participants=participants)
+    msg = make_message(group_chat, telegram_user, "/meetings", now_dt)
+    mock_get_chat_context_meetings.return_value = (MagicMock(title="Chat"), None, MagicMock())
+    _setup_sync_mock(mock_sync_meetings, [meeting])
+
+    await cmd_meetings(msg)
+
+    texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
+    combined = " ".join(texts)
+    assert "@user0" in combined
+    assert "@user19" in combined
+
+
+@pytest.mark.asyncio
+async def test_meeting_participant_no_username_no_fullname(
+    group_chat, telegram_user, now_dt,
+    mock_get_chat_context_meetings, mock_sync_meetings,
+):
+    from bot.handlers.meetings import cmd_meetings
+
+    p = MagicMock()
+    p.id = 42
+    p.username = None
+    p.full_name = None
+    meeting = _make_mock_meeting("Тест", participants=[p])
+    msg = make_message(group_chat, telegram_user, "/meetings", now_dt)
+    mock_get_chat_context_meetings.return_value = (MagicMock(title="Chat"), None, MagicMock())
+    _setup_sync_mock(mock_sync_meetings, [meeting])
+
+    try:
+        await cmd_meetings(msg)
+    except Exception:
+        pytest.fail("Участник без данных не должен ломать бота")
+
+
+@pytest.mark.asyncio
+async def test_meeting_50_meetings(
+    group_chat, telegram_user, now_dt,
+    mock_get_chat_context_meetings, mock_sync_meetings,
+):
+    from bot.handlers.meetings import cmd_meetings
+
+    meetings = [_make_mock_meeting(f"Встреча {i}", hours_ahead=i) for i in range(1, 51)]
+    msg = make_message(group_chat, telegram_user, "/meetings", now_dt)
+    mock_get_chat_context_meetings.return_value = (MagicMock(title="Chat"), None, MagicMock())
+    _setup_sync_mock(mock_sync_meetings, meetings)
+
+    await cmd_meetings(msg)
+
+    assert msg.answer.call_count == 51
+
+
+@pytest.mark.asyncio
+async def test_meeting_cancel_nonexistent():
+    from bot.handlers.meetings import callback_meeting_cancel
+
+    callback = AsyncMock()
+    callback.data = "meeting_cancel:99999"
+    callback.answer = AsyncMock()
+    callback.message = AsyncMock()
+
+    with patch("bot.handlers.meetings.meeting_service") as mock_service:
+        mock_service.get_meeting_by_id = AsyncMock(return_value=None)
+        await callback_meeting_cancel(callback)
+
+    callback.answer.assert_called_once()
+    assert "не найдена" in callback.answer.call_args[0][0].lower()
+
+
+@pytest.mark.asyncio
+async def test_meeting_cancel_invalid_id():
+    from bot.handlers.meetings import callback_meeting_cancel
+
+    callback = AsyncMock()
+    callback.data = "meeting_cancel:abc"
+    callback.answer = AsyncMock()
+
+    await callback_meeting_cancel(callback)
+
+    callback.answer.assert_called_once()
+    assert "некорректн" in callback.answer.call_args[0][0].lower()
+
+
+@pytest.mark.asyncio
+async def test_reschedule_past_date(
+    group_chat, telegram_user, now_dt,
+):
+    from bot.handlers.meetings import process_reschedule_datetime
+    from aiogram.fsm.context import FSMContext
+
+    msg = make_message(group_chat, telegram_user, "01.01.2020 10:00", now_dt)
+
+    state = AsyncMock(spec=FSMContext)
+    state.get_data = AsyncMock(return_value={
+        "reschedule_meeting_id": 1,
+        "reschedule_meeting_title": "Test",
+    })
+
+    await process_reschedule_datetime(msg, state)
+
+    texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
+    combined = " ".join(texts).lower()
+    assert "будущем" in combined or "прошл" in combined
+
+
+@pytest.mark.asyncio
+async def test_reschedule_invalid_format(
+    group_chat, telegram_user, now_dt,
+):
+    from bot.handlers.meetings import process_reschedule_datetime
+    from aiogram.fsm.context import FSMContext
+
+    msg = make_message(group_chat, telegram_user, "какой-то текст", now_dt)
+
+    state = AsyncMock(spec=FSMContext)
+    state.get_data = AsyncMock(return_value={
+        "reschedule_meeting_id": 1,
+        "reschedule_meeting_title": "Test",
+    })
+
+    await process_reschedule_datetime(msg, state)
+
+    texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
+    combined = " ".join(texts).lower()
+    assert "распознать" in combined or "формат" in combined
+
+
+@pytest.mark.asyncio
+async def test_reschedule_cancel_text(
+    group_chat, telegram_user, now_dt,
+):
+    from bot.handlers.meetings import process_reschedule_datetime
+    from aiogram.fsm.context import FSMContext
+
+    msg = make_message(group_chat, telegram_user, "отмена", now_dt)
+
+    state = AsyncMock(spec=FSMContext)
+    state.clear = AsyncMock()
+
+    await process_reschedule_datetime(msg, state)
+
+    state.clear.assert_called_once()
+    texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
+    combined = " ".join(texts).lower()
+    assert "отмен" in combined
