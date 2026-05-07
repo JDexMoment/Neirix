@@ -16,6 +16,12 @@ from bot.utils import get_chat_context
 from core.models import Meeting
 from core.services.meeting_service import MeetingService
 
+from bot.keyboards.inline import (
+    meeting_keyboard,
+    meeting_cancel_confirm_keyboard,
+    meeting_reschedule_cancel_keyboard,
+)
+
 logger = logging.getLogger(__name__)
 router = Router()
 meeting_service = MeetingService()
@@ -87,23 +93,6 @@ def _format_meeting_time(meeting: Meeting) -> str:
         dt = timezone.localtime(dt)
     return dt.strftime("%d.%m.%Y %H:%M")
 
-
-def _get_meeting_keyboard(meeting_id: int):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📅 Перенести", callback_data=f"meeting_reschedule:{meeting_id}")
-    builder.button(text="❌ Отменить", callback_data=f"meeting_cancel:{meeting_id}")
-    builder.adjust(2)
-    return builder.as_markup()
-
-
-def _get_cancel_confirm_keyboard(meeting_id: int):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Да, отменить", callback_data=f"meeting_cancel_confirm:{meeting_id}")
-    builder.button(text="↩️ Нет, оставить", callback_data=f"meeting_cancel_abort:{meeting_id}")
-    builder.adjust(2)
-    return builder.as_markup()
-
-
 def _parse_user_datetime(text: str) -> Optional[datetime]:
     """
     Парсит дату/время из пользовательского ввода.
@@ -171,7 +160,7 @@ async def cmd_meetings(message: Message):
             f"  ⏰ {local_time}\n"
             f"  👥 {mentions}",
             parse_mode="HTML",
-            reply_markup=_get_meeting_keyboard(m.id),
+            reply_markup=meeting_keyboard(m.id),
         )
 
 
@@ -197,7 +186,7 @@ async def callback_meeting_cancel(callback: CallbackQuery):
     await callback.message.reply(
         f"Вы уверены, что хотите отменить встречу <b>{meeting.title}</b>?",
         parse_mode="HTML",
-        reply_markup=_get_cancel_confirm_keyboard(meeting_id),
+        reply_markup=meeting_cancel_confirm_keyboard(meeting_id),
     )
     await callback.answer()
 
@@ -235,12 +224,12 @@ async def callback_meeting_cancel_abort(callback: CallbackQuery):
         await callback.message.edit_text(
             callback.message.text + "\n\n↩️ Отмена отменена.",
             parse_mode="HTML",
-            reply_markup=_get_meeting_keyboard(meeting_id),
+            reply_markup=meeting_keyboard(meeting_id),
         )
     except Exception:
         await callback.message.reply(
             "↩️ Встреча оставлена без изменений.",
-            reply_markup=_get_meeting_keyboard(meeting_id),
+            reply_markup=meeting_keyboard(meeting_id),
         )
 
 
@@ -272,9 +261,6 @@ async def callback_meeting_reschedule(callback: CallbackQuery, state: FSMContext
 
     await callback.message.edit_reply_markup(reply_markup=None)
 
-    cancel_builder = InlineKeyboardBuilder()
-    cancel_builder.button(text="↩️ Отмена", callback_data="meeting_reschedule_cancel")
-
     await callback.message.reply(
         f"📅 Перенос встречи <b>{meeting.title}</b>\n\n"
         f"Текущее время: {_format_meeting_time(meeting)}\n\n"
@@ -283,7 +269,7 @@ async def callback_meeting_reschedule(callback: CallbackQuery, state: FSMContext
         f"Или напишите <b>отмена</b> для отмены переноса.\n\n"
         f"⏱ У вас есть 2 минуты на ответ.",
         parse_mode="HTML",
-        reply_markup=cancel_builder.as_markup(),
+        reply_markup=meeting_reschedule_cancel_keyboard(),
     )
     await callback.answer()
 

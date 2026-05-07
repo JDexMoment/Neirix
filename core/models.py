@@ -92,6 +92,10 @@ class Task(models.Model):
     ])
     source_message = models.ForeignKey(Message, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Напоминание за сутки до дедлайна
+    daily_reminder_sent = models.BooleanField(default=False)
+    # Напоминание о просрочке 
+    overdue_reminder_sent = models.BooleanField(default=False)
 
     class Meta:
         indexes = [
@@ -101,6 +105,11 @@ class Task(models.Model):
 
     def __str__(self):
         return self.title
+    
+    def reset_reminders(self):
+        """Сбрасывает флаги напоминаний (при изменении дедлайна)."""
+        self.daily_reminder_sent = False
+        self.overdue_reminder_sent = False
     
 
 class TaskAssignee(models.Model):
@@ -121,6 +130,7 @@ class Meeting(models.Model):
         ('cancelled', 'Отменена'),
         ('rescheduled', 'Перенесена'),
     ]
+
     status = models.CharField(
         max_length=20,
         default='active',
@@ -130,12 +140,20 @@ class Meeting(models.Model):
     title = models.CharField(max_length=300)
     topic = models.ForeignKey(Topic, on_delete=models.CASCADE)
     start_at = models.DateTimeField()
-    reminder_sent = models.BooleanField(default=False)
     participants = models.ManyToManyField(TelegramUser, blank=True)
     source_message = models.ForeignKey(Message, on_delete=models.SET_NULL, null=True)
 
+    # Напоминание за час до встречи
+    reminder_sent = models.BooleanField(default=False)
+    # Напоминание за сутки до встречи
+    daily_reminder_sent = models.BooleanField(default=False)
+
     def __str__(self):
         return f"{self.title} at {self.start_at}"
+
+    def reset_reminders(self):
+        self.reminder_sent = False
+        self.daily_reminder_sent = False
 
 
 class Summary(models.Model):

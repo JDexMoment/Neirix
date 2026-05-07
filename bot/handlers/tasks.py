@@ -11,17 +11,11 @@ from django.utils import timezone
 from core.models import Task, TelegramUser
 from core.services.task_service import TaskService
 from bot.utils import get_chat_context
+from bot.keyboards.inline import task_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
 task_service = TaskService()
-
-
-def _get_task_keyboard(task_id: int):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Выполнено", callback_data=f"task_done:{task_id}")
-    return builder.as_markup()
-
 
 def _get_open_tasks_for_private(db_user: TelegramUser) -> List[Task]:
     return list(
@@ -104,7 +98,7 @@ async def cmd_tasks(message: Message):
             f"👤 {assignee_str}\n"
             f"{due_str}",
             parse_mode="HTML",
-            reply_markup=_get_task_keyboard(task.id),
+            reply_markup=task_keyboard(task.id),
         )
 
 

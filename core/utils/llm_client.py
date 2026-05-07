@@ -8,9 +8,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from django.conf import settings
-from gigachat import GigaChat
-from gigachat.models import Chat, Messages, MessagesRole
-from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -374,13 +371,27 @@ def _format_summary_sections(sections: List[Dict]) -> str:
 class LLMClient:
 
     def __init__(self):
-        self._chat_client = GigaChat(
-            credentials=settings.LLM_API_KEY,
-            scope="GIGACHAT_API_PERS",
-            model=settings.LLM_MODEL_NAME,
-            verify_ssl_certs=False,
-        )
-        self._embed_model = SentenceTransformer(settings.EMBEDDING_MODEL)
+        self._chat_client = None
+        self._embed_model = None
+
+    @property
+    def chat_client(self):
+        if self._chat_client is None:
+            from gigachat import GigaChat
+            self._chat_client = GigaChat(
+                credentials=settings.LLM_API_KEY,
+                scope="GIGACHAT_API_PERS",
+                model=settings.LLM_MODEL_NAME,
+                verify_ssl_certs=False,
+            )
+        return self._chat_client
+
+    @property
+    def embed_model(self):
+        if self._embed_model is None:
+            from sentence_transformers import SentenceTransformer
+            self._embed_model = SentenceTransformer(settings.EMBEDDING_MODEL)
+        return self._embed_model
 
     async def _run_sync(self, func, *args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
@@ -396,11 +407,14 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int = 2000,
     ) -> str:
+        from gigachat.models import Chat, Messages, MessagesRole
+
         role_map = {
             "system": MessagesRole.SYSTEM,
             "assistant": MessagesRole.ASSISTANT,
             "user": MessagesRole.USER,
         }
+
         giga_messages = [
             Messages(
                 role=role_map.get(m.get("role", "user"), MessagesRole.USER),
@@ -417,19 +431,15 @@ class LLMClient:
         if model:
             chat_kwargs["model"] = model
 
-        logger.debug("GigaChat request | temp=%.2f | max_tokens=%d", temperature, max_tokens)
-
-        response = await self._run_sync(self._chat_client.chat, Chat(**chat_kwargs))
-        content = response.choices[0].message.content
-        logger.debug("GigaChat response (300): %s", content[:300])
-        return content
+        response = await self._run_sync(self.chat_client.chat, Chat(**chat_kwargs))
+        return response.choices[0].message.content
 
     # ──────────────────────────────────────────────────────────────────────
     # generate_embedding
     # ──────────────────────────────────────────────────────────────────────
 
     async def generate_embedding(self, text: str) -> List[float]:
-        embedding = await self._run_sync(self._embed_model.encode, text)
+        embedding = await self._run_sync(self.embed_model.encode, text)
         return embedding.tolist()
 
     # ──────────────────────────────────────────────────────────────────────
