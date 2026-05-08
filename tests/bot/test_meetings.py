@@ -1,5 +1,6 @@
 import pytest
 from datetime import datetime, timedelta, timezone as dt_timezone
+from django.utils import timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.conftest import make_message
@@ -410,3 +411,398 @@ async def test_reschedule_cancel_text(
     texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
     combined = " ".join(texts).lower()
     assert "отмен" in combined
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCH MEETING EXTRACTION TESTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def mock_db_message_factory():
+    """Фабрика для создания мок-сообщений из БД."""
+
+    def _create(
+        msg_id: int,
+        text: str,
+        username: str = "testuser",
+        full_name: str = "Test User",
+        telegram_id: int = 12345,
+        chat_id: int = -100123,
+        thread_id: int = 0,
+        timestamp: datetime = None,
+    ):
+        if timestamp is None:
+            timestamp = timezone.now()
+
+        msg = MagicMock()
+        msg.id = msg_id
+        msg.text = text
+        msg.timestamp = timestamp
+        msg.is_processed = False
+        msg.save = MagicMock()
+
+        msg.author = MagicMock()
+        msg.author.username = username
+        msg.author.full_name = full_name
+        msg.author.telegram_id = telegram_id
+        msg.author.is_bot = False
+
+        msg.chat = MagicMock()
+        msg.chat.chat_id = chat_id
+
+        msg.topic = MagicMock()
+        msg.topic.thread_id = thread_id
+
+        return msg
+
+    return _create
+
+
+class TestBatchMeetingExtraction:
+    """Тесты для extract_meetings_from_messages_batch в MeetingService."""
+
+    @pytest.mark.asyncio
+    async def test_batch_empty_messages(self):
+        """Пустой список → пустой результат."""
+        from core.services.meeting_service import MeetingService
+
+        service = MeetingService(llm=MagicMock())
+        result = await service.extract_meetings_from_messages_batch([])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_batch_single_meeting(self, mock_db_message_factory):
+        """Одно сообщение в батче с встречей → встреча создана."""
+        from core.services.meeting_service import MeetingService
+
+        msg = mock_db_message_factory(
+            msg_id=1,
+            text="завтра в 10 встреча с заказчиком",
+            username="boss",
+        )
+
+        tomorrow = (timezone.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_meetings_from_messages = AsyncMock(
+            return_value=[
+                {
+                    "title": "встреча с заказчиком",
+                    "participants": [],
+                    "start_at": f"{tomorrow}T10:00:00",
+                    "description": "",
+                }
+            ]
+        )
+
+        with patch(
+            "core.services.meeting_service.sync_to_async",
+            side_effect=lambda f: AsyncMock(return_value=f()),
+        ):
+            with patch("core.services.meeting_service.Meeting") as MockMeeting:
+                mock_meeting_instance = MagicMock()
+                mock_meeting_instance.id = 1
+                mock_meeting_instance.participants = MagicMock()
+                mock_meeting_instance.participants.add = MagicMock()
+                MockMeeting.objects.create = MagicMock(
+                    return_value=mock_meeting_instance
+                )
+
+                service = MeetingService(llm=mock_llm)
+                result = await service.extract_meetings_from_messages_batch([msg])
+
+        assert len(result) == 1
+        mock_llm.extract_meetings_from_messages.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_batch_meeting_from_multiple_messages(
+        self, mock_db_message_factory
+    ):
+        """
+        Встреча описана в нескольких сообщениях →
+        LLM получает их пачкой и извлекает одну встречу.
+        """
+        from core.services.meeting_service import MeetingService
+
+        now = timezone.now()
+        msg1 = mock_db_message_factory(
+            msg_id=1,
+            text="давайте завтра созвон",
+            username="boss",
+            timestamp=now - timedelta(minutes=2),
+        )
+        msg2 = mock_db_message_factory(
+            msg_id=2,
+            text="ок, в 11:30 норм?",
+            username="worker1",
+            timestamp=now - timedelta(minutes=1),
+        )
+        msg3 = mock_db_message_factory(
+            msg_id=3,
+            text="да, давайте",
+            username="boss",
+            timestamp=now,
+        )
+
+        tomorrow = (now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_meetings_from_messages = AsyncMock(
+            return_value=[
+                {
+                    "title": "созвон",
+                    "participants": ["@boss", "@worker1"],
+                    "start_at": f"{tomorrow}T11:30:00",
+                    "description": "",
+                }
+            ]
+        )
+
+        with patch(
+            "core.services.meeting_service.sync_to_async",
+            side_effect=lambda f: AsyncMock(return_value=f()),
+        ):
+            with patch("core.services.meeting_service.Meeting") as MockMeeting:
+                mock_meeting_instance = MagicMock()
+                mock_meeting_instance.id = 1
+                mock_meeting_instance.participants = MagicMock()
+                mock_meeting_instance.participants.add = MagicMock()
+                MockMeeting.objects.create = MagicMock(
+                    return_value=mock_meeting_instance
+                )
+
+                with patch(
+                    "core.services.meeting_service._find_user_by_username",
+                    return_value=MagicMock(id=1),
+                ):
+                    service = MeetingService(llm=mock_llm)
+                    result = await service.extract_meetings_from_messages_batch(
+                        [msg1, msg2, msg3]
+                    )
+
+        # Один вызов LLM
+        assert mock_llm.extract_meetings_from_messages.call_count == 1
+
+        # Проверяем что в батч-текст попали все сообщения
+        call_args = mock_llm.extract_meetings_from_messages.call_args
+        batch_text = call_args[0][0]
+        assert "давайте завтра созвон" in batch_text
+        assert "11:30" in batch_text
+
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_no_meetings_found(self, mock_db_message_factory):
+        """LLM не нашла встреч → пустой результат."""
+        from core.services.meeting_service import MeetingService
+
+        msg = mock_db_message_factory(
+            msg_id=1,
+            text="купи молоко",
+            username="user1",
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_meetings_from_messages = AsyncMock(return_value=[])
+
+        service = MeetingService(llm=mock_llm)
+        result = await service.extract_meetings_from_messages_batch([msg])
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_batch_llm_error_returns_empty(self, mock_db_message_factory):
+        """LLM ошибка → пустой список, без краша."""
+        from core.services.meeting_service import MeetingService
+
+        msg = mock_db_message_factory(
+            msg_id=1,
+            text="встреча завтра в 9",
+            username="boss",
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_meetings_from_messages = AsyncMock(
+            side_effect=Exception("API timeout")
+        )
+
+        service = MeetingService(llm=mock_llm)
+        result = await service.extract_meetings_from_messages_batch([msg])
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_batch_multiple_meetings(self, mock_db_message_factory):
+        """Две встречи в батче → обе создаются."""
+        from core.services.meeting_service import MeetingService
+
+        now = timezone.now()
+        msg1 = mock_db_message_factory(
+            msg_id=1,
+            text="завтра в 9 встреча с заказчиком",
+            username="boss",
+            timestamp=now - timedelta(minutes=1),
+        )
+        msg2 = mock_db_message_factory(
+            msg_id=2,
+            text="и ещё в 14:00 созвон с дизайнером",
+            username="boss",
+            timestamp=now,
+        )
+
+        tomorrow = (now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_meetings_from_messages = AsyncMock(
+            return_value=[
+                {
+                    "title": "встреча с заказчиком",
+                    "participants": [],
+                    "start_at": f"{tomorrow}T09:00:00",
+                    "description": "",
+                },
+                {
+                    "title": "созвон с дизайнером",
+                    "participants": [],
+                    "start_at": f"{tomorrow}T14:00:00",
+                    "description": "",
+                },
+            ]
+        )
+
+        meeting_counter = {"count": 0}
+
+        def make_meeting(**kwargs):
+            meeting_counter["count"] += 1
+            m = MagicMock()
+            m.id = meeting_counter["count"]
+            m.participants = MagicMock()
+            m.participants.add = MagicMock()
+            return m
+
+        with patch(
+            "core.services.meeting_service.sync_to_async",
+            side_effect=lambda f: AsyncMock(return_value=f()),
+        ):
+            with patch("core.services.meeting_service.Meeting") as MockMeeting:
+                MockMeeting.objects.create = MagicMock(side_effect=make_meeting)
+
+                service = MeetingService(llm=mock_llm)
+                result = await service.extract_meetings_from_messages_batch(
+                    [msg1, msg2]
+                )
+
+        assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_source_message_is_last(self, mock_db_message_factory):
+        """Встречи привязываются к последнему сообщению батча."""
+        from core.services.meeting_service import MeetingService
+
+        now = timezone.now()
+        msg1 = mock_db_message_factory(
+            msg_id=1,
+            text="завтра созвон",
+            username="boss",
+            timestamp=now - timedelta(minutes=1),
+        )
+        msg2 = mock_db_message_factory(
+            msg_id=2,
+            text="в 10:00",
+            username="boss",
+            timestamp=now,
+        )
+
+        tomorrow = (now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_meetings_from_messages = AsyncMock(
+            return_value=[
+                {
+                    "title": "созвон",
+                    "participants": [],
+                    "start_at": f"{tomorrow}T10:00:00",
+                    "description": "",
+                }
+            ]
+        )
+
+        created_kwargs = {}
+
+        def capture_create(**kwargs):
+            created_kwargs.update(kwargs)
+            m = MagicMock()
+            m.id = 1
+            m.participants = MagicMock()
+            m.participants.add = MagicMock()
+            return m
+
+        def fake_sync_to_async(func):
+            async def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+            return wrapper
+
+        with patch(
+            "core.services.meeting_service.sync_to_async",
+            side_effect=fake_sync_to_async,
+        ):
+            with patch("core.services.meeting_service.Meeting") as MockMeeting:
+                MockMeeting.objects.create = MagicMock(side_effect=capture_create)
+
+                service = MeetingService(llm=mock_llm)
+                await service.extract_meetings_from_messages_batch(
+                    [msg1, msg2]
+                )
+
+        assert created_kwargs.get("source_message") == msg2
+
+    @pytest.mark.asyncio
+    async def test_batch_participant_not_found_skipped(
+        self, mock_db_message_factory
+    ):
+        """Участник не найден в БД → пропускается, встреча всё равно создана."""
+        from core.services.meeting_service import MeetingService
+
+        tomorrow = (timezone.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        msg = mock_db_message_factory(
+            msg_id=1,
+            text="завтра в 10 встреча @unknown_person",
+            username="boss",
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_meetings_from_messages = AsyncMock(
+            return_value=[
+                {
+                    "title": "встреча",
+                    "participants": ["@unknown_person"],
+                    "start_at": f"{tomorrow}T10:00:00",
+                    "description": "",
+                }
+            ]
+        )
+
+        mock_meeting_instance = MagicMock()
+        mock_meeting_instance.id = 1
+        mock_meeting_instance.participants = MagicMock()
+        mock_meeting_instance.participants.add = MagicMock()
+
+        with patch(
+            "core.services.meeting_service.sync_to_async",
+            side_effect=lambda f: AsyncMock(return_value=f()),
+        ):
+            with patch("core.services.meeting_service.Meeting") as MockMeeting:
+                MockMeeting.objects.create = MagicMock(
+                    return_value=mock_meeting_instance
+                )
+
+                with patch(
+                    "core.services.meeting_service._find_user_by_username",
+                    return_value=None,
+                ):
+                    service = MeetingService(llm=mock_llm)
+                    result = await service.extract_meetings_from_messages_batch([msg])
+
+        assert len(result) == 1
+        # participants.add не вызван, т.к. пользователь не найден
+        mock_meeting_instance.participants.add.assert_not_called()

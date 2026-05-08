@@ -1,17 +1,13 @@
 import asyncio
 import logging
+
 from celery import shared_task
-from core.models import Message
-from core.services.task_service import TaskService
-from core.services.meeting_service import MeetingService
-from vector_store.client import VectorStoreClient
-from vector_store.embeddings import generate_embedding
 
 logger = logging.getLogger(__name__)
 
 
 def _run_async(coro):
-    """Безопасный запуск асинхронной функции из синхронного контекста Celery."""
+    """Безопасный запуск async-кода из синхронной Celery-задачи."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -22,48 +18,48 @@ def _run_async(coro):
         return asyncio.run(coro)
 
 
-@shared_task
-def process_new_message(message_id: int):
-    try:
-        message = Message.objects.select_related('chat', 'topic', 'author').get(id=message_id)
-    except Message.DoesNotExist:
-        logger.error(f"Message {message_id} not found")
-        return
+@shared_task(name="celery_app.tasks.process_messages.process_target_buffer")
+def process_target_buffer(chat_id: int, topic_id: int):
+    """
+    Обрабатывает конкретный буфер сообщений:
+    - либо по таймеру,
+    - либо немедленно при достижении MAX_BATCH_SIZE.
+    """
+    return _run_async(_process_target_buffer_async(chat_id, topic_id))
 
-    # 1. Эмбеддинг
-    try:
-        embedding = _run_async(generate_embedding(message.text))
-        vector_client = VectorStoreClient()
-        payload = {
-            "message_id": message.id,
-            "chat_id": message.chat.chat_id,
-            "topic_id": message.topic.thread_id if message.topic else None,
-            "user_id": message.author.telegram_id,
-            "username": message.author.username,
-            "timestamp": int(message.timestamp.timestamp()),
-            "text": message.text[:1000],
-        }
-        vector_client.upsert_message(message.id, embedding, payload)
-    except Exception as e:
-        logger.error(f"Embedding failed for message {message_id}: {e}")
 
-    # 2. Извлечение задач и встреч
-    task_service = TaskService()
-    meeting_service = MeetingService()
+async def _process_target_buffer_async(chat_id: int, topic_id: int):
+    from core.services.message_buffer import MessageBuffer
+    from core.services.batch_processor import BatchProcessor
 
-    try:
-        tasks = _run_async(task_service.extract_tasks_from_message(message))
-        if tasks:
-            logger.info(f"Extracted {len(tasks)} tasks from message {message_id}")
-    except Exception as e:
-        logger.error(f"Task extraction failed: {e}")
+    buffer = MessageBuffer()
 
-    try:
-        meeting = _run_async(meeting_service.extract_meeting_from_message(message))
-        if meeting:
-            logger.info(f"Extracted meeting from message {message_id}")
-    except Exception as e:
-        logger.error(f"Meeting extraction failed: {e}")
+    messages = buffer.flush(chat_id, topic_id)
 
-    message.is_processed = True
-    message.save()
+    if not messages:
+        logger.debug(
+            "Buffer already empty, skipping | chat=%s topic=%s",
+            chat_id,
+            topic_id,
+        )
+        return {"tasks": 0, "meetings": 0, "status": "skipped"}
+
+    logger.info(
+        "Processing target buffer | chat=%s topic=%s size=%s",
+        chat_id,
+        topic_id,
+        len(messages),
+    )
+
+    processor = BatchProcessor()
+    result = await processor.process_batch(chat_id, topic_id, messages)
+
+    logger.info(
+        "Buffer processed | chat=%s topic=%s tasks=%s meetings=%s",
+        chat_id,
+        topic_id,
+        result["tasks_created"],
+        result["meetings_created"],
+    )
+
+    return result

@@ -31,6 +31,81 @@ class TaskService:
             self._llm = LLMClient()
         return self._llm
 
+    async def _create_task_from_data(
+        self,
+        task_data: dict,
+        source_message: Message,
+    ) -> Optional[Task]:
+        try:
+            title = (task_data.get("title") or "").strip()
+            if not title:
+                logger.warning(
+                    "_create_task_from_data: empty title in task_data=%s, skipping",
+                    task_data,
+                )
+                return None
+
+            due_date = None
+            raw_due = task_data.get("due_date")
+            if raw_due:
+                try:
+                    naive_dt = datetime.strptime(raw_due, "%Y-%m-%d")
+                    naive_dt = naive_dt.replace(
+                        hour=23,
+                        minute=59,
+                        second=0,
+                        microsecond=0,
+                    )
+                    current_tz = timezone.get_current_timezone()
+                    due_date = timezone.make_aware(naive_dt, current_tz)
+                except ValueError:
+                    logger.warning(
+                        "_create_task_from_data: invalid due_date format %r, ignoring",
+                        raw_due,
+                    )
+
+            task = await sync_to_async(Task.objects.create)(
+                title=title,
+                description=task_data.get("description", ""),
+                topic=source_message.topic,
+                due_date=due_date,
+                source_message=source_message,
+                status="open",
+            )
+
+            assignees: List[str] = task_data.get("assignees", [])
+            for raw_name in assignees:
+                clean_name = raw_name.lstrip("@").strip()
+                if not clean_name:
+                    continue
+
+                user: Optional[TelegramUser] = await sync_to_async(
+                    _find_user_by_username
+                )(clean_name)
+
+                if user:
+                    await sync_to_async(TaskAssignee.objects.create)(
+                        task=task,
+                        user=user,
+                    )
+                else:
+                    logger.warning(
+                        "Task id=%s: assignee %r not found in DB, skipping",
+                        task.id,
+                        raw_name,
+                    )
+
+            return task
+
+        except Exception as e:
+            logger.error(
+                "_create_task_from_data: task creation failed for task_data=%s: %s",
+                task_data,
+                e,
+                exc_info=True,
+            )
+            return None
+
     async def extract_tasks_from_message(self, message: Message) -> List[Task]:
         now = timezone.localtime(timezone.now())
         context_str = now.strftime("%Y-%m-%d %H:%M")
@@ -43,64 +118,61 @@ class TaskService:
         created_tasks: List[Task] = []
 
         for task_data in tasks_data:
-            try:
-                title = (task_data.get("title") or "").strip()
-                if not title:
-                    logger.warning(
-                        "extract_tasks_from_message: empty title in task_data=%s, skipping",
-                        task_data,
-                    )
-                    continue
-
-                due_date = None
-                raw_due = task_data.get("due_date")
-                if raw_due:
-                    try:
-                        naive_dt = datetime.strptime(raw_due, "%Y-%m-%d")
-                        current_tz = timezone.get_current_timezone()
-                        naive_dt = naive_dt.replace(hour=23, minute=59, second=0)
-                        due_date = timezone.make_aware(naive_dt, current_tz)
-                    except ValueError:
-                        logger.warning(
-                            "extract_tasks_from_message: invalid due_date format %r, ignoring",
-                            raw_due,
-                        )
-
-                task = await sync_to_async(Task.objects.create)(
-                    title=title,
-                    description=task_data.get("description", ""),
-                    topic=message.topic,
-                    due_date=due_date,
-                    source_message=message,
-                    status="open",
-                )
-
-                assignees: List[str] = task_data.get("assignees", [])
-                for raw_name in assignees:
-                    clean_name = raw_name.lstrip("@").strip()
-                    if not clean_name:
-                        continue
-
-                    user: Optional[TelegramUser] = await sync_to_async(_find_user_by_username)(clean_name)
-
-                    if user:
-                        await sync_to_async(TaskAssignee.objects.create)(
-                            task=task,
-                            user=user,
-                        )
-                    else:
-                        logger.warning(
-                            "Task id=%s: assignee %r not found in DB, skipping",
-                            task.id, raw_name,
-                        )
-
+            task = await self._create_task_from_data(task_data, message)
+            if task:
                 created_tasks.append(task)
 
-            except Exception as e:
-                logger.error(
-                    "extract_tasks_from_message: task creation failed for task_data=%s: %s",
-                    task_data, e, exc_info=True,
+        return created_tasks
+
+    async def extract_tasks_from_messages_batch(
+        self,
+        messages: list["Message"],
+    ) -> list[Task]:
+        """
+        Извлекает задачи из пачки сообщений одним вызовом LLM.
+        """
+        if not messages:
+            return []
+
+        messages = sorted(messages, key=lambda m: m.timestamp)
+
+        context_lines = []
+        for msg in messages:
+            author = (
+                f"@{msg.author.username}"
+                if msg.author and msg.author.username
+                else (
+                    msg.author.full_name
+                    or str(msg.author.telegram_id)
                 )
+            )
+            time_str = timezone.localtime(msg.timestamp).strftime("%H:%M")
+            context_lines.append(f"[{time_str}] {author}: {msg.text}")
+
+        batch_text = "\n".join(context_lines)
+
+        now = timezone.localtime(timezone.now())
+        context_str = now.strftime("%Y-%m-%d %H:%M")
+
+        try:
+            tasks_data = await self.llm.extract_tasks_from_messages(
+                batch_text,
+                current_context=context_str,
+            )
+        except Exception as e:
+            logger.error("Batch task extraction LLM call failed: %s", e, exc_info=True)
+            return []
+
+        if not tasks_data:
+            return []
+
+        created_tasks: list[Task] = []
+        source_message = messages[-1]
+
+        for task_data in tasks_data:
+            task = await self._create_task_from_data(task_data, source_message)
+            if task:
+                created_tasks.append(task)
 
         return created_tasks
 

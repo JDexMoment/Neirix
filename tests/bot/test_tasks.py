@@ -1,6 +1,8 @@
 import pytest
 from datetime import datetime, timedelta, timezone as dt_timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+from django.utils import timezone
+
 
 from tests.conftest import make_message
 
@@ -471,3 +473,401 @@ async def test_task_done_empty_callback_data():
     await callback_task_done(callback)
 
     callback.answer.assert_called_once()
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCH TASK EXTRACTION TESTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def mock_db_message_factory():
+    """Фабрика для создания мок-сообщений из БД."""
+
+    def _create(
+        msg_id: int,
+        text: str,
+        username: str = "testuser",
+        full_name: str = "Test User",
+        telegram_id: int = 12345,
+        chat_id: int = -100123,
+        thread_id: int = 0,
+        timestamp: datetime = None,
+    ):
+        if timestamp is None:
+            timestamp = timezone.now()
+
+        msg = MagicMock()
+        msg.id = msg_id
+        msg.text = text
+        msg.timestamp = timestamp
+        msg.is_processed = False
+        msg.save = MagicMock()
+
+        msg.author = MagicMock()
+        msg.author.username = username
+        msg.author.full_name = full_name
+        msg.author.telegram_id = telegram_id
+        msg.author.is_bot = False
+
+        msg.chat = MagicMock()
+        msg.chat.chat_id = chat_id
+
+        msg.topic = MagicMock()
+        msg.topic.thread_id = thread_id
+
+        return msg
+
+    return _create
+
+
+class TestBatchTaskExtraction:
+    """Тесты для extract_tasks_from_messages_batch в TaskService."""
+
+    @pytest.mark.asyncio
+    async def test_batch_empty_messages(self):
+        """Пустой список сообщений → пустой результат."""
+        from core.services.task_service import TaskService
+
+        service = TaskService(llm=MagicMock())
+        result = await service.extract_tasks_from_messages_batch([])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_batch_single_message_with_task(self, mock_db_message_factory):
+        """Один message в батче с задачей → одна задача создана."""
+        from core.services.task_service import TaskService
+
+        msg = mock_db_message_factory(
+            msg_id=1,
+            text="@TestUser нужно сделать отчёт к пятнице",
+            username="boss",
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_tasks_from_messages = AsyncMock(
+            return_value=[
+                {
+                    "title": "сделать отчёт",
+                    "assignees": ["@TestUser"],
+                    "due_date": "2025-07-11",
+                    "description": "",
+                }
+            ]
+        )
+
+        with patch(
+            "core.services.task_service.sync_to_async",
+            side_effect=lambda f: AsyncMock(return_value=f()),
+        ):
+            with patch("core.services.task_service.Task") as MockTask:
+                mock_task_instance = MagicMock()
+                mock_task_instance.id = 1
+                MockTask.objects.create = MagicMock(return_value=mock_task_instance)
+
+                with patch(
+                    "core.services.task_service._find_user_by_username",
+                    return_value=MagicMock(id=1),
+                ):
+                    with patch("core.services.task_service.TaskAssignee") as MockTA:
+                        MockTA.objects.create = MagicMock()
+
+                        service = TaskService(llm=mock_llm)
+                        result = await service.extract_tasks_from_messages_batch([msg])
+
+        assert len(result) == 1
+        mock_llm.extract_tasks_from_messages.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_batch_multiple_messages_combined_context(
+        self, mock_db_message_factory
+    ):
+        """
+        Несколько сообщений → склеиваются в один текст
+        и отправляются одним вызовом LLM.
+        """
+        from core.services.task_service import TaskService
+
+        now = timezone.now()
+        msg1 = mock_db_message_factory(
+            msg_id=1,
+            text="нужно сделать отчёт",
+            username="boss",
+            timestamp=now - timedelta(minutes=2),
+        )
+        msg2 = mock_db_message_factory(
+            msg_id=2,
+            text="@worker1, возьми на себя, дедлайн завтра",
+            username="boss",
+            timestamp=now - timedelta(minutes=1),
+        )
+        msg3 = mock_db_message_factory(
+            msg_id=3,
+            text="ок, сделаю",
+            username="worker1",
+            timestamp=now,
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_tasks_from_messages = AsyncMock(
+            return_value=[
+                {
+                    "title": "сделать отчёт",
+                    "assignees": ["@worker1"],
+                    "due_date": (now.date() + timedelta(days=1)).strftime(
+                        "%Y-%m-%d"
+                    ),
+                    "description": "",
+                }
+            ]
+        )
+
+        with patch(
+            "core.services.task_service.sync_to_async",
+            side_effect=lambda f: AsyncMock(return_value=f()),
+        ):
+            with patch("core.services.task_service.Task") as MockTask:
+                mock_task_instance = MagicMock()
+                mock_task_instance.id = 1
+                MockTask.objects.create = MagicMock(return_value=mock_task_instance)
+
+                with patch(
+                    "core.services.task_service._find_user_by_username",
+                    return_value=MagicMock(id=1),
+                ):
+                    with patch("core.services.task_service.TaskAssignee") as MockTA:
+                        MockTA.objects.create = MagicMock()
+
+                        service = TaskService(llm=mock_llm)
+                        result = await service.extract_tasks_from_messages_batch(
+                            [msg1, msg2, msg3]
+                        )
+
+        # Проверяем, что LLM вызван один раз (батч)
+        assert mock_llm.extract_tasks_from_messages.call_count == 1
+
+        # Проверяем, что в текст попали все три сообщения
+        call_args = mock_llm.extract_tasks_from_messages.call_args
+        batch_text = call_args[0][0]  # первый позиционный аргумент
+        assert "@boss:" in batch_text or "boss:" in batch_text
+        assert "нужно сделать отчёт" in batch_text
+        assert "дедлайн завтра" in batch_text
+
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_no_tasks_found(self, mock_db_message_factory):
+        """LLM не нашла задач в батче → пустой результат."""
+        from core.services.task_service import TaskService
+
+        msg = mock_db_message_factory(
+            msg_id=1,
+            text="привет, как дела?",
+            username="user1",
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_tasks_from_messages = AsyncMock(return_value=[])
+
+        service = TaskService(llm=mock_llm)
+        result = await service.extract_tasks_from_messages_batch([msg])
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_batch_llm_error_returns_empty(self, mock_db_message_factory):
+        """Если LLM выбрасывает исключение → пустой список, без краша."""
+        from core.services.task_service import TaskService
+
+        msg = mock_db_message_factory(
+            msg_id=1,
+            text="сделай отчёт @worker",
+            username="boss",
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_tasks_from_messages = AsyncMock(
+            side_effect=Exception("GigaChat API error")
+        )
+
+        service = TaskService(llm=mock_llm)
+        result = await service.extract_tasks_from_messages_batch([msg])
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_batch_multiple_tasks_from_batch(self, mock_db_message_factory):
+        """LLM извлекает 2 задачи из пачки → обе создаются."""
+        from core.services.task_service import TaskService
+
+        now = timezone.now()
+        msg1 = mock_db_message_factory(
+            msg_id=1,
+            text="@worker1 сделай отчёт к пятнице",
+            username="boss",
+            timestamp=now - timedelta(minutes=1),
+        )
+        msg2 = mock_db_message_factory(
+            msg_id=2,
+            text="@worker2 подготовь презентацию к понедельнику",
+            username="boss",
+            timestamp=now,
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_tasks_from_messages = AsyncMock(
+            return_value=[
+                {
+                    "title": "сделать отчёт",
+                    "assignees": ["@worker1"],
+                    "due_date": "2025-07-11",
+                    "description": "",
+                },
+                {
+                    "title": "подготовить презентацию",
+                    "assignees": ["@worker2"],
+                    "due_date": "2025-07-14",
+                    "description": "",
+                },
+            ]
+        )
+
+        task_counter = {"count": 0}
+
+        def make_task(**kwargs):
+            task_counter["count"] += 1
+            t = MagicMock()
+            t.id = task_counter["count"]
+            return t
+
+        with patch(
+            "core.services.task_service.sync_to_async",
+            side_effect=lambda f: AsyncMock(return_value=f()),
+        ):
+            with patch("core.services.task_service.Task") as MockTask:
+                MockTask.objects.create = MagicMock(side_effect=make_task)
+
+                with patch(
+                    "core.services.task_service._find_user_by_username",
+                    return_value=MagicMock(id=1),
+                ):
+                    with patch("core.services.task_service.TaskAssignee") as MockTA:
+                        MockTA.objects.create = MagicMock()
+
+                        service = TaskService(llm=mock_llm)
+                        result = await service.extract_tasks_from_messages_batch(
+                            [msg1, msg2]
+                        )
+
+        assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_source_message_is_last(self, mock_db_message_factory):
+        """
+        Задачи из батча привязываются к последнему сообщению
+        (source_message = messages[-1]).
+        """
+        from core.services.task_service import TaskService
+
+        now = timezone.now()
+        msg1 = mock_db_message_factory(
+            msg_id=1,
+            text="нужно сделать отчёт",
+            username="boss",
+            timestamp=now - timedelta(minutes=1),
+        )
+        msg2 = mock_db_message_factory(
+            msg_id=2,
+            text="@worker1, возьми это на себя",
+            username="boss",
+            timestamp=now,
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_tasks_from_messages = AsyncMock(
+            return_value=[
+                {
+                    "title": "сделать отчёт",
+                    "assignees": ["@worker1"],
+                    "due_date": None,
+                    "description": "",
+                }
+            ]
+        )
+
+        created_kwargs = {}
+
+        def capture_create(**kwargs):
+            created_kwargs.update(kwargs)
+            t = MagicMock()
+            t.id = 1
+            return t
+
+        def fake_sync_to_async(func):
+            async def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+            return wrapper
+
+        with patch(
+            "core.services.task_service.sync_to_async",
+            side_effect=fake_sync_to_async,
+        ):
+            with patch("core.services.task_service.Task") as MockTask:
+                MockTask.objects.create = MagicMock(side_effect=capture_create)
+
+                with patch(
+                    "core.services.task_service._find_user_by_username",
+                    return_value=MagicMock(id=1),
+                ):
+                    with patch("core.services.task_service.TaskAssignee") as MockTA:
+                        MockTA.objects.create = MagicMock()
+
+                        service = TaskService(llm=mock_llm)
+                        await service.extract_tasks_from_messages_batch(
+                            [msg1, msg2]
+                        )
+
+        assert created_kwargs.get("source_message") == msg2
+
+    @pytest.mark.asyncio
+    async def test_batch_assignee_not_found_skipped(self, mock_db_message_factory):
+        """Если assignee не найден в БД → пропускается, задача всё равно создаётся."""
+        from core.services.task_service import TaskService
+
+        msg = mock_db_message_factory(
+            msg_id=1,
+            text="@unknown_user сделай отчёт",
+            username="boss",
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.extract_tasks_from_messages = AsyncMock(
+            return_value=[
+                {
+                    "title": "сделать отчёт",
+                    "assignees": ["@unknown_user"],
+                    "due_date": None,
+                    "description": "",
+                }
+            ]
+        )
+
+        with patch(
+            "core.services.task_service.sync_to_async",
+            side_effect=lambda f: AsyncMock(return_value=f()),
+        ):
+            with patch("core.services.task_service.Task") as MockTask:
+                mock_task_instance = MagicMock()
+                mock_task_instance.id = 1
+                MockTask.objects.create = MagicMock(return_value=mock_task_instance)
+
+                with patch(
+                    "core.services.task_service._find_user_by_username",
+                    return_value=None,  # пользователь не найден
+                ):
+                    with patch("core.services.task_service.TaskAssignee") as MockTA:
+                        MockTA.objects.create = MagicMock()
+
+                        service = TaskService(llm=mock_llm)
+                        result = await service.extract_tasks_from_messages_batch([msg])
+
+        assert len(result) == 1
+        # TaskAssignee.objects.create НЕ должен быть вызван 
+        MockTA.objects.create.assert_not_called()
