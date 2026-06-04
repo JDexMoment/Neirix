@@ -63,13 +63,17 @@ def _format_assignees(task: Task) -> str:
     assignee_list = [a.user for a in task.assignees.all()]
     if not assignee_list:
         return "не назначен"
-    return ", ".join(
-        f"@{u.username}" if u.username else (u.full_name or f"id={u.id}")
-        for u in assignee_list
-    )
+    parts = []
+    for u in assignee_list:
+        if u.username:
+            parts.append(f"@{html.escape(u.username)}")
+        elif u.full_name:
+            parts.append(html.escape(u.full_name))
+        else:
+            parts.append(f"id={u.id}")
+    return ", ".join(parts)
 
 
-@router.message(Command("tasks"))
 async def cmd_tasks(message: Message):
     chat, topic, db_user = await get_chat_context(message)
     if not db_user:
@@ -80,6 +84,9 @@ async def cmd_tasks(message: Message):
         tasks = await sync_to_async(_get_open_tasks_for_private)(db_user)
         header = "📋 Ваши задачи:"
     else:
+        if not chat:
+            await message.answer("Не удалось определить чат.")
+            return
         tasks = await sync_to_async(_get_open_tasks_for_chat)(chat, topic)
         header = f"📋 Задачи чата {chat.title}:"
 
@@ -92,9 +99,10 @@ async def cmd_tasks(message: Message):
     for i, task in enumerate(tasks, 1):
         assignee_str = _format_assignees(task)
         due_str = _format_due_date(task)
+        title = html.escape(task.title or "")
 
         await message.answer(
-            f"{i}. <b>{task.title}</b>\n"
+            f"{i}. <b>{title}</b>\n"
             f"👤 {assignee_str}\n"
             f"{due_str}",
             parse_mode="HTML",

@@ -15,8 +15,6 @@ from bot.states import RescheduleMeetingStates
 from bot.utils import get_chat_context
 from core.models import Meeting
 from core.services.meeting_service import MeetingService
-from core.services.message_buffer import MessageBuffer
-from core.services.batch_processor import BatchProcessor
 
 from bot.keyboards.inline import (
     meeting_keyboard,
@@ -81,9 +79,9 @@ def _format_participants(meeting: Meeting) -> str:
     names = []
     for p in participants:
         if p.username:
-            names.append(f"@{p.username}")
+            names.append(f"@{html.escape(p.username)}")
         elif p.full_name:
-            names.append(p.full_name)
+            names.append(html.escape(p.full_name))
         else:
             names.append(f"id={p.id}")
     return ", ".join(names)
@@ -132,17 +130,6 @@ def _parse_user_datetime(text: str) -> Optional[datetime]:
 @router.message(Command("meetings"))
 async def cmd_meetings(message: Message):
     chat, topic, db_user = await get_chat_context(message)
-    buffer = MessageBuffer()
-    processor = BatchProcessor()
-    chat_id = message.chat.id
-    # Если у тебя форум — бери thread_id, иначе 0
-    topic_id = message.message_thread_id if getattr(message.chat, 'is_forum', False) else 0
-    
-    # Забираем сообщения из буфера, не дожидаясь 30 секунд
-    pending_messages = buffer.flush(chat_id, topic_id)
-    if pending_messages:
-        # Ждём, пока BatchProcessor их обработает (вызовет LLM и сохранит в БД)
-        await processor.process_batch(chat_id, topic_id, pending_messages)
     if not db_user:
         await message.answer("Не удалось определить пользователя.")
         return

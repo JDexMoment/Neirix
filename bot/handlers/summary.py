@@ -85,14 +85,15 @@ def _resolve_period(args: list[str], now: datetime) -> Tuple[Optional[datetime],
     где end — правая граница периода [start, end)
     """
     period = args[1].lower()
+    local_now = timezone.localtime(now)
 
     if period == "today":
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
         return start, end, None
 
     if period == "yesterday":
-        start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        start = (local_now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
         return start, end, None
 
