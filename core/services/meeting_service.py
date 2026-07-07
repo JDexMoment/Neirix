@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import List, Optional, TYPE_CHECKING
 
@@ -14,6 +15,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _is_bot_user(user: TelegramUser) -> bool:
+    if hasattr(user, "is_bot") and user.is_bot:
+        return True
+    if user.username and re.search(r"[_]?[Bb]ot$", user.username):
+        return True
+    return False
+
+
 def _find_user_by_username(clean_name: str) -> Optional[TelegramUser]:
     return TelegramUser.objects.filter(
         Q(username__iexact=clean_name) | Q(full_name__icontains=clean_name)
@@ -21,11 +30,6 @@ def _find_user_by_username(clean_name: str) -> Optional[TelegramUser]:
 
 
 def _parse_start_at_from_meeting_data(meeting_data: dict) -> Optional[datetime]:
-    """
-    Поддерживает обе схемы:
-    1. старая: start_at = ISO datetime
-    2. новая: date + time
-    """
     current_tz = timezone.get_current_timezone()
 
     raw_start_at = (meeting_data.get("start_at") or "").strip()
@@ -43,10 +47,8 @@ def _parse_start_at_from_meeting_data(meeting_data: dict) -> Optional[datetime]:
 
     if not raw_date or not raw_time:
         logger.warning(
-            "Meeting skipped: incomplete date/time | date=%r time=%r data=%s",
-            raw_date,
-            raw_time,
-            meeting_data,
+            "Meeting skipped: incomplete date/time | date=%r time=%r",
+            raw_date, raw_time,
         )
         return None
 
@@ -54,11 +56,7 @@ def _parse_start_at_from_meeting_data(meeting_data: dict) -> Optional[datetime]:
         naive_dt = datetime.strptime(f"{raw_date} {raw_time}", "%Y-%m-%d %H:%M")
         return timezone.make_aware(naive_dt, current_tz)
     except ValueError:
-        logger.warning(
-            "Invalid meeting date/time format | date=%r time=%r",
-            raw_date,
-            raw_time,
-        )
+        logger.warning("Invalid meeting date/time | date=%r time=%r", raw_date, raw_time)
         return None
 
 
@@ -73,18 +71,17 @@ class MeetingService:
             self._llm = LLMClient()
         return self._llm
 
+    # ─────────────────────────────────────────────────────────────────
+    #  Создание встреч
+    # ─────────────────────────────────────────────────────────────────
+
     async def _create_meeting_from_data(
-        self,
-        meeting_data: dict,
-        source_message: Message,
+        self, meeting_data: dict, source_message: Message,
     ) -> Optional[Meeting]:
         try:
             title = (meeting_data.get("title") or "").strip()
             if not title:
-                logger.warning(
-                    "_create_meeting_from_data: empty title in meeting_data=%s, skipping",
-                    meeting_data,
-                )
+                logger.warning("_create_meeting_from_data: empty title, skipping")
                 return None
 
             start_at = _parse_start_at_from_meeting_data(meeting_data)
@@ -112,42 +109,27 @@ class MeetingService:
                     await sync_to_async(meeting.participants.add)(user)
                 else:
                     logger.warning(
-                        "Meeting id=%s: participant %r not found in DB, skipping",
-                        meeting.id,
-                        raw_name,
+                        "Meeting id=%s: participant %r not found", meeting.id, raw_name,
                     )
 
             return meeting
 
         except Exception as e:
-            logger.error(
-                "_create_meeting_from_data error: %s | data=%s",
-                e,
-                meeting_data,
-                exc_info=True,
-            )
+            logger.error("_create_meeting_from_data error: %s", e, exc_info=True)
             return None
 
     async def extract_meeting_from_message(self, message: Message) -> Optional[Meeting]:
         now = timezone.localtime(timezone.now())
-        context_str = now.strftime("%Y-%m-%d %H:%M")
-
         meeting_data = await self.llm.extract_meeting_from_message(
-            message.text,
-            current_context=context_str,
+            message.text, current_context=now.strftime("%Y-%m-%d %H:%M"),
         )
         if not meeting_data:
             return None
-
         return await self._create_meeting_from_data(meeting_data, message)
 
     async def extract_meetings_from_messages_batch(
-        self,
-        messages: list["Message"],
+        self, messages: list["Message"],
     ) -> list[Meeting]:
-        """
-        Извлекает встречи из пачки сообщений одним вызовом LLM.
-        """
         if not messages:
             return []
 
@@ -158,49 +140,45 @@ class MeetingService:
             author = (
                 f"@{msg.author.username}"
                 if msg.author and msg.author.username
-                else (
-                    msg.author.full_name
-                    or str(msg.author.telegram_id)
-                )
+                else (msg.author.full_name or str(msg.author.telegram_id))
             )
             time_str = timezone.localtime(msg.timestamp).strftime("%H:%M")
             context_lines.append(f"[{time_str}] {author}: {msg.text}")
 
         batch_text = "\n".join(context_lines)
-
         now = timezone.localtime(timezone.now())
-        context_str = now.strftime("%Y-%m-%d %H:%M")
 
         try:
             meetings_data = await self.llm.extract_meetings_from_messages(
-                batch_text,
-                current_context=context_str,
+                batch_text, current_context=now.strftime("%Y-%m-%d %H:%M"),
             )
         except Exception as e:
-            logger.error("Batch meeting extraction LLM call failed: %s", e, exc_info=True)
+            logger.error("Batch meeting extraction failed: %s", e, exc_info=True)
             return []
 
         if not meetings_data:
             return []
 
-        created_meetings: list[Meeting] = []
+        created: list[Meeting] = []
         source_message = messages[-1]
-
         for meeting_data in meetings_data:
             meeting = await self._create_meeting_from_data(meeting_data, source_message)
             if meeting:
-                created_meetings.append(meeting)
+                created.append(meeting)
 
-        return created_meetings
+        return created
+
+    # ─────────────────────────────────────────────────────────────────
+    #  Запросы
+    # ─────────────────────────────────────────────────────────────────
 
     async def get_upcoming_meetings(self, hours_ahead: int = 24) -> List[Meeting]:
         def _query() -> List[Meeting]:
             now = timezone.now()
-            end_time = now + timedelta(hours=hours_ahead)
             return list(
                 Meeting.objects.filter(
                     start_at__gte=now,
-                    start_at__lte=end_time,
+                    start_at__lte=now + timedelta(hours=hours_ahead),
                     reminder_sent=False,
                 )
                 .select_related("topic")
@@ -208,38 +186,96 @@ class MeetingService:
             )
         return await sync_to_async(_query)()
 
+    async def get_meeting_by_id(self, meeting_id: int) -> Optional[Meeting]:
+        def _get():
+            return (
+                Meeting.objects.filter(id=meeting_id)
+                .select_related("topic__chat")
+                .prefetch_related("participants")
+                .first()
+            )
+        return await sync_to_async(_get)()
+
     async def mark_reminder_sent(self, meeting: Meeting) -> None:
-        def _update() -> None:
+        def _update():
             meeting.reminder_sent = True
             meeting.save(update_fields=["reminder_sent"])
         await sync_to_async(_update)()
 
-    async def cancel_meeting(self, meeting_id: int, bot=None) -> bool:
+    # ─────────────────────────────────────────────────────────────────
+    #  Отмена встречи  (с уведомлением всех участников)
+    # ─────────────────────────────────────────────────────────────────
+
+    async def cancel_meeting(
+        self,
+        meeting_id: int,
+        notification_sender=None,  # NotificationSender | None
+    ) -> bool:
+        """
+        Отменяет встречу. Если передан notification_sender —
+        уведомляет всех участников (кроме ботов) в их ветки.
+        """
+        meeting = await self.get_meeting_by_id(meeting_id)
+        if not meeting:
+            return False
+
         def _cancel():
-            try:
-                meeting = Meeting.objects.get(id=meeting_id)
-                meeting.status = "cancelled"
-                meeting.save(update_fields=["status"])
-                return True
-            except Meeting.DoesNotExist:
-                return False
-        return await sync_to_async(_cancel)()
+            meeting.status = "cancelled"
+            meeting.save(update_fields=["status"])
 
-    async def reschedule_meeting(self, meeting_id: int, new_start_at: datetime):
+        await sync_to_async(_cancel)()
+
+        # Уведомляем участников
+        if notification_sender is not None:
+            participants = list(meeting.participants.all())
+            for user in participants:
+                if _is_bot_user(user):
+                    continue
+                await notification_sender.send_meeting_cancelled(user, meeting)
+
+        return True
+
+    # ─────────────────────────────────────────────────────────────────
+    #  Перенос встречи  (с уведомлением всех участников)
+    # ─────────────────────────────────────────────────────────────────
+
+    async def reschedule_meeting(
+        self,
+        meeting_id: int,
+        new_start_at: datetime,
+        notification_sender=None,  # NotificationSender | None
+    ) -> Optional[Meeting]:
+        """
+        Переносит встречу. Если передан notification_sender —
+        уведомляет всех участников о переносе.
+        Возвращает обновлённую встречу или None.
+        """
+        old_meeting = await self.get_meeting_by_id(meeting_id)
+        if not old_meeting:
+            return None
+
+        old_start_at = old_meeting.start_at
+
         def _reschedule():
-            try:
-                meeting = Meeting.objects.get(id=meeting_id)
-                meeting.start_at = new_start_at
-                meeting.status = "active"
-                meeting.reminder_sent = False
-                meeting.daily_reminder_sent = False
-                meeting.save(update_fields=["start_at", "status", "reminder_sent", "daily_reminder_sent"])
-                return meeting
-            except Meeting.DoesNotExist:
-                return None
-        return await sync_to_async(_reschedule)()
+            old_meeting.start_at = new_start_at
+            old_meeting.status = "active"
+            old_meeting.reminder_sent = False
+            old_meeting.daily_reminder_sent = False
+            old_meeting.save(
+                update_fields=["start_at", "status", "reminder_sent", "daily_reminder_sent"]
+            )
+            return old_meeting
 
-    async def get_meeting_by_id(self, meeting_id: int) -> Optional[Meeting]:
-        def _get():
-            return Meeting.objects.filter(id=meeting_id).select_related("topic__chat").prefetch_related("participants").first()
-        return await sync_to_async(_get)()
+        meeting = await sync_to_async(_reschedule)()
+
+        # Уведомляем участников
+        if notification_sender is not None:
+            participants = list(meeting.participants.all())
+            for user in participants:
+                if _is_bot_user(user):
+                    continue
+                await notification_sender.send_meeting_rescheduled(
+                    user, meeting, old_start_at,
+                )
+
+        return meeting

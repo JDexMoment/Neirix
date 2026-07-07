@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from celery import shared_task
+from asgiref.sync import sync_to_async
 
 logger = logging.getLogger(__name__)
 
