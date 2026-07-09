@@ -92,6 +92,8 @@ class Task(models.Model):
     ])
     source_message = models.ForeignKey(Message, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Creator field - who created the task
+    creator = models.ForeignKey(TelegramUser, on_delete=models.SET_NULL, null=True, related_name='created_tasks')
     # Напоминание за сутки до дедлайна
     daily_reminder_sent = models.BooleanField(default=False)
     # Напоминание о просрочке 
@@ -142,6 +144,8 @@ class Meeting(models.Model):
     start_at = models.DateTimeField()
     participants = models.ManyToManyField(TelegramUser, blank=True)
     source_message = models.ForeignKey(Message, on_delete=models.SET_NULL, null=True)
+    # Creator field - who created the meeting
+    creator = models.ForeignKey(TelegramUser, on_delete=models.SET_NULL, null=True, related_name='created_meetings')
 
     # Напоминание за час до встречи
     reminder_sent = models.BooleanField(default=False)

@@ -4,27 +4,27 @@ BEAT_SCHEDULE = {
     # ─── Напоминания о встречах ──────────────────────────────────────
     "send-meeting-1h-reminders": {
         "task": "celery_app.tasks.send_reminders.send_meeting_reminders",
-        "schedule": crontab(minute="*/1"), #5
+        "schedule": crontab(minute="*/5"), #5
     },
     "send-meeting-24h-reminders": {
         "task": "celery_app.tasks.send_reminders.send_meeting_24h_reminders",
-        "schedule": crontab(minute="*/2"), #30
+        "schedule": crontab(minute="*/30"), #30
     },
 
     # ─── Напоминания о задачах ───────────────────────────────────────
     "send-task-24h-reminders": {
         "task": "celery_app.tasks.send_reminders.send_task_24h_reminders",
-        "schedule": crontab(minute="*/2"), #30
+        "schedule": crontab(minute="*/30"), #30
     },
     "send-overdue-task-reminders": {
         "task": "celery_app.tasks.send_reminders.send_overdue_task_reminders",
-        "schedule": crontab(hour=10, minute=0),
+        "schedule": crontab(hour=8, minute=0),
     },
 
     # ─── Утренний дайджест ───────────────────────────────────────────
     "send-daily-digest": {
         "task": "celery_app.tasks.send_reminders.send_daily_digest",
-        "schedule": crontab(hour=9, minute=0),
+        "schedule": crontab(hour=8, minute=0),
     },
 
     # ─── Саммари ─────────────────────────────────────────────────────

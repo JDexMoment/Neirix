@@ -4,7 +4,6 @@ from typing import List, Optional
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from asgiref.sync import sync_to_async
 from django.utils import timezone
 
@@ -17,29 +16,29 @@ logger = logging.getLogger(__name__)
 router = Router()
 task_service = TaskService()
 
+
 def _get_open_tasks_for_private(db_user: TelegramUser) -> List[Task]:
+    """Задачи, где пользователь — исполнитель (для лички)."""
     return list(
         Task.objects.filter(
             assignees__user=db_user,
             status="open",
         )
-        .select_related("topic__chat")
+        .select_related("topic__chat", "source_message__author")
         .prefetch_related("assignees__user")
         .order_by("due_date", "id")
         .distinct()
     )
 
 
-def _get_open_tasks_for_chat(chat, topic=None) -> List[Task]:
-    filters = {
-        "topic__chat": chat,
-        "status": "open",
-    }
-    if topic:
-        filters["topic"] = topic
-
+def _get_open_tasks_for_chat(chat) -> List[Task]:
+    """ВСЕ открытые задачи чата (без фильтра по топику)."""
     return list(
-        Task.objects.filter(**filters)
+        Task.objects.filter(
+            topic__chat=chat,
+            status="open",
+        )
+        .select_related("topic__chat", "source_message__author")
         .prefetch_related("assignees__user")
         .order_by("due_date", "id")
         .distinct()
@@ -64,9 +63,22 @@ def _format_assignees(task: Task) -> str:
     if not assignee_list:
         return "не назначен"
     return ", ".join(
-        f"@{u.username}" if u.username else (u.full_name or f"id={u.id}")
+        f"@{u.username}" if u.username else (u.full_name or f"id={u.telegram_id}")
         for u in assignee_list
     )
+
+
+def _format_assigner(task: Task) -> str:
+    """Кто создал/назначил задачу."""
+    try:
+        if task.source_message and task.source_message.author:
+            author = task.source_message.author
+            if author.username:
+                return f"@{author.username}"
+            return author.full_name or str(author.telegram_id)
+    except Exception:
+        pass
+    return "—"
 
 
 @router.message(Command("tasks"))
@@ -80,7 +92,11 @@ async def cmd_tasks(message: Message):
         tasks = await sync_to_async(_get_open_tasks_for_private)(db_user)
         header = "📋 Ваши задачи:"
     else:
-        tasks = await sync_to_async(_get_open_tasks_for_chat)(chat, topic)
+        if not chat:
+            await message.answer("Не удалось определить чат.")
+            return
+        # В группе показываем ВСЕ задачи чата (без фильтра по топику)
+        tasks = await sync_to_async(_get_open_tasks_for_chat)(chat)
         header = f"📋 Задачи чата {chat.title}:"
 
     if not tasks:
@@ -92,11 +108,13 @@ async def cmd_tasks(message: Message):
     for i, task in enumerate(tasks, 1):
         assignee_str = _format_assignees(task)
         due_str = _format_due_date(task)
+        assigner_str = _format_assigner(task)
 
         await message.answer(
             f"{i}. <b>{task.title}</b>\n"
             f"👤 {assignee_str}\n"
-            f"{due_str}",
+            f"{due_str}\n"
+            f"📝 Назначил(а): {assigner_str}",
             parse_mode="HTML",
             reply_markup=task_keyboard(task.id),
         )

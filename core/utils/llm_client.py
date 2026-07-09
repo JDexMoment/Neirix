@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from django.conf import settings
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ TASK_RULES: Dict = _load_json("task_rules.json")
 MEETING_RULES: Dict = _load_json("meeting_rules.json")
 SUMMARY_RULES: Dict = _load_json("summary_rules.json")
 
+COMBINED_RULES: Dict = _load_json("combined_rules.json")
 # ─────────────────────────────────────────────────────────────────────────────
 # Константы
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,64 +249,68 @@ def _strip_batch_headers(text: str) -> str:
 # Построение контекста дат (общий, для встреч и задач)
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-def _build_date_context(now: datetime) -> str:
+def _build_date_context_compact(now: datetime, days: int = 7) -> str:
+    """Компактный календарь на 7 дней."""
     today = now.date()
-    wd = now.weekday()
-
-    table: List[str] = [
-        "=== ТАБЛИЦА ЗАМЕНЫ ОТНОСИТЕЛЬНЫХ ДАТ ===",
-        "ВАЖНО: используй ТОЛЬКО значения из этой таблицы, не считай даты самостоятельно.",
-        "",
-        f"  сегодня               → {today.strftime('%d.%m.%Y')} ({DAY_FORMS[wd]['label_this']})",
-        f"  завтра                → {(today + timedelta(days=1)).strftime('%d.%m.%Y')}",
-        f"  послезавтра           → {(today + timedelta(days=2)).strftime('%d.%m.%Y')}",
+    lines_out: List[str] = [
+        "=== ТАБЛИЦА ЗАМЕНЫ ДАТ (только эти значения) ===",
+        f"  сегодня      → {today.strftime('%d.%m.%Y')}",
+        f"  завтра       → {(today + timedelta(days=1)).strftime('%d.%m.%Y')}",
+        f"  послезавтра  → {(today + timedelta(days=2)).strftime('%d.%m.%Y')}",
         "",
     ]
-
     for item in DAY_FORMS:
         idx = item["weekday"]
         this_d = _next_weekday_date(today, idx)
         next_d = this_d + timedelta(days=7)
-        fmt_this = this_d.strftime("%d.%m.%Y")
-        fmt_next = next_d.strftime("%d.%m.%Y")
-
-        for alias in item["aliases_this"]:
-            table.append(f"  {alias:<35} → {fmt_this}")
-        table.append(f"  {item['label_next']:<35} → {fmt_next}")
-        for alias in item["aliases_next"]:
-            table.append(f"  {alias:<35} → {fmt_next}")
-        table.append("")
-
+        lines_out.append(f"  {item['label_this']:<30} → {this_d.strftime('%d.%m.%Y')}")
+        lines_out.append(f"  {item['label_next']:<30} → {next_d.strftime('%d.%m.%Y')}")
     _, last_day = cal_mod.monthrange(today.year, today.month)
     next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
-    table += [
-        "  Правило 'N числа' (без месяца):",
-        f"    если N >= {today.day} и N <= {last_day} → месяц {today.strftime('%m.%Y')}",
-        f"    иначе → месяц {next_month.strftime('%m.%Y')}",
+    lines_out += [
         "",
+        f"  Правило 'N числа': если N ≥ {today.day} и N ≤ {last_day} → "
+        f"{today.strftime('%m.%Y')}, иначе → {next_month.strftime('%m.%Y')}",
+        "",
+        f"=== КАЛЕНДАРЬ НА {days} ДНЕЙ ===",
     ]
-
-    cal_lines = [
-        "=== КАЛЕНДАРЬ НА 90 ДНЕЙ ===",
-    ]
-    for i in range(90):
+    for i in range(days):
         d = today + timedelta(days=i)
         marker = " ← СЕГОДНЯ" if i == 0 else (" ← ЗАВТРА" if i == 1 else "")
-        month_name = MONTH_NAMES_RU[d.month]
         label = DAY_FORMS[d.weekday()]["label_this"]
-        cal_lines.append(
-            f"  {label:<25} {d.day} {month_name}  {d.strftime('%d.%m.%Y')}{marker}"
+        lines_out.append(
+            f"  {d.day} {MONTH_NAMES_RU[d.month]} ({label})  "
+            f"{d.strftime('%d.%m.%Y')}{marker}"
         )
+    return "\n".join(lines_out)
 
-    return "\n".join(table + cal_lines)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Построение alias-map для детерминированного парсинга дедлайнов задач
-# ─────────────────────────────────────────────────────────────────────────────
-
-
+def _build_combined_examples(now: datetime) -> str:
+    """4 разнообразных few-shot примера."""
+    today = now.date()
+    tomorrow = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    today_str = today.strftime("%Y-%m-%d")
+    friday = _next_weekday_date(today, 4).strftime("%Y-%m-%d")
+    sunday = _next_weekday_date(today, 6).strftime("%Y-%m-%d")
+    return (
+        "=== ПРИМЕРЫ ===\n\n"
+        f'Сообщение: "в эту субботу @JDexMoment нужно подготовить отчет"\n'
+        f'Ответ: {{"tasks":[{{"title":"подготовить отчет",'
+        f'"assignees":["@JDexMoment"],"due_date":"{sunday}","description":""}}],"meetings":[]}}\n\n'
+        f'Сообщение: "завтра в 14:30 у @JDexMoment и @D1MRUS созвон с заказчиком"\n'
+        f'Ответ: {{"tasks":[],"meetings":[{{"title":"созвон с заказчиком",'
+        f'"participants":["@JDexMoment","@D1MRUS"],"date":"{tomorrow}","time":"14:30","description":""}}]}}\n\n'
+        f'Сообщение: "завтра @D1MRUS должен сделать отчёт, а в 10 у нас общее собрание, всем быть"\n'
+        f'Ответ: {{"tasks":[{{"title":"сделать отчёт","assignees":["@D1MRUS"],'
+        f'"due_date":"{tomorrow}","description":""}}],'
+        f'"meetings":[{{"title":"общее собрание","participants":["Все участники"],'
+        f'"date":"{tomorrow}","time":"10:00","description":""}}]}}\n\n'
+        f'Пачка сообщений:\n'
+        f'[09:15] @JDexMoment: @Neirix1_bot, скинь отчёт\n'
+        f'[09:16] @Neirix1_bot: ок, сегодня до 18:00 сделаю\n'
+        f'Ответ: {{"tasks":[{{"title":"скинуть отчёт",'
+        f'"assignees":["@Neirix1_bot"],"due_date":"{today_str}","description":""}}],"meetings":[]}}\n\n'
+        "=== КОНЕЦ ПРИМЕРОВ ===\n"
+    )
 def _build_alias_map(now: datetime) -> Dict[str, str]:
     today = now.date()
     alias_map: Dict[str, str] = {
@@ -330,93 +336,6 @@ def _detect_due_date_fallback(
         if f" {phrase} " in text_l or text_l.endswith(f" {phrase} "):
             return alias_map[phrase]
     return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Few-shot примеры (генерируются с реальными датами)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _build_task_examples(now: datetime) -> str:
-    today = now.date()
-    tomorrow = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-    day_after = (today + timedelta(days=2)).strftime("%Y-%m-%d")
-    saturday = _next_weekday_date(today, 5).strftime("%Y-%m-%d")
-    sunday = _next_weekday_date(today, 6).strftime("%Y-%m-%d")
-
-    return f"""
-=== ПРИМЕРЫ ===
-
-Сообщение: "в эту субботу @JDexMoment и @Neirix1_bot нужно подготовить отчет"
-Ответ:
-{{"tasks": [{{"title": "подготовить отчет", "assignees": ["@JDexMoment", "@Neirix1_bot"], "due_date": "{saturday}", "description": ""}}]}}
-
-Сообщение: "в это воскресенье нужно провести презентацию"
-Ответ:
-{{"tasks": [{{"title": "провести презентацию", "assignees": [], "due_date": "{sunday}", "description": ""}}]}}
-
-Сообщение: "к воскресенью @Neirix1_bot и @JDexMoment должны будут сделать тест по русскому языку"
-Ответ:
-{{"tasks": [{{"title": "сделать тест по русскому языку", "assignees": ["@Neirix1_bot", "@JDexMoment"], "due_date": "{sunday}", "description": ""}}]}}
-
-Сообщение: "нужно послезавтра провести презентацию"
-Ответ:
-{{"tasks": [{{"title": "провести презентацию", "assignees": [], "due_date": "{day_after}", "description": ""}}]}}
-
-Сообщение: "завтра нужно чтобы @JDexMoment предоставил отчет по практике"
-Ответ:
-{{"tasks": [{{"title": "предоставить отчет по практике", "assignees": ["@JDexMoment"], "due_date": "{tomorrow}", "description": ""}}]}}
-
-Сообщение: "завтра у нас встреча с заказчиком в 9"
-Ответ:
-{{"tasks": []}}
-
-Пачка сообщений:
-[10:15] @JDexMoment: нужно сделать отчёт
-[10:16] @JDexMoment: @Neirix1_bot, возьми на себя, дедлайн в эту субботу
-Ответ:
-{{"tasks": [{{"title": "сделать отчёт", "assignees": ["@Neirix1_bot"], "due_date": "{saturday}", "description": ""}}]}}
-
-=== КОНЕЦ ПРИМЕРОВ ==="""
-
-
-def _build_meeting_examples(now: datetime) -> str:
-    today = now.date()
-    tomorrow = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-    day_after = (today + timedelta(days=2)).strftime("%Y-%m-%d")
-    sunday = _next_weekday_date(today, 6).strftime("%Y-%m-%d")
-
-    return f"""
-=== ПРИМЕРЫ ===
-
-Сообщение: "у @JDexMoment и @Neirix1_bot 5 мая в 11:30 будет встреча с генералом Гавсом"
-Ответ:
-{{"meetings": [{{"title": "встреча с генералом Гавсом", "participants": ["@JDexMoment", "@Neirix1_bot"], "date": "2026-05-05", "time": "11:30", "description": ""}}]}}
-
-Сообщение: "у @JDexMoment в это воскресенье в 7 утра будет встреча с другом"
-Ответ:
-{{"meetings": [{{"title": "встреча с другом", "participants": ["@JDexMoment"], "date": "{sunday}", "time": "07:00", "description": ""}}]}}
-
-Сообщение: "завтра у нас встреча с заказчиком в 9"
-Ответ:
-{{"meetings": [{{"title": "встреча с заказчиком", "participants": [], "date": "{tomorrow}", "time": "09:00", "description": ""}}]}}
-
-Сообщение: "послезавтра у нас встреча с директором в 10"
-Ответ:
-{{"meetings": [{{"title": "встреча с директором", "participants": [], "date": "{day_after}", "time": "10:00", "description": ""}}]}}
-
-Сообщение: "нужно купить молоко"
-Ответ:
-{{"meetings": []}}
-
-Пачка сообщений:
-[14:00] @JDexMoment: давайте завтра созвон
-[14:01] @Neirix1_bot: ок, в 11:30 норм?
-[14:02] @JDexMoment: да, давайте
-Ответ:
-{{"meetings": [{{"title": "созвон", "participants": ["@JDexMoment", "@Neirix1_bot"], "date": "{tomorrow}", "time": "11:30", "description": ""}}]}}
-
-=== КОНЕЦ ПРИМЕРОВ ==="""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -485,8 +404,8 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         model: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2000,
+        temperature: float = 0.3,
+        max_tokens: int = 1500,
     ) -> str:
         from gigachat.models import Chat, Messages, MessagesRole
 
@@ -512,10 +431,19 @@ class LLMClient:
         if model:
             chat_kwargs["model"] = model
 
-        response = await self._run_sync(
-            self.chat_client.chat, Chat(**chat_kwargs)
-        )
-        return response.choices[0].message.content
+        try:
+            response = await self._run_sync(
+                self.chat_client.chat, Chat(**chat_kwargs)
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            # Check if it's a payment required error
+            if "402" in str(e) or "Payment Required" in str(e):
+                logger.error("GigaChat API payment required error: %s", e)
+                # Return a default response or handle gracefully
+                return '{"tasks": [], "meetings": []}'  # Generic default response
+            else:
+                raise e
 
     # ──────────────────────────────────────────────────────────────────────
     # generate_embedding
@@ -526,372 +454,154 @@ class LLMClient:
         return embedding.tolist()
 
     # ──────────────────────────────────────────────────────────────────────
-    # extract_tasks_from_messages  (batch-метод, основной)
+    # extract_all_from_messages
     # ──────────────────────────────────────────────────────────────────────
 
-    async def extract_tasks_from_messages(
+    async def extract_all_from_messages(
         self,
-        message_text: str,
-        current_context: str,
-    ) -> List[Dict[str, Any]]:
-        """
-        Извлекает задачи из текста.
-        Текст может быть одним сообщением или пачкой строк
-        вида '[HH:MM] @author: текст'.
-        """
+        messages: list,
+    ) -> Optional[Dict[str, List[Dict]]]:
+        """Извлекает задачи И встречи за ОДИН LLM-вызов. Экономия ~50% токенов."""
+        if not messages:
+            return {"tasks": [], "meetings": []}
+
+        messages = sorted(messages, key=lambda m: m.timestamp)
+
+        context_lines = []
+        for msg in messages:
+            author = (
+                f"@{msg.author.username}"
+                if msg.author and msg.author.username
+                else (msg.author.full_name or str(msg.author.telegram_id))
+            )
+            time_str = timezone.localtime(msg.timestamp).strftime("%H:%M")
+            context_lines.append(f"[{time_str}] {author}: {msg.text}")
+
+        batch_text = "\n".join(context_lines)
 
         now = datetime.now()
-        date_context = _build_date_context(now)
+        date_context = _build_date_context_compact(now, days=14)
         alias_map = _build_alias_map(now)
-        examples = _build_task_examples(now)
+        examples = _build_combined_examples(now)
 
-        # Чистим batch-заголовки для regex-анализа,
-        # но в промпт отправляем оригинал (LLM видит авторов).
-        content_text = _strip_batch_headers(message_text)
-
-        deterministic_due = _detect_due_date_fallback(content_text, alias_map)
-        explicit_date = _contains_explicit_date(content_text)
-        regex_mentions = extract_mentions(content_text)
-
-        logger.debug(
-            "Task extraction | mentions=%s | det_due=%s | text=%r",
-            regex_mentions,
-            deterministic_due,
-            message_text[:200],
-        )
-
-        ctx = ""
-        if current_context and current_context.strip():
-            ctx = (
-                f"\n=== КОНТЕКСТ ===\n"
-                f"{current_context.strip()}\n"
-                f"=== КОНЕЦ КОНТЕКСТА ===\n"
-            )
-
-        rules_text = _format_rules(TASK_RULES["rules"])
-        schema_text = _format_response_schema(TASK_RULES["response_format"])
-
-        prompt = (
-            f"Ты извлекаешь ЗАДАЧИ из рабочего фрагмента чата.\n\n"
-            f"Во входном тексте может быть одно сообщение или несколько "
-            f"последовательных сообщений.\n"
-            f"Если это пачка, строки могут быть в формате "
-            f"'[HH:MM] author: текст'.\n"
-            f"Анализируй весь фрагмент целиком. Если задача описана "
-            f"в нескольких соседних сообщениях, собери её в один объект "
-            f"и не дублируй.\n\n"
-            f"{date_context}\n\n"
-            f"{examples}\n\n"
-            f"{ctx}\n"
-            f"{rules_text}\n\n"
-            f"Ответ строго в JSON (без markdown, без пояснений):\n"
-            f"{schema_text}\n\n"
-            f"Фрагмент чата для анализа:\n{message_text}"
-        )
-
-        messages = [
-            {"role": "system", "content": TASK_RULES["system_prompt"]},
-            {"role": "user", "content": prompt},
-        ]
-
-        raw_response = ""
-        try:
-            raw_response = await self.chat_completion(
-                messages=messages,
-                temperature=0.1,
-                max_tokens=2000,
-            )
-            logger.info("RAW TASK RESPONSE: %s", raw_response)
-
-            data = json.loads(_clean_llm_json(raw_response))
-            raw_tasks = data.get("tasks", [])
-            if not isinstance(raw_tasks, list):
-                raw_tasks = []
-
-            normalized: List[Dict[str, Any]] = []
-            seen: set = set()
-            single_result = len(raw_tasks) == 1
-
-            for task in raw_tasks:
-                if not isinstance(task, dict):
-                    continue
-
-                title = (task.get("title") or "").strip()
-                if not title:
-                    continue
-
-                llm_assignees = _normalize_usernames(task.get("assignees"))
-
-                # При батче мержить regex mentions безопасно только
-                # если LLM вернула ровно одну задачу — иначе авторы
-                # соседних реплик попадут во все задачи.
-                merged = (
-                    _merge_usernames(llm_assignees, regex_mentions)
-                    if single_result
-                    else llm_assignees
-                )
-
-                due = _normalize_due_date(task.get("due_date"))
-
-                # Детерминированный override тоже безопасен только
-                # при одной задаче — иначе две задачи с разными
-                # дедлайнами получат одинаковый.
-                if single_result and deterministic_due and not explicit_date:
-                    if due != deterministic_due:
-                        logger.info(
-                            "Override due: llm=%s -> det=%s",
-                            due,
-                            deterministic_due,
-                        )
-                    due = deterministic_due
-
-                norm = {
-                    "title": title,
-                    "assignees": merged,
-                    "due_date": due,
-                    "description": (task.get("description") or "").strip(),
-                }
-
-                dedupe_key = (
-                    norm["title"].casefold(),
-                    tuple(sorted(norm["assignees"])),
-                    norm["due_date"],
-                    norm["description"].casefold(),
-                )
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-
-                normalized.append(norm)
-
-            logger.info("NORMALIZED TASKS: %s", normalized)
-            return normalized
-
-        except json.JSONDecodeError as e:
-            logger.error("Task JSON error: %s | raw: %s", e, raw_response)
-            return []
-        except Exception as e:
-            logger.error("Task extraction failed: %s", e, exc_info=True)
-            return []
-
-    # ──────────────────────────────────────────────────────────────────────
-    # extract_tasks_from_message  (обратная совместимость, single message)
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def extract_tasks_from_message(
-        self,
-        message_text: str,
-        current_context: str,
-    ) -> List[Dict[str, Any]]:
-        """Обёртка для одного сообщения — делегирует в batch-метод."""
-        return await self.extract_tasks_from_messages(
-            message_text=message_text,
-            current_context=current_context,
-        )
-
-    # ──────────────────────────────────────────────────────────────────────
-    # extract_meetings_from_messages  (batch-метод, основной)
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def extract_meetings_from_messages(
-        self,
-        message_text: str,
-        current_context: str,
-    ) -> List[Dict[str, Any]]:
-        """
-        Извлекает встречи из текста.
-        Текст может быть одним сообщением или пачкой строк
-        вида '[HH:MM] @author: текст'.
-
-        Возвращает список dict'ов с ключами:
-            title, participants, start_at, description
-        где start_at — ISO-строка (YYYY-MM-DDTHH:MM:SS).
-        """
-
-        now = datetime.now()
-        date_context = _build_date_context(now)
-        alias_map = _build_alias_map(now)
-        examples = _build_meeting_examples(now)
-
-        content_text = _strip_batch_headers(message_text)
-
+        content_text = _strip_batch_headers(batch_text)
         deterministic_date = _detect_due_date_fallback(content_text, alias_map)
         explicit_date = _contains_explicit_date(content_text)
         regex_mentions = extract_mentions(content_text)
 
-        logger.debug(
-            "Meeting extraction | mentions=%s | det_date=%s | text=%r",
-            regex_mentions,
-            deterministic_date,
-            message_text[:200],
-        )
-
-        ctx = ""
-        if current_context and current_context.strip():
-            ctx = (
-                f"\n=== КОНТЕКСТ ===\n"
-                f"{current_context.strip()}\n"
-                f"=== КОНЕЦ КОНТЕКСТА ===\n"
-            )
-
-        rules_text = _format_rules(MEETING_RULES["rules"])
-        schema_text = _format_response_schema(MEETING_RULES["response_format"])
+        rules_text = _format_rules(COMBINED_RULES["rules"])
+        schema_text = _format_response_schema(COMBINED_RULES["response_format"])
 
         prompt = (
-            f"Ты извлекаешь ВСТРЕЧИ из рабочего фрагмента чата.\n\n"
-            f"Во входном тексте может быть одно сообщение или несколько "
-            f"последовательных сообщений.\n"
-            f"Если это пачка, строки могут быть в формате "
-            f"'[HH:MM] author: текст'.\n"
-            f"Анализируй весь фрагмент целиком. Если встреча описана "
-            f"в нескольких соседних сообщениях, собери её в один объект "
-            f"и не дублируй.\n\n"
+            f"Извлеки задачи и встречи из фрагмента чата.\n"
+            f"Анализируй весь фрагмент целиком.\n\n"
             f"{date_context}\n\n"
             f"{examples}\n\n"
-            f"{ctx}\n"
             f"{rules_text}\n\n"
-            f"Ответ строго в JSON (без markdown, без пояснений):\n"
+            f"Ответ СТРОГО в JSON (без пояснений):\n"
             f"{schema_text}\n\n"
-            f"Фрагмент чата для анализа:\n{message_text}"
+            f"Фрагмент чата:\n{batch_text}"
         )
 
-        messages = [
-            {"role": "system", "content": MEETING_RULES["system_prompt"]},
+        fm = [
+            {"role": "system", "content": COMBINED_RULES["system_prompt"]},
             {"role": "user", "content": prompt},
         ]
 
         raw_response = ""
         try:
             raw_response = await self.chat_completion(
-                messages=messages,
-                temperature=0.1,
-                max_tokens=2000,
+                messages=fm, temperature=0.1, max_tokens=2000,
             )
-            logger.info("RAW MEETING RESPONSE: %s", raw_response)
-
+            logger.info("RAW COMBINED RESPONSE: %s", raw_response)
             data = json.loads(_clean_llm_json(raw_response))
 
-            # ── Поддержка обоих форматов ответа LLM ──────────
-            # Новый формат: {"meetings": [...]}
-            # Старый формат: {"meeting": {...} | null}
-            raw_meetings: List[Dict] = []
-            if "meetings" in data:
-                raw_meetings = data["meetings"]
-                if not isinstance(raw_meetings, list):
-                    raw_meetings = [raw_meetings] if raw_meetings else []
-            elif "meeting" in data:
-                m = data["meeting"]
-                raw_meetings = [m] if m and isinstance(m, dict) else []
+            raw_tasks = data.get("tasks", [])
+            raw_meetings = data.get("meetings", [])
 
-            normalized: List[Dict[str, Any]] = []
-            seen: set = set()
-            single_result = len(raw_meetings) == 1
+            # Нормализация задач
+            normalized_tasks: List[Dict] = []
+            seen_tasks: set = set()
+            single_task = len(raw_tasks) == 1
 
-            for meeting in raw_meetings:
+            for task in (raw_tasks if isinstance(raw_tasks, list) else []):
+                if not isinstance(task, dict):
+                    continue
+                title = (task.get("title") or "").strip()
+                if not title:
+                    continue
+                llm_assignees = _normalize_usernames(task.get("assignees"))
+                merged = (
+                    _merge_usernames(llm_assignees, regex_mentions)
+                    if single_task else llm_assignees
+                )
+                due_date = _normalize_due_date(task.get("due_date"))
+                if (single_task and deterministic_date and not explicit_date
+                        and due_date != deterministic_date):
+                    due_date = deterministic_date
+                desc = (task.get("description") or "").strip()
+                dedupe_key = (title.casefold(), tuple(sorted(merged)), due_date, desc.casefold())
+                if dedupe_key in seen_tasks:
+                    continue
+                seen_tasks.add(dedupe_key)
+                normalized_tasks.append({
+                    "title": title, "assignees": merged,
+                    "due_date": due_date, "description": desc,
+                })
+
+            # Нормализация встреч
+            normalized_meetings: List[Dict] = []
+            seen_meetings: set = set()
+            single_meeting = len(raw_meetings) == 1
+
+            for meeting in (raw_meetings if isinstance(raw_meetings, list) else []):
                 if not isinstance(meeting, dict):
                     continue
-
                 title = (meeting.get("title") or "").strip()
                 if not title:
                     title = _fallback_meeting_title(content_text)
                 if not title:
                     continue
-
-                llm_participants = _normalize_usernames(
-                    meeting.get("participants")
-                )
-
+                llm_participants = _normalize_usernames(meeting.get("participants"))
                 merged = (
                     _merge_usernames(llm_participants, regex_mentions)
-                    if single_result
-                    else llm_participants
+                    if single_meeting else llm_participants
                 )
-
-                # ── Собираем start_at ────────────────────────
-                # LLM может вернуть:
-                #   1) start_at напрямую (старый формат)
-                #   2) date + time (новый формат)
                 raw_start_at = meeting.get("start_at")
                 raw_date = meeting.get("date")
                 raw_time = meeting.get("time")
-
                 if raw_start_at:
                     start_at = _normalize_start_at(raw_start_at)
                 else:
                     date_value = _normalize_due_date(raw_date)
-
-                    if (
-                        single_result
-                        and deterministic_date
-                        and not explicit_date
-                    ):
-                        if date_value != deterministic_date:
-                            logger.info(
-                                "Override meeting date: llm=%s -> det=%s",
-                                date_value,
-                                deterministic_date,
-                            )
+                    if (single_meeting and deterministic_date and not explicit_date
+                            and date_value != deterministic_date):
                         date_value = deterministic_date
-
                     time_value = _normalize_time(raw_time)
-                    start_at = _build_start_at_from_date_time(
-                        date_value, time_value
-                    )
-
+                    start_at = _build_start_at_from_date_time(date_value, time_value)
                 if not start_at:
-                    logger.warning(
-                        "Meeting skipped: no valid start_at | data=%s",
-                        meeting,
-                    )
                     continue
-
-                norm = {
-                    "title": title,
-                    "participants": merged,
-                    "start_at": start_at,
-                    "description": (
-                        meeting.get("description") or ""
-                    ).strip(),
-                }
-
-                dedupe_key = (
-                    norm["title"].casefold(),
-                    tuple(sorted(norm["participants"])),
-                    norm["start_at"],
-                    norm["description"].casefold(),
-                )
-                if dedupe_key in seen:
+                desc = (meeting.get("description") or "").strip()
+                dedupe_key = (title.casefold(), tuple(sorted(merged)), start_at, desc.casefold())
+                if dedupe_key in seen_meetings:
                     continue
-                seen.add(dedupe_key)
+                seen_meetings.add(dedupe_key)
+                normalized_meetings.append({
+                    "title": title, "participants": merged,
+                    "start_at": start_at, "description": desc,
+                })
 
-                normalized.append(norm)
-
-            logger.info("NORMALIZED MEETINGS: %s", normalized)
-            return normalized
+            logger.info("COMBINED: tasks=%d meetings=%d",
+                        len(normalized_tasks), len(normalized_meetings))
+            return {"tasks": normalized_tasks, "meetings": normalized_meetings}
 
         except json.JSONDecodeError as e:
-            logger.error("Meeting JSON error: %s | raw: %s", e, raw_response)
-            return []
+            logger.error("Combined JSON error: %s | raw: %s", e, raw_response)
+            return None
         except Exception as e:
-            logger.error("Meeting extraction failed: %s", e, exc_info=True)
-            return []
-
-    # ──────────────────────────────────────────────────────────────────────
-    # extract_meeting_from_message  (обратная совместимость, single message)
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def extract_meeting_from_message(
-        self,
-        message_text: str,
-        current_context: str,
-    ) -> Optional[Dict[str, Any]]:
-        """Обёртка для одного сообщения — возвращает первую встречу или None."""
-        meetings = await self.extract_meetings_from_messages(
-            message_text=message_text,
-            current_context=current_context,
-        )
-        return meetings[0] if meetings else None
-
+            logger.error("Combined extraction failed: %s", e, exc_info=True)
+            return None
+        
     # ──────────────────────────────────────────────────────────────────────
     # generate_summary
     # ──────────────────────────────────────────────────────────────────────
@@ -955,7 +665,7 @@ class LLMClient:
 
         try:
             result = await self.chat_completion(
-                messages=messages, temperature=0.3, max_tokens=3000
+                messages=messages, temperature=0.2, max_tokens=2000
             )
             logger.info("Summary generated | len=%d", len(result))
             return result

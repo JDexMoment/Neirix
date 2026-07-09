@@ -24,9 +24,60 @@ def _is_bot_user(user: TelegramUser) -> bool:
 
 
 def _find_user_by_username(clean_name: str) -> Optional[TelegramUser]:
-    return TelegramUser.objects.filter(
-        Q(username__iexact=clean_name) | Q(full_name__icontains=clean_name)
+    # Ищем пользователя по username (без учета регистра)
+    user = TelegramUser.objects.filter(
+        username__iexact=clean_name
     ).first()
+    
+    if user:
+        return user
+    
+    # Если не найден по username, ищем по полному имени (точное совпадение)
+    user = TelegramUser.objects.filter(
+        full_name__iexact=clean_name
+    ).first()
+    
+    if user:
+        return user
+    
+    # Если имя состоит из двух слов, пробуем найти по частям
+    name_parts = clean_name.split()
+    if len(name_parts) == 2:
+        user = TelegramUser.objects.filter(
+            Q(full_name__icontains=name_parts[0]) & Q(full_name__icontains=name_parts[1])
+        ).first()
+        
+        if user:
+            return user
+    
+    # Поиск по частичному совпадению в полном имени
+    user = TelegramUser.objects.filter(
+        full_name__icontains=clean_name
+    ).first()
+    
+    if user:
+        return user
+        
+    # Поиск по первому имени или фамилии (если имя содержит пробел)
+    if ' ' in clean_name:
+        first_name, last_name = clean_name.split(' ', 1)
+        user = TelegramUser.objects.filter(
+            Q(full_name__icontains=first_name) | Q(full_name__icontains=last_name)
+        ).first()
+        
+        if user:
+            return user
+    
+    # Поиск по самому длинному совпадению (на случай сокращений)
+    possible_matches = TelegramUser.objects.filter(
+        full_name__icontains=clean_name.split()[0] if clean_name.split() else clean_name
+    )
+    
+    for match in possible_matches:
+        if clean_name.lower() in match.full_name.lower() or match.full_name.lower() in clean_name.lower():
+            return match
+    
+    return None
 
 
 def _parse_start_at_from_meeting_data(meeting_data: dict) -> Optional[datetime]:
@@ -84,21 +135,55 @@ class MeetingService:
                 logger.warning("_create_meeting_from_data: empty title, skipping")
                 return None
 
+            # Удаляем упоминания пользователей из заголовка встречи
+            username_pattern = re.compile(r'@\w+')
+            clean_title = username_pattern.sub('', title).strip()
+            # Убираем лишние пробелы и возможные остатки символов
+            clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+            # Убираем лишние символы в начале и конце
+            clean_title = re.sub(r'^[,\-\s\|]+|[,\-\s\|]+$', '', clean_title).strip()
+            
+            if not clean_title:
+                logger.warning("_create_meeting_from_data: title became empty after removing mentions, skipping")
+                return None
+
             start_at = _parse_start_at_from_meeting_data(meeting_data)
             if not start_at:
                 return None
 
             meeting = await sync_to_async(Meeting.objects.create)(
-                title=title,
+                title=clean_title,
                 topic=source_message.topic,
                 start_at=start_at,
                 source_message=source_message,
+                creator=source_message.author,  # Устанавливаем создателя как автора сообщения
             )
 
             participants_names: List[str] = meeting_data.get("participants", [])
+            has_all_participants = False
+            
+            # Проверяем, упомянут ли автор сообщения в тексте сообщения
+            message_text_lower = source_message.text.lower()
+            author_mentioned = False
+            
+            if source_message.author.username:
+                author_mentioned = f"@{source_message.author.username}".lower() in message_text_lower
+            
+            # Если автор не упомянут в сообщении, удаляем его из списка участников
+            if not author_mentioned:
+                participants_names = [
+                    p for p in participants_names 
+                    if source_message.author.username and p.lower() != f"@{source_message.author.username}".lower()
+                ]
+            
             for raw_name in participants_names:
                 clean_name = raw_name.lstrip("@").strip()
                 if not clean_name:
+                    continue
+                
+                # Check if this is "Все участники" special case
+                if clean_name.lower() in ['все участники', 'все', 'всем']:
+                    has_all_participants = True
                     continue
 
                 user: Optional[TelegramUser] = await sync_to_async(
@@ -106,11 +191,23 @@ class MeetingService:
                 )(clean_name)
 
                 if user:
-                    await sync_to_async(meeting.participants.add)(user)
+                    # Проверяем, что пользователь не является ботом
+                    if not _is_bot_user(user):
+                        await sync_to_async(meeting.participants.add)(user)
                 else:
                     logger.warning(
                         "Meeting id=%s: participant %r not found", meeting.id, raw_name,
                     )
+            
+            # If "Все участники" was specified, we don't add individual participants
+            # The meeting will be considered as for all participants (empty participants set)
+            if has_all_participants and len([p for p in participants_names if 
+                                            p.lower().strip('@') not in ['все участники', 'все', 'всем']]):
+                # If both specific participants and "all participants" are specified,
+                # we should probably clear the specific participants to mark as all
+                # But this depends on the desired behavior
+                # For now, we'll let both coexist, but in the UI logic we handle empty participants as "all"
+                pass
 
             return meeting
 
@@ -213,7 +310,7 @@ class MeetingService:
     ) -> bool:
         """
         Отменяет встречу. Если передан notification_sender —
-        уведомляет всех участников (кроме ботов) в их ветки.
+        уведомляет всех участников (кроме ботов) в их ветке.
         """
         meeting = await self.get_meeting_by_id(meeting_id)
         if not meeting:
