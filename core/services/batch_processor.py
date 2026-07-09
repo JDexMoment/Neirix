@@ -78,62 +78,15 @@ class BatchProcessor:
 
     async def _create_task(self, task_data: dict, source_message: Message):
         """Создаёт задачу и назначает исполнителей с детальным логгированием."""
-        from datetime import datetime
-        from django.utils import timezone
-        from django.db.models import Q
-        from core.models import Task
-
-        title = (task_data.get("title") or "").strip()
-        if not title:
-            logger.warning("_create_task: empty title, skipping")
-            return None
-
-        due_date = None
-        raw_due = task_data.get("due_date")
-        if raw_due:
-            try:
-                naive_dt = datetime.strptime(str(raw_due)[:10], "%Y-%m-%d")
-                naive_dt = naive_dt.replace(hour=23, minute=59, second=0, microsecond=0)
-                current_tz = timezone.get_current_timezone()
-                due_date = timezone.make_aware(naive_dt, current_tz)
-            except (ValueError, TypeError) as e:
-                logger.warning("_create_task: invalid due_date=%r: %s", raw_due, e)
-
-        task = await sync_to_async(Task.objects.create)(
-            title=title,
-            description=(task_data.get("description") or "").strip(),
-            topic=source_message.topic,
-            due_date=due_date,
-            source_message=source_message,
-            status="open",
-        )
-
-        logger.info("_create_task: Task(id=%s, title=%r) created", task.id, task.title)
-
-        assignee_names = task_data.get("assignees", [])
-        logger.info("_create_task: processing %d assignees for task %s: %s",
-                    len(assignee_names), task.id, assignee_names)
-
-        for raw_name in assignee_names:
-            clean_name = raw_name.lstrip("@").strip()
-            if not clean_name:
-                continue
-
-            user = await sync_to_async(
-                lambda n=clean_name: TelegramUser.objects.filter(
-                    Q(username__iexact=n) | Q(full_name__icontains=n)
-                ).first()
-            )()
-
-            if user:
-                await sync_to_async(TaskAssignee.objects.create)(task=task, user=user)
-                logger.info("_create_task: assignee %s (tg_id=%s) -> task %s",
-                            clean_name, user.telegram_id, task.id)
-            else:
-                logger.error(
-                    "_create_task: assignee %r NOT FOUND in TelegramUser! "
-                    "Task %s has NO assignees -> WONT APPEAR in /tasks.", clean_name, task.id)
-
+        from core.services.task_service import TaskService
+        
+        # Используем TaskService для создания задачи с проверкой дубликатов
+        task_service = TaskService()
+        task = await task_service._create_task_from_data(task_data, source_message)
+        
+        if task:
+            logger.info("Task created | id=%s title=%s", task.id, task.title)
+        
         return task
 
     @sync_to_async

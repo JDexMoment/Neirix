@@ -7,12 +7,22 @@ from django.db.models import Q
 from django.utils import timezone
 from asgiref.sync import sync_to_async
 
-from core.models import Task, TelegramUser, Message, TaskAssignee
+from core.models import Task, TelegramUser, Message, TaskAssignee, Topic
 
 if TYPE_CHECKING:
     from core.utils.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
+
+
+_USERNAME_RE = re.compile(r"@\w+")
+_CLEAN_EDGES_RE = re.compile(r"^[\s,\-|]+|[\s,\-|]+$")
+
+
+def _find_user_by_username(clean_name: str) -> Optional[TelegramUser]:
+    return TelegramUser.objects.filter(
+        Q(username__iexact=clean_name) | Q(full_name__icontains=clean_name)
+    ).first()
 
 
 def _is_bot_user(user: TelegramUser) -> bool:
@@ -23,61 +33,69 @@ def _is_bot_user(user: TelegramUser) -> bool:
     return False
 
 
-def _find_user_by_username(clean_name: str) -> Optional[TelegramUser]:
-    # Ищем пользователя по username (без учета регистра)
-    user = TelegramUser.objects.filter(
-        username__iexact=clean_name
-    ).first()
-    
-    if user:
-        return user
-    
-    # Если не найден по username, ищем по полному имени (точное совпадение)
-    user = TelegramUser.objects.filter(
-        full_name__iexact=clean_name
-    ).first()
-    
-    if user:
-        return user
-    
-    # Если имя состоит из двух слов, пробуем найти по частям
-    name_parts = clean_name.split()
-    if len(name_parts) == 2:
-        user = TelegramUser.objects.filter(
-            Q(full_name__icontains=name_parts[0]) & Q(full_name__icontains=name_parts[1])
-        ).first()
-        
-        if user:
-            return user
-    
-    # Поиск по частичному совпадению в полном имени
-    user = TelegramUser.objects.filter(
-        full_name__icontains=clean_name
-    ).first()
-    
-    if user:
-        return user
-        
-    # Поиск по первому имени или фамилии (если имя содержит пробел)
-    if ' ' in clean_name:
-        first_name, last_name = clean_name.split(' ', 1)
-        user = TelegramUser.objects.filter(
-            Q(full_name__icontains=first_name) | Q(full_name__icontains=last_name)
-        ).first()
-        
-        if user:
-            return user
-    
-    # Поиск по самому длинному совпадению (на случай сокращений)
-    possible_matches = TelegramUser.objects.filter(
-        full_name__icontains=clean_name.split()[0] if clean_name.split() else clean_name
+def _clean_title(title: str) -> str:
+    cleaned = _USERNAME_RE.sub("", title)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = _CLEAN_EDGES_RE.sub("", cleaned).strip()
+    return cleaned
+
+
+def _is_author_mentioned(source_message: Message) -> bool:
+    if not source_message.author or not source_message.author.username:
+        return False
+    mention = f"@{source_message.author.username}".lower()
+    return mention in (source_message.text or "").lower()
+
+
+def _filter_author_from_list(names: List[str], source_message: Message) -> List[str]:
+    if _is_author_mentioned(source_message):
+        return names
+    if not source_message.author or not source_message.author.username:
+        return names
+    author_mention = f"@{source_message.author.username}".lower()
+    return [n for n in names if n.lower() != author_mention]
+
+
+_PRIVATE_CHAT_CACHE: dict = {}
+"""Простой кэш: {author_id: (linked_topic_id,)} для linked_topic из private-чата."""
+
+
+def _resolve_topic_for_private_message(source_message: Message) -> Optional[Topic]:
+    """
+    Если source_message пришёл из приватного чата, находит Topic
+    привязанной группы (через UserRole). Иначе возвращает исходный topic.
+    """
+    chat = source_message.chat
+    # Если это не приватный чат — оставляем topic как есть
+    if chat.type != "private":
+        return source_message.topic
+
+    author = source_message.author
+    if not author:
+        return source_message.topic
+
+    # Ищем привязанный групповой чат пользователя
+    from core.models import UserRole
+    linked_role = (
+        UserRole.objects.filter(user=author)
+        .select_related("chat")
+        .first()
     )
-    
-    for match in possible_matches:
-        if clean_name.lower() in match.full_name.lower() or match.full_name.lower() in clean_name.lower():
-            return match
-    
-    return None
+    if not linked_role:
+        logger.warning(
+            "_resolve_topic: user %s has no linked chat, falling back to source topic",
+            author,
+        )
+        return source_message.topic
+
+    linked_chat = linked_role.chat
+    # Берём (или создаём) topic с thread_id=0 (общая тема группы)
+    linked_topic, _ = Topic.objects.get_or_create(
+        chat=linked_chat,
+        thread_id=0,
+        defaults={"is_active": True},
+    )
+    return linked_topic
 
 
 class TaskService:
@@ -91,194 +109,154 @@ class TaskService:
             self._llm = LLMClient()
         return self._llm
 
-    def _is_bot_user(self, user: TelegramUser) -> bool:
-        """Check if the user is a bot."""
-        return user.is_bot
+    # ── Создание задачи ─────────────────────────────────────────
 
     async def _create_task_from_data(
-        self,
-        task_data: dict,
-        source_message: Message,
+        self, task_data: dict, source_message: Message,
     ) -> Optional[Task]:
         try:
             title = (task_data.get("title") or "").strip()
             if not title:
-                logger.warning(
-                    "_create_task_from_data: empty title in task_data=%s, skipping",
-                    task_data,
-                )
+                logger.warning("_create_task_from_data: empty title, skipping")
                 return None
 
-            # Удаляем упоминания пользователей из заголовка задачи
-            import re
-            username_pattern = re.compile(r'@\w+')
-            clean_title = username_pattern.sub('', title).strip()
-            # Убираем лишние пробелы и возможные остатки символов
-            clean_title = re.sub(r'\s+', ' ', clean_title).strip()
-            # Убираем лишние символы в начале и конце
-            clean_title = re.sub(r'^[,\-\s\|]+|[,\-\s\|]+$', '', clean_title).strip()
-            
+            clean_title = _clean_title(title)
             if not clean_title:
-                logger.warning("_create_task_from_data: title became empty after removing mentions, skipping")
+                logger.warning("_create_task_from_data: title empty after cleaning")
                 return None
+
+            # Определяем правильный topic (для приватных чатов — topic привязанной группы)
+            topic = await sync_to_async(_resolve_topic_for_private_message)(source_message)
 
             due_date = None
             raw_due = task_data.get("due_date")
             if raw_due:
                 try:
-                    naive_dt = datetime.strptime(raw_due, "%Y-%m-%d")
-                    naive_dt = naive_dt.replace(
-                        hour=23,
-                        minute=59,
-                        second=0,
-                        microsecond=0,
-                    )
+                    naive_dt = datetime.strptime(str(raw_due)[:10], "%Y-%m-%d")
+                    naive_dt = naive_dt.replace(hour=23, minute=59, second=0, microsecond=0)
                     current_tz = timezone.get_current_timezone()
                     due_date = timezone.make_aware(naive_dt, current_tz)
-                except ValueError:
-                    logger.warning(
-                        "_create_task_from_data: invalid due_date format %r, ignoring",
-                        raw_due,
-                    )
+                except (ValueError, TypeError):
+                    logger.warning("_create_task_from_data: invalid due_date=%r", raw_due)
 
-            task = await sync_to_async(Task.objects.create)(
-                title=clean_title,
-                description=task_data.get("description", ""),
-                topic=source_message.topic,
-                due_date=due_date,
-                source_message=source_message,
-                status="open",
-                creator=source_message.author,  # Устанавливаем создателя как автора сообщения
-            )
-
+            # Собираем исполнителей
             assignees: List[str] = task_data.get("assignees", [])
-            
-            # Проверяем, упомянут ли автор сообщения в тексте сообщения
-            message_text_lower = source_message.text.lower()
-            author_mentioned = False
-            
-            if source_message.author.username:
-                author_mentioned = f"@{source_message.author.username}".lower() in message_text_lower
-            
-            # Если автор не упомянут в сообщении, удаляем его из списка исполнителей
-            if not author_mentioned:
-                assignees = [
-                    a for a in assignees 
-                    if source_message.author.username and a.lower() != f"@{source_message.author.username}".lower()
-                ]
+            assignees = _filter_author_from_list(assignees, source_message)
+
+            assignee_objects: List[TelegramUser] = []
             for raw_name in assignees:
                 clean_name = raw_name.lstrip("@").strip()
                 if not clean_name:
                     continue
 
-                user: Optional[TelegramUser] = await sync_to_async(
-                    _find_user_by_username
-                )(clean_name)
+                user: Optional[TelegramUser] = await sync_to_async(_find_user_by_username)(clean_name)
+                if user and not _is_bot_user(user):
+                    assignee_objects.append(user)
+                elif not user:
+                    logger.warning("Task: assignee %r not found in DB", raw_name)
 
-                if user:
-                    # Skip the message author unless they are a bot
-                    if user.telegram_id == source_message.author.telegram_id:
-                        if not self._is_bot_user(user):
-                            continue
-                    await sync_to_async(TaskAssignee.objects.create)(
-                        task=task,
-                        user=user,
-                    )
-                else:
-                    logger.warning(
-                        "Task id=%s: assignee %r not found in DB, skipping",
-                        task.id,
-                        raw_name,
-                    )
+            # Проверка дубликата
+            existing = await sync_to_async(self._check_duplicate_task)(
+                clean_title, due_date, topic, assignee_objects,
+            )
+            if existing:
+                logger.info("Duplicate task: '%s' due %s, skipping", clean_title, due_date)
+                return existing
+
+            # Создание
+            task = await sync_to_async(Task.objects.create)(
+                title=clean_title,
+                description=task_data.get("description", ""),
+                topic=topic,
+                due_date=due_date,
+                source_message=source_message,
+                creator=source_message.author,
+                status="open",
+            )
+
+            for user in assignee_objects:
+                await sync_to_async(TaskAssignee.objects.create)(task=task, user=user)
 
             return task
 
         except Exception as e:
-            logger.error(
-                "_create_task_from_data: task creation failed for task_data=%s: %s",
-                task_data,
-                e,
-                exc_info=True,
-            )
+            logger.error("_create_task_from_data error: %s", e, exc_info=True)
             return None
+
+    # ── Проверка дубликата ──────────────────────────────────────
+
+    def _check_duplicate_task(
+        self, title: str, due_date, topic, assignees: List[TelegramUser],
+    ) -> Optional[Task]:
+        possible = Task.objects.filter(
+            title=title, due_date=due_date, topic=topic, status="open",
+        )
+        new_ids = {a.id for a in assignees}
+        for task in possible:
+            existing_ids = set(task.assignees.values_list("user_id", flat=True))
+            if existing_ids == new_ids:
+                return task
+        return None
+
+    # ── Извлечение ──────────────────────────────────────────────
 
     async def extract_tasks_from_message(self, message: Message) -> List[Task]:
         now = timezone.localtime(timezone.now())
-        context_str = now.strftime("%Y-%m-%d %H:%M")
-
         tasks_data = await self.llm.extract_tasks_from_message(
-            message.text,
-            current_context=context_str,
+            message.text, current_context=now.strftime("%Y-%m-%d %H:%M"),
         )
-
-        created_tasks: List[Task] = []
-
-        for task_data in tasks_data:
+        created: List[Task] = []
+        for task_data in (tasks_data or []):
             task = await self._create_task_from_data(task_data, message)
             if task:
-                created_tasks.append(task)
-
-        return created_tasks
+                created.append(task)
+        return created
 
     async def extract_tasks_from_messages_batch(
-        self,
-        messages: list["Message"],
+        self, messages: list["Message"],
     ) -> list[Task]:
-        """
-        Извлекает задачи из пачки сообщений одним вызовом LLM.
-        """
         if not messages:
             return []
 
         messages = sorted(messages, key=lambda m: m.timestamp)
-
         context_lines = []
         for msg in messages:
             author = (
                 f"@{msg.author.username}"
                 if msg.author and msg.author.username
-                else (
-                    msg.author.full_name
-                    or str(msg.author.telegram_id)
-                )
+                else (msg.author.full_name or str(msg.author.telegram_id))
             )
             time_str = timezone.localtime(msg.timestamp).strftime("%H:%M")
             context_lines.append(f"[{time_str}] {author}: {msg.text}")
 
         batch_text = "\n".join(context_lines)
-
         now = timezone.localtime(timezone.now())
-        context_str = now.strftime("%Y-%m-%d %H:%M")
 
         try:
             tasks_data = await self.llm.extract_tasks_from_messages(
-                batch_text,
-                current_context=context_str,
+                batch_text, current_context=now.strftime("%Y-%m-%d %H:%M"),
             )
         except Exception as e:
-            logger.error("Batch task extraction LLM call failed: %s", e, exc_info=True)
+            logger.error("Batch task extraction failed: %s", e, exc_info=True)
             return []
 
         if not tasks_data:
             return []
 
-        created_tasks: list[Task] = []
+        created: list[Task] = []
         source_message = messages[-1]
-
         for task_data in tasks_data:
             task = await self._create_task_from_data(task_data, source_message)
             if task:
-                created_tasks.append(task)
+                created.append(task)
+        return created
 
-        return created_tasks
+    # ── Запросы ─────────────────────────────────────────────────
 
     async def get_user_tasks(self, user: TelegramUser, status: str = "open") -> List[Task]:
         def _query() -> List[Task]:
             return list(
-                Task.objects.filter(
-                    assignees__user=user,
-                    status=status,
-                ).order_by("due_date")
+                Task.objects.filter(assignees__user=user, status=status).order_by("due_date")
             )
         return await sync_to_async(_query)()
 
@@ -286,35 +264,20 @@ class TaskService:
         def _update() -> bool:
             try:
                 task = Task.objects.get(id=task_id)
-
-                is_assignee = TaskAssignee.objects.filter(
-                    task=task,
-                    user=user,
-                ).exists()
-
-                if not is_assignee:
-                    logger.warning(
-                        "mark_task_done: user %s is not assignee of task %s, denied",
-                        user.id, task_id,
-                    )
+                if not TaskAssignee.objects.filter(task=task, user=user).exists():
+                    logger.warning("mark_task_done: user %s not assignee of task %s", user.id, task_id)
                     return False
-
                 task.status = "done"
                 task.save(update_fields=["status"])
                 return True
-
             except Task.DoesNotExist:
                 return False
-
         return await sync_to_async(_update)()
 
     async def get_overdue_tasks(self) -> List[Task]:
         def _query() -> List[Task]:
             return list(
-                Task.objects.filter(
-                    status="open",
-                    due_date__lt=timezone.now(),
-                )
+                Task.objects.filter(status="open", due_date__lt=timezone.now())
                 .select_related("topic")
                 .prefetch_related("assignees__user")
             )

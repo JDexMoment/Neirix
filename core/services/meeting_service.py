@@ -7,12 +7,22 @@ from django.db.models import Q
 from django.utils import timezone
 from asgiref.sync import sync_to_async
 
-from core.models import Meeting, TelegramUser, Message
+from core.models import Meeting, TelegramUser, Message, Topic
 
 if TYPE_CHECKING:
     from core.utils.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
+
+
+_USERNAME_RE = re.compile(r"@\w+")
+_CLEAN_EDGES_RE = re.compile(r"^[\s,\-|]+|[\s,\-|]+$")
+
+
+def _find_user_by_username(clean_name: str) -> Optional[TelegramUser]:
+    return TelegramUser.objects.filter(
+        Q(username__iexact=clean_name) | Q(full_name__icontains=clean_name)
+    ).first()
 
 
 def _is_bot_user(user: TelegramUser) -> bool:
@@ -23,66 +33,31 @@ def _is_bot_user(user: TelegramUser) -> bool:
     return False
 
 
-def _find_user_by_username(clean_name: str) -> Optional[TelegramUser]:
-    # Ищем пользователя по username (без учета регистра)
-    user = TelegramUser.objects.filter(
-        username__iexact=clean_name
-    ).first()
-    
-    if user:
-        return user
-    
-    # Если не найден по username, ищем по полному имени (точное совпадение)
-    user = TelegramUser.objects.filter(
-        full_name__iexact=clean_name
-    ).first()
-    
-    if user:
-        return user
-    
-    # Если имя состоит из двух слов, пробуем найти по частям
-    name_parts = clean_name.split()
-    if len(name_parts) == 2:
-        user = TelegramUser.objects.filter(
-            Q(full_name__icontains=name_parts[0]) & Q(full_name__icontains=name_parts[1])
-        ).first()
-        
-        if user:
-            return user
-    
-    # Поиск по частичному совпадению в полном имени
-    user = TelegramUser.objects.filter(
-        full_name__icontains=clean_name
-    ).first()
-    
-    if user:
-        return user
-        
-    # Поиск по первому имени или фамилии (если имя содержит пробел)
-    if ' ' in clean_name:
-        first_name, last_name = clean_name.split(' ', 1)
-        user = TelegramUser.objects.filter(
-            Q(full_name__icontains=first_name) | Q(full_name__icontains=last_name)
-        ).first()
-        
-        if user:
-            return user
-    
-    # Поиск по самому длинному совпадению (на случай сокращений)
-    possible_matches = TelegramUser.objects.filter(
-        full_name__icontains=clean_name.split()[0] if clean_name.split() else clean_name
-    )
-    
-    for match in possible_matches:
-        if clean_name.lower() in match.full_name.lower() or match.full_name.lower() in clean_name.lower():
-            return match
-    
-    return None
+def _clean_title(title: str) -> str:
+    cleaned = _USERNAME_RE.sub("", title)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = _CLEAN_EDGES_RE.sub("", cleaned).strip()
+    return cleaned
+
+
+def _is_author_mentioned(source_message: Message) -> bool:
+    if not source_message.author or not source_message.author.username:
+        return False
+    mention = f"@{source_message.author.username}".lower()
+    return mention in (source_message.text or "").lower()
+
+
+def _filter_author_from_list(names: List[str], source_message: Message) -> List[str]:
+    if _is_author_mentioned(source_message):
+        return names
+    if not source_message.author or not source_message.author.username:
+        return names
+    author_mention = f"@{source_message.author.username}".lower()
+    return [n for n in names if n.lower() != author_mention]
 
 
 def _parse_start_at_from_meeting_data(meeting_data: dict) -> Optional[datetime]:
     current_tz = timezone.get_current_timezone()
-
     raw_start_at = (meeting_data.get("start_at") or "").strip()
     if raw_start_at:
         try:
@@ -95,20 +70,50 @@ def _parse_start_at_from_meeting_data(meeting_data: dict) -> Optional[datetime]:
 
     raw_date = (meeting_data.get("date") or "").strip()
     raw_time = (meeting_data.get("time") or "").strip()
-
     if not raw_date or not raw_time:
-        logger.warning(
-            "Meeting skipped: incomplete date/time | date=%r time=%r",
-            raw_date, raw_time,
-        )
+        logger.warning("Meeting skipped: incomplete date/time | date=%r time=%r", raw_date, raw_time)
         return None
-
     try:
         naive_dt = datetime.strptime(f"{raw_date} {raw_time}", "%Y-%m-%d %H:%M")
         return timezone.make_aware(naive_dt, current_tz)
     except ValueError:
         logger.warning("Invalid meeting date/time | date=%r time=%r", raw_date, raw_time)
         return None
+
+
+def _resolve_topic_for_private_message(source_message: Message):
+    """
+    Если source_message пришёл из приватного чата, находит Topic
+    привязанной группы (через UserRole). Иначе возвращает исходный topic.
+    """
+    chat = source_message.chat
+    if chat.type != "private":
+        return source_message.topic
+
+    author = source_message.author
+    if not author:
+        return source_message.topic
+
+    from core.models import UserRole
+    linked_role = (
+        UserRole.objects.filter(user=author)
+        .select_related("chat")
+        .first()
+    )
+    if not linked_role:
+        logger.warning(
+            "_resolve_topic: user %s has no linked chat, falling back to source topic",
+            author,
+        )
+        return source_message.topic
+
+    linked_chat = linked_role.chat
+    linked_topic, _ = Topic.objects.get_or_create(
+        chat=linked_chat,
+        thread_id=0,
+        defaults={"is_active": True},
+    )
+    return linked_topic
 
 
 class MeetingService:
@@ -122,9 +127,7 @@ class MeetingService:
             self._llm = LLMClient()
         return self._llm
 
-    # ─────────────────────────────────────────────────────────────────
-    #  Создание встреч
-    # ─────────────────────────────────────────────────────────────────
+    # ── Создание встречи ────────────────────────────────────────
 
     async def _create_meeting_from_data(
         self, meeting_data: dict, source_message: Message,
@@ -135,79 +138,60 @@ class MeetingService:
                 logger.warning("_create_meeting_from_data: empty title, skipping")
                 return None
 
-            # Удаляем упоминания пользователей из заголовка встречи
-            username_pattern = re.compile(r'@\w+')
-            clean_title = username_pattern.sub('', title).strip()
-            # Убираем лишние пробелы и возможные остатки символов
-            clean_title = re.sub(r'\s+', ' ', clean_title).strip()
-            # Убираем лишние символы в начале и конце
-            clean_title = re.sub(r'^[,\-\s\|]+|[,\-\s\|]+$', '', clean_title).strip()
-            
+            clean_title = _clean_title(title)
             if not clean_title:
-                logger.warning("_create_meeting_from_data: title became empty after removing mentions, skipping")
+                logger.warning("_create_meeting_from_data: title empty after cleaning")
                 return None
+
+            # Определяем правильный topic (для приватных чатов — topic привязанной группы)
+            topic = await sync_to_async(_resolve_topic_for_private_message)(source_message)
 
             start_at = _parse_start_at_from_meeting_data(meeting_data)
             if not start_at:
                 return None
 
-            meeting = await sync_to_async(Meeting.objects.create)(
-                title=clean_title,
-                topic=source_message.topic,
-                start_at=start_at,
-                source_message=source_message,
-                creator=source_message.author,  # Устанавливаем создателя как автора сообщения
-            )
-
+            # Собираем участников в один проход
             participants_names: List[str] = meeting_data.get("participants", [])
-            has_all_participants = False
-            
-            # Проверяем, упомянут ли автор сообщения в тексте сообщения
-            message_text_lower = source_message.text.lower()
-            author_mentioned = False
-            
-            if source_message.author.username:
-                author_mentioned = f"@{source_message.author.username}".lower() in message_text_lower
-            
-            # Если автор не упомянут в сообщении, удаляем его из списка участников
-            if not author_mentioned:
-                participants_names = [
-                    p for p in participants_names 
-                    if source_message.author.username and p.lower() != f"@{source_message.author.username}".lower()
-                ]
-            
+            participants_names = _filter_author_from_list(participants_names, source_message)
+
+            has_all = False
+            participant_objects: List[TelegramUser] = []
+
             for raw_name in participants_names:
                 clean_name = raw_name.lstrip("@").strip()
                 if not clean_name:
                     continue
-                
-                # Check if this is "Все участники" special case
-                if clean_name.lower() in ['все участники', 'все', 'всем']:
-                    has_all_participants = True
+
+                if clean_name.lower() in ("все участники", "все", "всем"):
+                    has_all = True
                     continue
 
-                user: Optional[TelegramUser] = await sync_to_async(
-                    _find_user_by_username
-                )(clean_name)
+                user: Optional[TelegramUser] = await sync_to_async(_find_user_by_username)(clean_name)
+                if user and not _is_bot_user(user):
+                    participant_objects.append(user)
+                elif not user:
+                    logger.warning("Meeting: participant %r not found", raw_name)
 
-                if user:
-                    # Проверяем, что пользователь не является ботом
-                    if not _is_bot_user(user):
-                        await sync_to_async(meeting.participants.add)(user)
-                else:
-                    logger.warning(
-                        "Meeting id=%s: participant %r not found", meeting.id, raw_name,
-                    )
-            
-            # If "Все участники" was specified, we don't add individual participants
-            # The meeting will be considered as for all participants (empty participants set)
-            if has_all_participants and len([p for p in participants_names if 
-                                            p.lower().strip('@') not in ['все участники', 'все', 'всем']]):
-                # If both specific participants and "all participants" are specified,
-                # we should probably clear the specific participants to mark as all
-                # But this depends on the desired behavior
-                # For now, we'll let both coexist, but in the UI logic we handle empty participants as "all"
-                pass
+            # Проверка дубликата
+            existing = await sync_to_async(self._check_duplicate_meeting)(
+                clean_title, start_at, topic, participant_objects,
+            )
+            if existing:
+                logger.info("Duplicate meeting: '%s' at %s, skipping", clean_title, start_at)
+                return existing
+
+            # Создание
+            meeting = await sync_to_async(Meeting.objects.create)(
+                title=clean_title,
+                topic=topic,
+                start_at=start_at,
+                source_message=source_message,
+                creator=source_message.author,
+            )
+
+            if not has_all:
+                for user in participant_objects:
+                    await sync_to_async(meeting.participants.add)(user)
 
             return meeting
 
@@ -215,14 +199,29 @@ class MeetingService:
             logger.error("_create_meeting_from_data error: %s", e, exc_info=True)
             return None
 
+    # ── Проверка дубликата ──────────────────────────────────────
+
+    def _check_duplicate_meeting(
+        self, title: str, start_at: datetime, topic, participants: List[TelegramUser],
+    ) -> Optional[Meeting]:
+        possible = Meeting.objects.filter(
+            title=title, start_at=start_at, topic=topic, status="active",
+        )
+        new_ids = {p.id for p in participants}
+        for meeting in possible:
+            existing_ids = set(meeting.participants.values_list("id", flat=True))
+            if existing_ids == new_ids:
+                return meeting
+        return None
+
+    # ── Извлечение ──────────────────────────────────────────────
+
     async def extract_meeting_from_message(self, message: Message) -> Optional[Meeting]:
         now = timezone.localtime(timezone.now())
         meeting_data = await self.llm.extract_meeting_from_message(
             message.text, current_context=now.strftime("%Y-%m-%d %H:%M"),
         )
-        if not meeting_data:
-            return None
-        return await self._create_meeting_from_data(meeting_data, message)
+        return await self._create_meeting_from_data(meeting_data, message) if meeting_data else None
 
     async def extract_meetings_from_messages_batch(
         self, messages: list["Message"],
@@ -231,7 +230,6 @@ class MeetingService:
             return []
 
         messages = sorted(messages, key=lambda m: m.timestamp)
-
         context_lines = []
         for msg in messages:
             author = (
@@ -262,12 +260,9 @@ class MeetingService:
             meeting = await self._create_meeting_from_data(meeting_data, source_message)
             if meeting:
                 created.append(meeting)
-
         return created
 
-    # ─────────────────────────────────────────────────────────────────
-    #  Запросы
-    # ─────────────────────────────────────────────────────────────────
+    # ── Запросы ─────────────────────────────────────────────────
 
     async def get_upcoming_meetings(self, hours_ahead: int = 24) -> List[Meeting]:
         def _query() -> List[Meeting]:
@@ -299,19 +294,11 @@ class MeetingService:
             meeting.save(update_fields=["reminder_sent"])
         await sync_to_async(_update)()
 
-    # ─────────────────────────────────────────────────────────────────
-    #  Отмена встречи  (с уведомлением всех участников)
-    # ─────────────────────────────────────────────────────────────────
+    # ── Отмена / перенос ───────────────────────────────────────
 
     async def cancel_meeting(
-        self,
-        meeting_id: int,
-        notification_sender=None,  # NotificationSender | None
+        self, meeting_id: int, notification_sender=None,
     ) -> bool:
-        """
-        Отменяет встречу. Если передан notification_sender —
-        уведомляет всех участников (кроме ботов) в их ветке.
-        """
         meeting = await self.get_meeting_by_id(meeting_id)
         if not meeting:
             return False
@@ -319,34 +306,18 @@ class MeetingService:
         def _cancel():
             meeting.status = "cancelled"
             meeting.save(update_fields=["status"])
-
         await sync_to_async(_cancel)()
 
-        # Уведомляем участников
         if notification_sender is not None:
-            participants = list(meeting.participants.all())
-            for user in participants:
+            for user in meeting.participants.all():
                 if _is_bot_user(user):
                     continue
                 await notification_sender.send_meeting_cancelled(user, meeting)
-
         return True
 
-    # ─────────────────────────────────────────────────────────────────
-    #  Перенос встречи  (с уведомлением всех участников)
-    # ─────────────────────────────────────────────────────────────────
-
     async def reschedule_meeting(
-        self,
-        meeting_id: int,
-        new_start_at: datetime,
-        notification_sender=None,  # NotificationSender | None
+        self, meeting_id: int, new_start_at: datetime, notification_sender=None,
     ) -> Optional[Meeting]:
-        """
-        Переносит встречу. Если передан notification_sender —
-        уведомляет всех участников о переносе.
-        Возвращает обновлённую встречу или None.
-        """
         old_meeting = await self.get_meeting_by_id(meeting_id)
         if not old_meeting:
             return None
@@ -358,21 +329,14 @@ class MeetingService:
             old_meeting.status = "active"
             old_meeting.reminder_sent = False
             old_meeting.daily_reminder_sent = False
-            old_meeting.save(
-                update_fields=["start_at", "status", "reminder_sent", "daily_reminder_sent"]
-            )
+            old_meeting.save(update_fields=["start_at", "status", "reminder_sent", "daily_reminder_sent"])
             return old_meeting
 
         meeting = await sync_to_async(_reschedule)()
 
-        # Уведомляем участников
         if notification_sender is not None:
-            participants = list(meeting.participants.all())
-            for user in participants:
+            for user in meeting.participants.all():
                 if _is_bot_user(user):
                     continue
-                await notification_sender.send_meeting_rescheduled(
-                    user, meeting, old_start_at,
-                )
-
+                await notification_sender.send_meeting_rescheduled(user, meeting, old_start_at)
         return meeting

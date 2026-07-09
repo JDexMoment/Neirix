@@ -38,47 +38,24 @@ def _get_upcoming_meetings_for_private(db_user, chat=None) -> List[Meeting]:
     from django.db.models import Q
 
     now = timezone.now()
-    
-    # Get meetings where the user is a participant
-    meetings_with_user = Meeting.objects.filter(
-        participants=db_user,
-        start_at__gte=now,
-        status='active',
+    query = Q(participants=db_user)
+    if chat is not None:
+        query |= Q(topic__chat=chat)
+
+    return list(
+        Meeting.objects.filter(
+            query,
+            start_at__gte=now,
+            status='active',
+        )
+        .select_related("topic", "topic__chat", "creator")
+        .prefetch_related("participants")
+        .order_by("start_at", "id")
+        .distinct()
     )
-    
-    # Get meetings that have no specific participants (meaning all participants)
-    # Approach: Find meetings where no participants are explicitly added
-    # We'll get all meetings and then filter in Python
-    all_meetings = Meeting.objects.filter(
-        start_at__gte=now,
-        status='active',
-    ).select_related("topic", "topic__chat", "creator").prefetch_related("participants")
-
-    # Filter meetings that have no participants
-    meetings_all_users = []
-    for meeting in all_meetings:
-        if not meeting.participants.exists():
-            meetings_all_users.append(meeting)
-
-    # Combine the results
-    all_meetings_filtered = list(meetings_with_user.select_related("topic", "topic__chat", "creator").prefetch_related("participants"))
-    all_meetings_filtered.extend(meetings_all_users)
-    
-    # Remove duplicates and sort
-    seen_ids = set()
-    unique_meetings = []
-    for meeting in all_meetings_filtered:
-        if meeting.id not in seen_ids:
-            seen_ids.add(meeting.id)
-            unique_meetings.append(meeting)
-    
-    return sorted(unique_meetings, key=lambda m: m.start_at)
 
 
 def _get_upcoming_meetings_for_chat(chat, topic=None) -> List[Meeting]:
-    from django.db.models import Q
-    from core.models import Message as DBMessage
-
     now = timezone.now()
     filters = {
         "topic__chat": chat,
@@ -88,27 +65,12 @@ def _get_upcoming_meetings_for_chat(chat, topic=None) -> List[Meeting]:
     if topic is not None:
         filters["topic"] = topic
 
-    # Get meetings in this chat
-    chat_meetings = Meeting.objects.filter(**filters)
-
-    # We also want to include meetings assigned to users who have interacted in this chat
-    users_in_chat = DBMessage.objects.filter(chat=chat).values_list('author', flat=True).distinct()
-    
-    # Get meetings assigned to these users (or meetings for all participants)
-    assigned_meetings = Meeting.objects.filter(
-        Q(participants__in=users_in_chat) | ~Q(participants__isnull=False),
-        start_at__gte=now,
-        status="active"
-    )
-
-    # Combine both querysets
-    combined_meetings = (chat_meetings | assigned_meetings).distinct()
-
     return list(
-        combined_meetings
+        Meeting.objects.filter(**filters)
         .select_related("topic", "topic__chat", "creator")
         .prefetch_related("participants")
         .order_by("start_at", "id")
+        .distinct()
     )
 
 
@@ -134,15 +96,13 @@ def _format_meeting_time(meeting: Meeting) -> str:
     return dt.strftime("%d.%m.%Y %H:%M")
 
 
-def _format_creator(meeting: Meeting) -> str:
-    if not meeting.creator:
-        return ""
-    if meeting.creator.username:
-        return f"<a href=\"tg://user?id={meeting.creator.telegram_id}\">@{meeting.creator.username}</a>"
-    elif meeting.creator.full_name:
-        return f"<a href=\"tg://user?id={meeting.creator.telegram_id}\">{meeting.creator.full_name}</a>"
-    else:
-        return f"id={meeting.creator.id}"
+def _format_creator(creator) -> str:
+    """Форматирует создателя встречи."""
+    if not creator:
+        return "неизвестен"
+    if creator.username:
+        return f"@{creator.username}"
+    return creator.full_name or f"id={creator.id}"
 
 
 def _parse_user_datetime(text: str) -> Optional[datetime]:
@@ -216,18 +176,14 @@ async def cmd_meetings(message: Message):
     for m in meetings:
         mentions = _format_participants(m)
         local_time = _format_meeting_time(m)
-        creator = _format_creator(m)
         title = (m.title or "Без названия").strip()
-
-        meeting_info = f"• <b>{title}</b>\n" \
-                       f"  ⏰ {local_time}\n" \
-                       f"  👥 {mentions}"
-                       
-        if creator:
-            meeting_info += f"\n  📝 Назначил(а): {creator}"
+        creator_str = _format_creator(m.creator)
 
         await message.answer(
-            meeting_info,
+            f"• <b>{title}</b>\n"
+            f"  ⏰ {local_time}\n"
+            f"  👥 {mentions}\n"
+            f"  📝 Назначил(а): {creator_str}",
             parse_mode="HTML",
             reply_markup=meeting_keyboard(m.id),
         )
