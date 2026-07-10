@@ -52,9 +52,10 @@ class TestBatchProcessor:
     async def test_empty_messages(self):
         """Пустой список → нули."""
         with patch("core.services.batch_processor.VectorStoreClient"):
-            from core.services.batch_processor import BatchProcessor
-            processor = BatchProcessor()
-            result = await processor.process_batch(-100, 0, [])
+            with patch("core.services.batch_processor.user_can_create", return_value=True):
+                from core.services.batch_processor import BatchProcessor
+                processor = BatchProcessor()
+                result = await processor.process_batch(-100, 0, [])
         assert result == {"tasks_created": 0, "meetings_created": 0}
 
     @pytest.mark.asyncio
@@ -63,12 +64,13 @@ class TestBatchProcessor:
         with patch("core.services.batch_processor.VectorStoreClient"):
             with patch("core.services.batch_processor.Message") as MockMsg:
                 MockMsg.objects = _make_mock_qs([])
-                from core.services.batch_processor import BatchProcessor
-                processor = BatchProcessor()
-                result = await processor.process_batch(
-                    -100, 0,
-                    [{"message_id": 999, "text": "x", "author_name": "u", "timestamp": 1.0}],
-                )
+                with patch("core.services.batch_processor.user_can_create", return_value=True):
+                    from core.services.batch_processor import BatchProcessor
+                    processor = BatchProcessor()
+                    result = await processor.process_batch(
+                        -100, 0,
+                        [{"message_id": 999, "text": "x", "author_name": "u", "timestamp": 1.0}],
+                    )
         assert result == {"tasks_created": 0, "meetings_created": 0}
 
     @pytest.mark.asyncio
@@ -91,8 +93,6 @@ class TestBatchProcessor:
                     new_callable=AsyncMock,
                     return_value=[[0.1, 0.2]] * 3,
                 ) as mock_embed:
-                    # Исправление: LLMClient импортируется как from core.utils.llm_client import LLMClient
-                    # поэтому пэтчить надо путь в модуле, где он реально определён
                     with patch("core.utils.llm_client.LLMClient") as MockLLM:
                         mock_llm = MagicMock()
                         mock_llm.extract_all_from_messages = AsyncMock(
@@ -100,9 +100,10 @@ class TestBatchProcessor:
                         )
                         MockLLM.return_value = mock_llm
 
-                        from core.services.batch_processor import BatchProcessor
-                        processor = BatchProcessor()
-                        await processor.process_batch(-100, 0, buffer_data)
+                        with patch("core.services.batch_processor.user_can_create", return_value=True):
+                            from core.services.batch_processor import BatchProcessor
+                            processor = BatchProcessor()
+                            await processor.process_batch(-100, 0, buffer_data)
 
         mock_embed.assert_called_once()
         assert len(mock_embed.call_args[0][0]) == 3
@@ -133,9 +134,10 @@ class TestBatchProcessor:
                         )
                         MockLLM.return_value = mock_llm
 
-                        from core.services.batch_processor import BatchProcessor
-                        processor = BatchProcessor()
-                        await processor.process_batch(-100, 0, buffer_data)
+                        with patch("core.services.batch_processor.user_can_create", return_value=True):
+                            from core.services.batch_processor import BatchProcessor
+                            processor = BatchProcessor()
+                            await processor.process_batch(-100, 0, buffer_data)
 
         mock_qs.update.assert_called_once_with(is_processed=True)
 
@@ -163,11 +165,11 @@ class TestBatchProcessor:
                         )
                         MockLLM.return_value = mock_llm
 
-                        from core.services.batch_processor import BatchProcessor
-                        processor = BatchProcessor()
-                        result = await processor.process_batch(-100, 0, buffer_data)
+                        with patch("core.services.batch_processor.user_can_create", return_value=True):
+                            from core.services.batch_processor import BatchProcessor
+                            processor = BatchProcessor()
+                            result = await processor.process_batch(-100, 0, buffer_data)
 
-        # При ошибке извлечения — 0 созданных сущностей, но сообщения помечены
         assert result["tasks_created"] == 0
         assert result["meetings_created"] == 0
 
@@ -202,16 +204,16 @@ class TestBatchProcessor:
                         )
                         MockLLM.return_value = mock_llm
 
-                        # Мокаем _create_task
-                        with patch.object(
-                            __import__("core.services.batch_processor", fromlist=["BatchProcessor"]).BatchProcessor,
-                            "_create_task",
-                            new_callable=AsyncMock,
-                            side_effect=lambda data, msg: MagicMock(id=1),
-                        ):
-                            from core.services.batch_processor import BatchProcessor
-                            processor = BatchProcessor()
-                            result = await processor.process_batch(-100, 0, buffer_data)
+                        with patch("core.services.batch_processor.user_can_create", return_value=True):
+                            with patch.object(
+                                __import__("core.services.batch_processor", fromlist=["BatchProcessor"]).BatchProcessor,
+                                "_create_task",
+                                new_callable=AsyncMock,
+                                side_effect=lambda data, msg: MagicMock(id=1),
+                            ):
+                                from core.services.batch_processor import BatchProcessor
+                                processor = BatchProcessor()
+                                result = await processor.process_batch(-100, 0, buffer_data)
 
         assert result["tasks_created"] == 2
         assert result["meetings_created"] == 0
@@ -250,7 +252,7 @@ class TestFullFlowTopicResolution:
             telegram_id=4001, username="dev", full_name="Dev User",
         )
         await sync_to_async(UserRole.objects.create)(
-            user=author, chat=group_chat, role="member",
+            user=author, chat=group_chat, role="admin",
         )
         private_chat = await sync_to_async(TelegramChat.objects.create)(
             chat_id=400100, title="", type="private",
@@ -325,7 +327,7 @@ class TestFullFlowTopicResolution:
     async def test_batch_from_group_preserves_own_topic(self):
         from unittest.mock import AsyncMock, MagicMock, patch
         from core.services.batch_processor import BatchProcessor
-        from core.models import TelegramChat, TelegramUser, Topic, Message, Task
+        from core.models import TelegramChat, TelegramUser, Topic, Message, Task, UserRole
 
         group_chat = await sync_to_async(TelegramChat.objects.create)(
             chat_id=-5001, title="Team Chat", type="supergroup",
@@ -335,6 +337,9 @@ class TestFullFlowTopicResolution:
         )
         author = await sync_to_async(TelegramUser.objects.create)(
             telegram_id=5001, username="teammate", full_name="Teammate",
+        )
+        await sync_to_async(UserRole.objects.create)(
+            user=author, chat=group_chat, role="admin",
         )
         db_msg = await sync_to_async(Message.objects.create)(
             telegram_msg_id=801, chat=group_chat, topic=group_topic,

@@ -17,6 +17,7 @@ class TestMessageHandlerForumFlag:
         и запланировать delayed processing через apply_async.
         """
         from bot.handlers import messages as messages_handler
+        from core.models import TelegramUser, TelegramChat, UserRole
 
         fake_message = MagicMock()
         fake_message.message_id = 101
@@ -34,15 +35,47 @@ class TestMessageHandlerForumFlag:
         fake_message.chat.type = "supergroup"
         fake_message.chat.is_forum = None
 
+        # 👇 ДОБАВИТЬ — создаём роль ДО вызова хендлера
+        user_obj, _ = TelegramUser.objects.get_or_create(
+            telegram_id=1111,
+            defaults={"username": "evgeny", "full_name": "Евгений", "is_bot": False},
+        )
+        chat_obj, _ = TelegramChat.objects.get_or_create(
+            chat_id=-100123456,
+            defaults={"title": "", "type": "supergroup"},
+        )
+        UserRole.objects.get_or_create(
+            user=user_obj,
+            chat=chat_obj,
+            defaults={"role": "admin"},
+        )
+
         monkeypatch.setattr(
             messages_handler.message_buffer,
             "add_message",
-            MagicMock(return_value=1),  # первое сообщение в батче
+            MagicMock(return_value=1),
         )
 
         with patch.object(messages_handler.process_target_buffer, "apply_async") as apply_async_mock:
             with patch.object(messages_handler.process_target_buffer, "delay") as delay_mock:
                 async_to_sync(messages_handler.handle_text_message)(fake_message)
+
+        chat = TelegramChat.objects.get(chat_id=-100123456)
+
+        # Создаём роль ДО вызова хендлера
+        user_obj, _ = TelegramUser.objects.get_or_create(
+            telegram_id=1111,
+            defaults={"username": "evgeny", "full_name": "Евгений", "is_bot": False},
+        )
+        chat_obj, _ = TelegramChat.objects.get_or_create(
+            chat_id=-100123456,
+            defaults={"title": "", "type": "supergroup"},
+        )
+        UserRole.objects.get_or_create(
+            user=user_obj,
+            chat=chat_obj,
+            defaults={"role": "admin"},
+        )
 
         chat = TelegramChat.objects.get(chat_id=-100123456)
         assert chat.type == "supergroup"
@@ -70,6 +103,7 @@ class TestMessageHandlerForumFlag:
         поле не должно стать None.
         """
         from bot.handlers import messages as messages_handler
+        from core.models import TelegramChat, TelegramUser, Topic, Message as DBMessage, UserRole
 
         existing_chat = TelegramChat.objects.create(
             chat_id=-100999888,
@@ -102,8 +136,28 @@ class TestMessageHandlerForumFlag:
 
         with patch.object(messages_handler.process_target_buffer, "apply_async") as apply_async_mock:
             with patch.object(messages_handler.process_target_buffer, "delay") as delay_mock:
+                # 👇 ДОБАВИТЬ — создаём роль ДО вызова хендлера
+                user_obj2, _ = TelegramUser.objects.get_or_create(
+                    telegram_id=2222,
+                    defaults={"username": "tester", "full_name": "Test User", "is_bot": False},
+                )
+                UserRole.objects.get_or_create(
+                    user=user_obj2,
+                    chat=existing_chat,
+                    defaults={"role": "admin"},
+                )
                 async_to_sync(messages_handler.handle_text_message)(fake_message)
 
+        TelegramUser.objects.get_or_create(
+            telegram_id=2222,
+            defaults={"username": "tester", "full_name": "Test User", "is_bot": False},
+        )
+        UserRole.objects.get_or_create(
+            user=TelegramUser.objects.get(telegram_id=2222),
+            chat=existing_chat,
+            defaults={"role": "admin"},
+        )
+    
         existing_chat.refresh_from_db()
 
         assert existing_chat.title == "Новое название чата"

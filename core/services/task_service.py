@@ -7,7 +7,8 @@ from django.db.models import Q
 from django.utils import timezone
 from asgiref.sync import sync_to_async
 
-from core.models import Task, TelegramUser, Message, TaskAssignee, Topic
+from core.models import Task, TelegramUser, Message, TaskAssignee, Topic, UserRole
+from core.services.permissions import user_can_create
 
 if TYPE_CHECKING:
     from core.utils.llm_client import LLMClient
@@ -56,17 +57,13 @@ def _filter_author_from_list(names: List[str], source_message: Message) -> List[
     return [n for n in names if n.lower() != author_mention]
 
 
-_PRIVATE_CHAT_CACHE: dict = {}
-"""Простой кэш: {author_id: (linked_topic_id,)} для linked_topic из private-чата."""
-
-
+@sync_to_async
 def _resolve_topic_for_private_message(source_message: Message) -> Optional[Topic]:
     """
     Если source_message пришёл из приватного чата, находит Topic
     привязанной группы (через UserRole). Иначе возвращает исходный topic.
     """
     chat = source_message.chat
-    # Если это не приватный чат — оставляем topic как есть
     if chat.type != "private":
         return source_message.topic
 
@@ -74,8 +71,6 @@ def _resolve_topic_for_private_message(source_message: Message) -> Optional[Topi
     if not author:
         return source_message.topic
 
-    # Ищем привязанный групповой чат пользователя
-    from core.models import UserRole
     linked_role = (
         UserRole.objects.filter(user=author)
         .select_related("chat")
@@ -89,7 +84,6 @@ def _resolve_topic_for_private_message(source_message: Message) -> Optional[Topi
         return source_message.topic
 
     linked_chat = linked_role.chat
-    # Берём (или создаём) topic с thread_id=0 (общая тема группы)
     linked_topic, _ = Topic.objects.get_or_create(
         chat=linked_chat,
         thread_id=0,
@@ -125,8 +119,17 @@ class TaskService:
                 logger.warning("_create_task_from_data: title empty after cleaning")
                 return None
 
-            # Определяем правильный topic (для приватных чатов — topic привязанной группы)
-            topic = await sync_to_async(_resolve_topic_for_private_message)(source_message)
+            topic = await _resolve_topic_for_private_message(source_message)
+
+            # ════════════════════════════════════════════════════════
+            # Проверка прав: member не может создавать задачи
+            # ════════════════════════════════════════════════════════
+            if not await sync_to_async(user_can_create)(source_message):
+                logger.warning(
+                    "Permission denied: user %s cannot create tasks in chat %s",
+                    source_message.author, source_message.chat,
+                )
+                return None
 
             due_date = None
             raw_due = task_data.get("due_date")
@@ -139,7 +142,6 @@ class TaskService:
                 except (ValueError, TypeError):
                     logger.warning("_create_task_from_data: invalid due_date=%r", raw_due)
 
-            # Собираем исполнителей
             assignees: List[str] = task_data.get("assignees", [])
             assignees = _filter_author_from_list(assignees, source_message)
 
@@ -148,14 +150,12 @@ class TaskService:
                 clean_name = raw_name.lstrip("@").strip()
                 if not clean_name:
                     continue
-
                 user: Optional[TelegramUser] = await sync_to_async(_find_user_by_username)(clean_name)
                 if user and not _is_bot_user(user):
                     assignee_objects.append(user)
                 elif not user:
                     logger.warning("Task: assignee %r not found in DB", raw_name)
 
-            # Проверка дубликата
             existing = await sync_to_async(self._check_duplicate_task)(
                 clean_title, due_date, topic, assignee_objects,
             )
@@ -163,7 +163,6 @@ class TaskService:
                 logger.info("Duplicate task: '%s' due %s, skipping", clean_title, due_date)
                 return existing
 
-            # Создание
             task = await sync_to_async(Task.objects.create)(
                 title=clean_title,
                 description=task_data.get("description", ""),

@@ -28,7 +28,7 @@ django.setup()
 
 
 # Импортируем роутеры из handlers
-from bot.handlers import summary, tasks, meetings, chat_link, chat_events, messages
+from bot.handlers import summary, tasks, meetings, chat_link, chat_events, messages, roles
 from bot.middlewares.fsm_timeout import FSMTimeoutMiddleware
 
 logging.basicConfig(level=logging.INFO)
@@ -82,6 +82,8 @@ async def main():
     dp.include_router(tasks.router)
     dp.include_router(meetings.router)
     dp.include_router(messages.router)
+    dp.include_router(roles.router)
+
 
     @dp.message(Command("start"))
     async def cmd_start(message: Message):
@@ -92,7 +94,7 @@ async def main():
                 "1. Добавьте меня в группу и выдайте права администратора.\n"
                 "2. В группе отправьте команду /link_chat — я пришлю код.\n"
                 "3. Скопируйте код и отправьте его сюда, в личные сообщения.\n\n"
-                "После привязки вам станут доступны команды /summary, /task, /meetings."
+                "После привязки вам станут доступны команды /summary, /task, /meetings, /role."
             )
         else:
             await message.answer(
@@ -114,7 +116,12 @@ async def main():
             "/summary week — за прошлую неделю\n"
             "/summary YYYY-MM-DD YYYY-MM-DD — за период\n\n"
             "🔗 <b>Привязка:</b>\n"
-            "/link_chat — получить код привязки чата\n\n"
+            "/link_chat — получить код привязки чата и получить роль\n\n"
+            "Роли бывают: member - участник чата, manager - создатель заданий\встреч, admin - полный доступ.\n"
+            "/role                    — показать свою роль\n"
+            "/role list               — список участников чата с ролями\n"
+            "/role set @user manager  — назначить роль (только admin)\n"
+            "/role set @user member   — понизить (только admin)\n"
             "💡 Задачи и встречи распознаются автоматически из сообщений.\n"
             "Используйте кнопки под задачами и встречами для управления.",
             parse_mode="HTML",

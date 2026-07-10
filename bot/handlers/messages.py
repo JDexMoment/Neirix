@@ -5,6 +5,7 @@ from aiogram.types import Message
 from asgiref.sync import sync_to_async
 
 from core.models import Message as DBMessage, TelegramChat, Topic, TelegramUser
+from core.models import UserRole
 from core.services.message_buffer import MessageBuffer, MAX_BATCH_SIZE
 from celery_app.tasks.process_messages import process_target_buffer
 
@@ -16,20 +17,44 @@ BATCH_FLUSH_DELAY_SEC = 30
 
 
 def _extract_is_forum(chat) -> bool:
-    """
-    Безопасно нормализует is_forum в bool.
-    Telegram/aiogram может прислать is_forum=None.
-    """
     if chat.type == "private":
         return False
     return bool(getattr(chat, "is_forum", False))
 
 
+def _can_create_in_chat(user: TelegramUser, chat: TelegramChat) -> bool:
+    """
+    Проверяет, может ли пользователь создавать задачи/встречи в этом чате.
+    Для приватного чата — проверяем роль в привязанной группе.
+    """
+    target_chat = chat
+    if chat.type == "private":
+        # Ищем привязанную группу
+        role = (
+            UserRole.objects.filter(user=user)
+            .select_related("chat")
+            .first()
+        )
+        if not role:
+            return False
+        target_chat = role.chat
+
+    user_role = (
+        UserRole.objects.filter(user=user, chat=target_chat)
+        .values_list("role", flat=True)
+        .first()
+    )
+    return user_role in ("manager", "admin")
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_text_message(message: Message):
     """
-    Сохраняет входящее текстовое сообщение в БД
-    и кладёт его в Redis-буфер для батч-обработки.
+    Сохраняет входящее текстовое сообщение в БД.
+    Если автор имеет права manager/admin — кладёт в буфер
+    для батч-обработки (LLM).
+    Если member — сообщение только сохраняется (история/саммари),
+    но не обрабатывается LLM (экономия токенов).
     """
 
     @sync_to_async
@@ -114,9 +139,21 @@ async def handle_text_message(message: Message):
             timestamp=message.date,
             is_processed=False,
         )
-        return db_msg
+        return db_msg, db_user, chat
 
-    db_message = await save_message()
+    db_message, db_user, chat = await save_message()
+
+    # ════════════════════════════════════════════════════════════════
+    # Проверка прав: если member — НЕ кладём в буфер (экономия токенов)
+    # ════════════════════════════════════════════════════════════════
+    can_create = await sync_to_async(_can_create_in_chat)(db_user, chat)
+
+    if not can_create:
+        logger.info(
+            "Member skipped from buffer | user=%s chat=%s text=%r",
+            db_user, chat.chat_id, db_message.text[:100],
+        )
+        return  # сообщение сохранено в БД, но в буфер не попало
 
     chat_id = db_message.chat.chat_id
     topic_id = db_message.topic.thread_id

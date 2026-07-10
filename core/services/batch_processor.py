@@ -2,9 +2,10 @@ import logging
 
 from asgiref.sync import sync_to_async
 
-from core.models import Message, TaskAssignee, TelegramUser
+from core.models import Message, TaskAssignee, TelegramUser, UserRole
 from vector_store.client import VectorStoreClient
 from vector_store.embeddings import generate_embeddings_batch
+from core.services.permissions import user_can_create
 
 logger = logging.getLogger(__name__)
 
@@ -35,16 +36,39 @@ class BatchProcessor:
             logger.warning("No DB messages found for ids=%s", msg_ids)
             return {"tasks_created": 0, "meetings_created": 0}
 
-        await self._store_embeddings(db_messages)
+        # ════════════════════════════════════════════════════════════
+        # Фильтр: оставляем только сообщения от manager/admin
+        # Сообщения от member не отправляем в LLM
+        # ════════════════════════════════════════════════════════════
+        authorized_messages = []
+        for msg in db_messages:
+            try:
+                if await sync_to_async(user_can_create)(msg):
+                    authorized_messages.append(msg)
+            except Exception:
+                authorized_messages.append(msg)
+        skipped = len(db_messages) - len(authorized_messages)
+        if skipped:
+            logger.info(
+                "Skipped %d messages from members (not sent to LLM)",
+                skipped,
+            )
+
+        if not authorized_messages:
+            logger.info("No authorized messages in batch, skipping LLM call")
+            await self._mark_messages_processed(msg_ids)
+            return {"tasks_created": 0, "meetings_created": 0}
+
+        await self._store_embeddings(db_messages)  # всё равно индексируем всё
 
         tasks_created = 0
         meetings_created = 0
-        source_message = db_messages[-1]
+        source_message = authorized_messages[-1]
 
         try:
             from core.utils.llm_client import LLMClient
             llm = LLMClient()
-            result = await llm.extract_all_from_messages(db_messages)
+            result = await llm.extract_all_from_messages(authorized_messages)
 
             if result:
                 for task_data in result.get("tasks", []):
@@ -77,16 +101,15 @@ class BatchProcessor:
         return {"tasks_created": tasks_created, "meetings_created": meetings_created}
 
     async def _create_task(self, task_data: dict, source_message: Message):
-        """Создаёт задачу и назначает исполнителей с детальным логгированием."""
+        """Создаёт задачу с проверкой дубликатов через TaskService."""
         from core.services.task_service import TaskService
-        
-        # Используем TaskService для создания задачи с проверкой дубликатов
+
         task_service = TaskService()
         task = await task_service._create_task_from_data(task_data, source_message)
-        
+
         if task:
             logger.info("Task created | id=%s title=%s", task.id, task.title)
-        
+
         return task
 
     @sync_to_async

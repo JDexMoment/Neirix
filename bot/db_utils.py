@@ -5,6 +5,7 @@ from core.models import TelegramChat, Topic, TelegramUser, UserRole
 
 logger = logging.getLogger(__name__)
 
+
 def get_chat_context_sync(
     telegram_user_id: int,
     username: str,
@@ -67,7 +68,7 @@ def get_chat_context_sync(
 
 
 def get_or_create_chat_sync(chat_id: int, title: str, chat_type: str, is_forum: bool = False) -> TelegramChat:
-    is_forum = bool(is_forum)  # гарантируем True/False
+    is_forum = bool(is_forum)
     chat, _ = TelegramChat.objects.get_or_create(
         chat_id=chat_id,
         defaults={
@@ -100,9 +101,22 @@ def get_or_create_user_sync(telegram_id: int, username: str, full_name: str, is_
 
 
 def create_user_role_sync(user: TelegramUser, chat: TelegramChat) -> bool:
+    """
+    Создаёт роль для пользователя в чате.
+    Первый пользователь в чате → admin.
+    Остальные → member.
+    """
+    # Первый ли это пользователь в этом чате?
+    if not UserRole.objects.filter(chat=chat).exists():
+        role = 'admin'
+    else:
+        role = 'member'
+
     _, created = UserRole.objects.get_or_create(
         user=user,
         chat=chat,
-        defaults={'role': 'member'}
+        defaults={'role': role}
     )
+    if created:
+        logger.info(f"Role created: user={user} chat={chat} role={role}")
     return created

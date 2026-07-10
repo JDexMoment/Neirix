@@ -459,7 +459,7 @@ class TestMeetingDuplicatePrevention:
     @pytest.mark.django_db(transaction=True)
     async def test_create_meeting_duplicate_same_title_time_participants(self, mock_db_message_factory):
         from core.services.meeting_service import MeetingService
-        from core.models import Meeting, TelegramUser, TelegramChat, Topic, Message
+        from core.models import Meeting, TelegramUser, TelegramChat, Topic, Message, UserRole
 
         chat = await sync_to_async(TelegramChat.objects.create)(chat_id=-1001, title="Test Chat")
         topic = await sync_to_async(Topic.objects.create)(chat=chat, thread_id=0)
@@ -467,23 +467,19 @@ class TestMeetingDuplicatePrevention:
             telegram_id=54321, username="organizer", full_name="Organizer")
         user = await sync_to_async(TelegramUser.objects.create)(
             telegram_id=12345, username="testuser", full_name="Test User")
+        # ═══ ДАЁМ ПРАВА ═══
+        await sync_to_async(UserRole.objects.create)(user=author, chat=chat, role="admin")
 
-        # Реальный Message — чтобы source_message не ломал FK
         real_msg = await sync_to_async(Message.objects.create)(
             telegram_msg_id=1, chat=chat, topic=topic, author=author,
             text="завтра встреча с @testuser", timestamp=timezone.now())
 
-        meeting_data = {
-            "title": "Важная встреча",
-            "participants": ["@testuser"],
-            "start_at": (timezone.now() + timedelta(days=1)).strftime("%Y-%m-%dT10:00:00"),
-            "description": "",
-        }
-
+        meeting_data = {"title": "Важная встреча", "participants": ["@testuser"],
+                        "start_at": (timezone.now() + timedelta(days=1)).strftime("%Y-%m-%dT10:00:00"),
+                        "description": ""}
         service = MeetingService()
         first = await service._create_meeting_from_data(meeting_data, real_msg)
         second = await service._create_meeting_from_data(meeting_data, real_msg)
-
         assert first is not None
         assert second is not None
         assert first.id == second.id
@@ -492,14 +488,15 @@ class TestMeetingDuplicatePrevention:
     @pytest.mark.django_db(transaction=True)
     async def test_create_meeting_different_title_no_duplicate(self, mock_db_message_factory):
         from core.services.meeting_service import MeetingService
-        from core.models import TelegramUser, TelegramChat, Topic, Message
+        from core.models import TelegramUser, TelegramChat, Topic, Message, UserRole
 
         chat = await sync_to_async(TelegramChat.objects.create)(chat_id=-1002, title="Test Chat 2")
         topic = await sync_to_async(Topic.objects.create)(chat=chat, thread_id=0)
         author = await sync_to_async(TelegramUser.objects.create)(
             telegram_id=54322, username="organizer2", full_name="Organizer 2")
-        user = await sync_to_async(TelegramUser.objects.create)(
+        await sync_to_async(TelegramUser.objects.create)(
             telegram_id=12346, username="testuser2", full_name="Test User 2")
+        await sync_to_async(UserRole.objects.create)(user=author, chat=chat, role="admin")
 
         real_msg = await sync_to_async(Message.objects.create)(
             telegram_msg_id=2, chat=chat, topic=topic, author=author,
@@ -510,11 +507,9 @@ class TestMeetingDuplicatePrevention:
                  "start_at": start_at, "description": ""}
         data2 = {"title": "Вторая встреча", "participants": ["@testuser2"],
                  "start_at": start_at, "description": ""}
-
         service = MeetingService()
         first = await service._create_meeting_from_data(data1, real_msg)
         second = await service._create_meeting_from_data(data2, real_msg)
-
         assert first is not None
         assert second is not None
         assert first.id != second.id
@@ -538,7 +533,6 @@ class TestMeetingDuplicatePrevention:
         service = MeetingService()
         result = await sync_to_async(service._check_duplicate_meeting)(
             "Тестовая встреча", start_time, topic, [user])
-
         assert result is not None
         assert result.id == existing.id
 
@@ -546,7 +540,7 @@ class TestMeetingDuplicatePrevention:
     @pytest.mark.django_db(transaction=True)
     async def test_create_meeting_different_participants_no_duplicate(self, mock_db_message_factory):
         from core.services.meeting_service import MeetingService
-        from core.models import TelegramUser, TelegramChat, Topic, Message
+        from core.models import TelegramUser, TelegramChat, Topic, Message, UserRole
 
         chat = await sync_to_async(TelegramChat.objects.create)(chat_id=-1004, title="Test Chat 4")
         topic = await sync_to_async(Topic.objects.create)(chat=chat, thread_id=0)
@@ -556,6 +550,7 @@ class TestMeetingDuplicatePrevention:
             telegram_id=12348, username="testuser1", full_name="Test User 1")
         user2 = await sync_to_async(TelegramUser.objects.create)(
             telegram_id=12349, username="testuser2", full_name="Test User 2")
+        await sync_to_async(UserRole.objects.create)(user=author, chat=chat, role="admin")
 
         real_msg = await sync_to_async(Message.objects.create)(
             telegram_msg_id=4, chat=chat, topic=topic, author=author,
@@ -566,11 +561,9 @@ class TestMeetingDuplicatePrevention:
                  "start_at": start_at, "description": ""}
         data2 = {"title": "Встреча с первым", "participants": ["@testuser2"],
                  "start_at": start_at, "description": ""}
-
         service = MeetingService()
         first = await service._create_meeting_from_data(data1, real_msg)
         second = await service._create_meeting_from_data(data2, real_msg)
-
         assert first is not None
         assert second is not None
         assert first.id != second.id
@@ -579,7 +572,7 @@ class TestMeetingDuplicatePrevention:
     @pytest.mark.django_db(transaction=True)
     async def test_create_meeting_inactive_meeting_not_considered_duplicate(self, mock_db_message_factory):
         from core.services.meeting_service import MeetingService
-        from core.models import Meeting, TelegramUser, TelegramChat, Topic, Message
+        from core.models import Meeting, TelegramUser, TelegramChat, Topic, Message, UserRole
 
         chat = await sync_to_async(TelegramChat.objects.create)(chat_id=-1005, title="Test Chat 5")
         topic = await sync_to_async(Topic.objects.create)(chat=chat, thread_id=0)
@@ -587,6 +580,7 @@ class TestMeetingDuplicatePrevention:
             telegram_id=54325, username="organizer5", full_name="Organizer 5")
         user = await sync_to_async(TelegramUser.objects.create)(
             telegram_id=12350, username="testuser5", full_name="Test User 5")
+        await sync_to_async(UserRole.objects.create)(user=author, chat=chat, role="admin")
 
         start_time = timezone.now() + timedelta(days=1)
         inactive = await sync_to_async(Meeting.objects.create)(
@@ -599,10 +593,8 @@ class TestMeetingDuplicatePrevention:
 
         data = {"title": "Тестовая встреча", "participants": ["@testuser5"],
                 "start_at": start_time.strftime("%Y-%m-%dT%H:%M:%S"), "description": ""}
-
         service = MeetingService()
         new_meeting = await service._create_meeting_from_data(data, real_msg)
-
         assert new_meeting is not None
         assert new_meeting.id != inactive.id
 
@@ -618,27 +610,25 @@ class TestMeetingDuplicatePrevention:
     @pytest.mark.asyncio
     async def test_batch_single_meeting(self, mock_db_message_factory):
         from core.services.meeting_service import MeetingService
-
         msg = mock_db_message_factory(msg_id=1, text="завтра в 10 встреча", username="boss")
         tomorrow = (timezone.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
-
         mock_llm = AsyncMock()
         mock_llm.extract_meetings_from_messages = AsyncMock(return_value=[{
             "title": "встреча с заказчиком", "participants": [],
             "start_at": f"{tomorrow}T10:00:00", "description": "",
         }])
-
         proper_s2a = _make_proper_sync_to_async()
-        with patch("core.services.meeting_service.sync_to_async", side_effect=proper_s2a):
-            with patch("core.services.meeting_service.Meeting") as MockMeeting:
-                inst = MagicMock()
-                inst.id = 1
-                inst.participants = MagicMock()
-                inst.participants.add = MagicMock()
-                MockMeeting.objects.create = MagicMock(return_value=inst)
 
-                service = MeetingService(llm=mock_llm)
-                result = await service.extract_meetings_from_messages_batch([msg])
+        with patch("core.services.meeting_service.sync_to_async", side_effect=proper_s2a):
+            with patch("core.services.meeting_service.user_can_create", return_value=True):
+                with patch("core.services.meeting_service.Meeting") as MockMeeting:
+                    inst = MagicMock()
+                    inst.id = 1
+                    inst.participants = MagicMock()
+                    inst.participants.add = MagicMock()
+                    MockMeeting.objects.create = MagicMock(return_value=inst)
+                    service = MeetingService(llm=mock_llm)
+                    result = await service.extract_meetings_from_messages_batch([msg])
 
         assert len(result) == 1
         mock_llm.extract_meetings_from_messages.assert_called_once()
@@ -652,28 +642,25 @@ class TestMeetingDuplicatePrevention:
                                     timestamp=now - timedelta(minutes=2)),
             mock_db_message_factory(msg_id=2, text="ок, в 11:30 норм?", username="worker1",
                                     timestamp=now - timedelta(minutes=1)),
-            mock_db_message_factory(msg_id=3, text="да, давайте", username="boss",
-                                    timestamp=now),
+            mock_db_message_factory(msg_id=3, text="да, давайте", username="boss", timestamp=now),
         ]
         tomorrow = (now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
-
         mock_llm = AsyncMock()
         mock_llm.extract_meetings_from_messages = AsyncMock(return_value=[{
-            "title": "созвон", "participants": [], "start_at": f"{tomorrow}T11:30:00",
-            "description": "",
+            "title": "созвон", "participants": [], "start_at": f"{tomorrow}T11:30:00", "description": "",
         }])
-
         proper_s2a = _make_proper_sync_to_async()
-        with patch("core.services.meeting_service.sync_to_async", side_effect=proper_s2a):
-            with patch("core.services.meeting_service.Meeting") as MockMeeting:
-                inst = MagicMock()
-                inst.id = 1
-                inst.participants = MagicMock()
-                inst.participants.add = MagicMock()
-                MockMeeting.objects.create = MagicMock(return_value=inst)
 
-                service = MeetingService(llm=mock_llm)
-                result = await service.extract_meetings_from_messages_batch(msgs)
+        with patch("core.services.meeting_service.sync_to_async", side_effect=proper_s2a):
+            with patch("core.services.meeting_service.user_can_create", return_value=True):
+                with patch("core.services.meeting_service.Meeting") as MockMeeting:
+                    inst = MagicMock()
+                    inst.id = 1
+                    inst.participants = MagicMock()
+                    inst.participants.add = MagicMock()
+                    MockMeeting.objects.create = MagicMock(return_value=inst)
+                    service = MeetingService(llm=mock_llm)
+                    result = await service.extract_meetings_from_messages_batch(msgs)
 
         assert mock_llm.extract_meetings_from_messages.call_count == 1
         assert len(result) == 1
@@ -693,8 +680,7 @@ class TestMeetingDuplicatePrevention:
         from core.services.meeting_service import MeetingService
         msg = mock_db_message_factory(msg_id=1, text="встреча завтра в 9", username="boss")
         mock_llm = AsyncMock()
-        mock_llm.extract_meetings_from_messages = AsyncMock(
-            side_effect=Exception("API timeout"))
+        mock_llm.extract_meetings_from_messages = AsyncMock(side_effect=Exception("API timeout"))
         service = MeetingService(llm=mock_llm)
         result = await service.extract_meetings_from_messages_batch([msg])
         assert result == []
@@ -702,7 +688,6 @@ class TestMeetingDuplicatePrevention:
     @pytest.mark.asyncio
     async def test_batch_multiple_meetings(self, mock_db_message_factory):
         from core.services.meeting_service import MeetingService
-
         now = timezone.now()
         msgs = [
             mock_db_message_factory(msg_id=1, text="завтра в 9 встреча с заказчиком", username="boss",
@@ -711,7 +696,6 @@ class TestMeetingDuplicatePrevention:
                                     timestamp=now),
         ]
         tomorrow = (now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
-
         mock_llm = AsyncMock()
         mock_llm.extract_meetings_from_messages = AsyncMock(return_value=[
             {"title": "встреча с заказчиком", "participants": [],
@@ -719,7 +703,6 @@ class TestMeetingDuplicatePrevention:
             {"title": "созвон с дизайнером", "participants": [],
              "start_at": f"{tomorrow}T14:00:00", "description": ""},
         ])
-
         counter = {"count": 0}
         def make_meeting(**kwargs):
             counter["count"] += 1
@@ -728,14 +711,14 @@ class TestMeetingDuplicatePrevention:
             m.participants = MagicMock()
             m.participants.add = MagicMock()
             return m
-
         proper_s2a = _make_proper_sync_to_async()
-        with patch("core.services.meeting_service.sync_to_async", side_effect=proper_s2a):
-            with patch("core.services.meeting_service.Meeting") as MockMeeting:
-                MockMeeting.objects.create = MagicMock(side_effect=make_meeting)
 
-                service = MeetingService(llm=mock_llm)
-                result = await service.extract_meetings_from_messages_batch(msgs)
+        with patch("core.services.meeting_service.sync_to_async", side_effect=proper_s2a):
+            with patch("core.services.meeting_service.user_can_create", return_value=True):
+                with patch("core.services.meeting_service.Meeting") as MockMeeting:
+                    MockMeeting.objects.create = MagicMock(side_effect=make_meeting)
+                    service = MeetingService(llm=mock_llm)
+                    result = await service.extract_meetings_from_messages_batch(msgs)
 
         assert len(result) == 2
 
@@ -746,17 +729,13 @@ class TestMeetingDuplicatePrevention:
         msgs = [
             mock_db_message_factory(msg_id=1, text="завтра созвон", username="boss",
                                     timestamp=now - timedelta(minutes=1)),
-            mock_db_message_factory(msg_id=2, text="в 10:00", username="boss",
-                                    timestamp=now),
+            mock_db_message_factory(msg_id=2, text="в 10:00", username="boss", timestamp=now),
         ]
         tomorrow = (now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
-
         mock_llm = AsyncMock()
         mock_llm.extract_meetings_from_messages = AsyncMock(return_value=[{
-            "title": "созвон", "participants": [],
-            "start_at": f"{tomorrow}T10:00:00", "description": "",
+            "title": "созвон", "participants": [], "start_at": f"{tomorrow}T10:00:00", "description": "",
         }])
-
         created_kwargs = {}
         def capture_create(**kwargs):
             created_kwargs.update(kwargs)
@@ -765,14 +744,14 @@ class TestMeetingDuplicatePrevention:
             m.participants = MagicMock()
             m.participants.add = MagicMock()
             return m
-
         proper_s2a = _make_proper_sync_to_async()
-        with patch("core.services.meeting_service.sync_to_async", side_effect=proper_s2a):
-            with patch("core.services.meeting_service.Meeting") as MockMeeting:
-                MockMeeting.objects.create = MagicMock(side_effect=capture_create)
 
-                service = MeetingService(llm=mock_llm)
-                await service.extract_meetings_from_messages_batch(msgs)
+        with patch("core.services.meeting_service.sync_to_async", side_effect=proper_s2a):
+            with patch("core.services.meeting_service.user_can_create", return_value=True):
+                with patch("core.services.meeting_service.Meeting") as MockMeeting:
+                    MockMeeting.objects.create = MagicMock(side_effect=capture_create)
+                    service = MeetingService(llm=mock_llm)
+                    await service.extract_meetings_from_messages_batch(msgs)
 
         assert created_kwargs.get("source_message") == msgs[-1]
 
@@ -780,28 +759,25 @@ class TestMeetingDuplicatePrevention:
     async def test_batch_participant_not_found_skipped(self, mock_db_message_factory):
         from core.services.meeting_service import MeetingService
         tomorrow = (timezone.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
-
         msg = mock_db_message_factory(msg_id=1, text="завтра в 10 встреча @unknown", username="boss")
-
         mock_llm = AsyncMock()
         mock_llm.extract_meetings_from_messages = AsyncMock(return_value=[{
             "title": "встреча", "participants": ["@unknown_person"],
             "start_at": f"{tomorrow}T10:00:00", "description": "",
         }])
-
         inst = MagicMock()
         inst.id = 1
         inst.participants = MagicMock()
         inst.participants.add = MagicMock()
-
         proper_s2a = _make_proper_sync_to_async()
+
         with patch("core.services.meeting_service.sync_to_async", side_effect=proper_s2a):
-            with patch("core.services.meeting_service.Meeting") as MockMeeting:
-                MockMeeting.objects.create = MagicMock(return_value=inst)
-                with patch("core.services.meeting_service._find_user_by_username",
-                           return_value=None):
-                    service = MeetingService(llm=mock_llm)
-                    result = await service.extract_meetings_from_messages_batch([msg])
+            with patch("core.services.meeting_service.user_can_create", return_value=True):
+                with patch("core.services.meeting_service.Meeting") as MockMeeting:
+                    MockMeeting.objects.create = MagicMock(return_value=inst)
+                    with patch("core.services.meeting_service._find_user_by_username", return_value=None):
+                        service = MeetingService(llm=mock_llm)
+                        result = await service.extract_meetings_from_messages_batch([msg])
 
         assert len(result) == 1
         inst.participants.add.assert_not_called()
@@ -817,7 +793,7 @@ class TestMeetingTopicResolution:
     @pytest.mark.django_db(transaction=True)
     async def test_meeting_from_group_chat_uses_own_topic(self):
         from core.services.meeting_service import MeetingService
-        from core.models import TelegramChat, TelegramUser, Topic, Message
+        from core.models import TelegramChat, TelegramUser, Topic, Message, UserRole
 
         group_chat = await sync_to_async(TelegramChat.objects.create)(
             chat_id=-3001, title="Group", type="supergroup",
@@ -827,6 +803,9 @@ class TestMeetingTopicResolution:
         )
         author = await sync_to_async(TelegramUser.objects.create)(
             telegram_id=3001, username="boss", full_name="Boss",
+        )
+        await sync_to_async(UserRole.objects.create)(
+            user=author, chat=group_chat, role="admin",
         )
         msg = await sync_to_async(Message.objects.create)(
             telegram_msg_id=501, chat=group_chat, topic=group_topic,
@@ -860,7 +839,7 @@ class TestMeetingTopicResolution:
             telegram_id=3002, username="worker", full_name="Worker",
         )
         await sync_to_async(UserRole.objects.create)(
-            user=author, chat=group_chat, role="member",
+            user=author, chat=group_chat, role="admin",
         )
         private_chat = await sync_to_async(TelegramChat.objects.create)(
             chat_id=300200, title="", type="private",

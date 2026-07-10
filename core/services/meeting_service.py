@@ -7,7 +7,8 @@ from django.db.models import Q
 from django.utils import timezone
 from asgiref.sync import sync_to_async
 
-from core.models import Meeting, TelegramUser, Message, Topic
+from core.models import Meeting, TelegramUser, Message, Topic, UserRole
+from core.services.permissions import user_can_create
 
 if TYPE_CHECKING:
     from core.utils.llm_client import LLMClient
@@ -81,7 +82,8 @@ def _parse_start_at_from_meeting_data(meeting_data: dict) -> Optional[datetime]:
         return None
 
 
-def _resolve_topic_for_private_message(source_message: Message):
+@sync_to_async
+def _resolve_topic_for_private_message(source_message: Message) -> Optional[Topic]:
     """
     Если source_message пришёл из приватного чата, находит Topic
     привязанной группы (через UserRole). Иначе возвращает исходный topic.
@@ -94,7 +96,6 @@ def _resolve_topic_for_private_message(source_message: Message):
     if not author:
         return source_message.topic
 
-    from core.models import UserRole
     linked_role = (
         UserRole.objects.filter(user=author)
         .select_related("chat")
@@ -143,14 +144,22 @@ class MeetingService:
                 logger.warning("_create_meeting_from_data: title empty after cleaning")
                 return None
 
-            # Определяем правильный topic (для приватных чатов — topic привязанной группы)
-            topic = await sync_to_async(_resolve_topic_for_private_message)(source_message)
+            topic = await _resolve_topic_for_private_message(source_message)
+
+            # ════════════════════════════════════════════════════════
+            # Проверка прав: member не может создавать встречи
+            # ════════════════════════════════════════════════════════
+            if not await sync_to_async(user_can_create)(source_message):
+                logger.warning(
+                    "Permission denied: user %s cannot create meetings in chat %s",
+                    source_message.author, source_message.chat,
+                )
+                return None
 
             start_at = _parse_start_at_from_meeting_data(meeting_data)
             if not start_at:
                 return None
 
-            # Собираем участников в один проход
             participants_names: List[str] = meeting_data.get("participants", [])
             participants_names = _filter_author_from_list(participants_names, source_message)
 
@@ -172,7 +181,6 @@ class MeetingService:
                 elif not user:
                     logger.warning("Meeting: participant %r not found", raw_name)
 
-            # Проверка дубликата
             existing = await sync_to_async(self._check_duplicate_meeting)(
                 clean_title, start_at, topic, participant_objects,
             )
@@ -180,7 +188,6 @@ class MeetingService:
                 logger.info("Duplicate meeting: '%s' at %s, skipping", clean_title, start_at)
                 return existing
 
-            # Создание
             meeting = await sync_to_async(Meeting.objects.create)(
                 title=clean_title,
                 topic=topic,
