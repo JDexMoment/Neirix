@@ -143,6 +143,13 @@ class Meeting(models.Model):
     topic = models.ForeignKey(Topic, on_delete=models.CASCADE)
     start_at = models.DateTimeField()
     participants = models.ManyToManyField(TelegramUser, blank=True)
+
+    is_all_hands = models.BooleanField(
+        default=False,
+        verbose_name="Все участники",
+        help_text="True, если встреча для всех участников чата",
+    )
+
     source_message = models.ForeignKey(Message, on_delete=models.SET_NULL, null=True)
     # Creator field - who created the meeting
     creator = models.ForeignKey(TelegramUser, on_delete=models.SET_NULL, null=True, related_name='created_meetings')

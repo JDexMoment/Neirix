@@ -46,6 +46,7 @@ class BatchProcessor:
                 if await sync_to_async(user_can_create)(msg):
                     authorized_messages.append(msg)
             except Exception:
+                # Если проверка прав недоступна (тесты, миграции) — пропускаем
                 authorized_messages.append(msg)
         skipped = len(db_messages) - len(authorized_messages)
         if skipped:
@@ -63,6 +64,8 @@ class BatchProcessor:
 
         tasks_created = 0
         meetings_created = 0
+        unassigned_task_ids: list[int] = []
+        unassigned_meeting_ids: list[int] = []
         source_message = authorized_messages[-1]
 
         try:
@@ -77,6 +80,12 @@ class BatchProcessor:
                         if task:
                             tasks_created += 1
                             logger.info("Task created | id=%s title=%s", task.id, task.title)
+                            # Проверяем, нужен ли исполнитель
+                            assignee_count = await sync_to_async(
+                                lambda: task.assignees.count()
+                            )()
+                            if assignee_count == 0:
+                                unassigned_task_ids.append(task.id)
                     except Exception as e:
                         logger.error("Task creation failed | data=%s: %s", task_data, e, exc_info=True)
 
@@ -84,11 +93,22 @@ class BatchProcessor:
                 meeting_svc = MeetingService()
                 for meeting_data in result.get("meetings", []):
                     try:
+                        # ═══ Проверяем ОРИГИНАЛЬНЫЕ данные LLM ═══
+                        # Если participants — пустой список [] → уведомляем
+                        # Если participants = ["Все участники"] → НЕ уведомляем
+                        llm_participants = meeting_data.get("participants", [])
+                        truly_empty = (
+                            isinstance(llm_participants, list)
+                            and len(llm_participants) == 0
+                        )
+
                         meeting = await meeting_svc._create_meeting_from_data(
                             meeting_data, source_message,
                         )
                         if meeting:
                             meetings_created += 1
+                            if truly_empty:
+                                unassigned_meeting_ids.append(meeting.id)
                     except Exception as e:
                         logger.error("Meeting creation failed | data=%s: %s", meeting_data, e, exc_info=True)
 
@@ -98,7 +118,12 @@ class BatchProcessor:
             logger.error("Batch extraction failed: %s", e, exc_info=True)
 
         await self._mark_messages_processed(msg_ids)
-        return {"tasks_created": tasks_created, "meetings_created": meetings_created}
+        return {
+            "tasks_created": tasks_created,
+            "meetings_created": meetings_created,
+            "unassigned_task_ids": unassigned_task_ids,
+            "unassigned_meeting_ids": unassigned_meeting_ids,
+        }
 
     async def _create_task(self, task_data: dict, source_message: Message):
         """Создаёт задачу с проверкой дубликатов через TaskService."""

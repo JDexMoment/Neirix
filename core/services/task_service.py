@@ -8,7 +8,6 @@ from django.utils import timezone
 from asgiref.sync import sync_to_async
 
 from core.models import Task, TelegramUser, Message, TaskAssignee, Topic, UserRole
-from core.services.permissions import user_can_create
 
 if TYPE_CHECKING:
     from core.utils.llm_client import LLMClient
@@ -120,16 +119,6 @@ class TaskService:
                 return None
 
             topic = await _resolve_topic_for_private_message(source_message)
-
-            # ════════════════════════════════════════════════════════
-            # Проверка прав: member не может создавать задачи
-            # ════════════════════════════════════════════════════════
-            if not await sync_to_async(user_can_create)(source_message):
-                logger.warning(
-                    "Permission denied: user %s cannot create tasks in chat %s",
-                    source_message.author, source_message.chat,
-                )
-                return None
 
             due_date = None
             raw_due = task_data.get("due_date")
@@ -252,6 +241,17 @@ class TaskService:
 
     # ── Запросы ─────────────────────────────────────────────────
 
+    async def get_task_by_id(self, task_id: int) -> Optional[Task]:
+        """Получает задачу по ID с prefetch_related assignees."""
+        def _get():
+            return (
+                Task.objects.filter(id=task_id)
+                .select_related("topic", "creator")
+                .prefetch_related("assignees__user")
+                .first()
+            )
+        return await sync_to_async(_get)()
+
     async def get_user_tasks(self, user: TelegramUser, status: str = "open") -> List[Task]:
         def _query() -> List[Task]:
             return list(
@@ -268,6 +268,46 @@ class TaskService:
                     return False
                 task.status = "done"
                 task.save(update_fields=["status"])
+                return True
+            except Task.DoesNotExist:
+                return False
+        return await sync_to_async(_update)()
+
+    # ── Редактирование задачи ────────────────────────────────────
+
+    async def update_due_date(self, task_id: int, new_due_date_str: str) -> bool:
+        """Обновляет due_date задачи по строке вида 'YYYY-MM-DD'."""
+        def _update() -> bool:
+            try:
+                task = Task.objects.get(id=task_id)
+                naive_dt = datetime.strptime(str(new_due_date_str)[:10], "%Y-%m-%d")
+                naive_dt = naive_dt.replace(hour=23, minute=59, second=0, microsecond=0)
+                current_tz = timezone.get_current_timezone()
+                task.due_date = timezone.make_aware(naive_dt, current_tz)
+                task.save(update_fields=["due_date"])
+                return True
+            except (Task.DoesNotExist, ValueError, TypeError) as e:
+                logger.warning("update_due_date failed: %s", e)
+                return False
+        return await sync_to_async(_update)()
+
+    async def update_assignees(
+        self, task_id: int, assignee_usernames: List[str],
+    ) -> bool:
+        """Заменяет исполнителей задачи. Если список пуст — удаляет всех."""
+        def _update() -> bool:
+            try:
+                task = Task.objects.get(id=task_id)
+                # Удаляем старых исполнителей
+                TaskAssignee.objects.filter(task=task).delete()
+                # Добавляем новых
+                for raw_name in assignee_usernames:
+                    clean_name = raw_name.lstrip("@").strip()
+                    if not clean_name:
+                        continue
+                    user = _find_user_by_username(clean_name)
+                    if user and not _is_bot_user(user):
+                        TaskAssignee.objects.create(task=task, user=user)
                 return True
             except Task.DoesNotExist:
                 return False

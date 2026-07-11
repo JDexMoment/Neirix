@@ -7,8 +7,7 @@ from django.db.models import Q
 from django.utils import timezone
 from asgiref.sync import sync_to_async
 
-from core.models import Meeting, TelegramUser, Message, Topic, UserRole
-from core.services.permissions import user_can_create
+from core.models import Meeting, TelegramUser, Message, Topic
 
 if TYPE_CHECKING:
     from core.utils.llm_client import LLMClient
@@ -83,11 +82,7 @@ def _parse_start_at_from_meeting_data(meeting_data: dict) -> Optional[datetime]:
 
 
 @sync_to_async
-def _resolve_topic_for_private_message(source_message: Message) -> Optional[Topic]:
-    """
-    Если source_message пришёл из приватного чата, находит Topic
-    привязанной группы (через UserRole). Иначе возвращает исходный topic.
-    """
+def _resolve_topic_for_private_message(source_message: Message):
     chat = source_message.chat
     if chat.type != "private":
         return source_message.topic
@@ -96,6 +91,7 @@ def _resolve_topic_for_private_message(source_message: Message) -> Optional[Topi
     if not author:
         return source_message.topic
 
+    from core.models import UserRole
     linked_role = (
         UserRole.objects.filter(user=author)
         .select_related("chat")
@@ -128,40 +124,40 @@ class MeetingService:
             self._llm = LLMClient()
         return self._llm
 
-    # ── Создание встречи ────────────────────────────────────────
-
     async def _create_meeting_from_data(
         self, meeting_data: dict, source_message: Message,
     ) -> Optional[Meeting]:
         try:
             title = (meeting_data.get("title") or "").strip()
             if not title:
-                logger.warning("_create_meeting_from_data: empty title, skipping")
+                logger.warning("empty title, skipping")
                 return None
 
             clean_title = _clean_title(title)
             if not clean_title:
-                logger.warning("_create_meeting_from_data: title empty after cleaning")
+                logger.warning("title empty after cleaning")
                 return None
 
             topic = await _resolve_topic_for_private_message(source_message)
-
-            # ════════════════════════════════════════════════════════
-            # Проверка прав: member не может создавать встречи
-            # ════════════════════════════════════════════════════════
-            if not await sync_to_async(user_can_create)(source_message):
-                logger.warning(
-                    "Permission denied: user %s cannot create meetings in chat %s",
-                    source_message.author, source_message.chat,
-                )
-                return None
 
             start_at = _parse_start_at_from_meeting_data(meeting_data)
             if not start_at:
                 return None
 
+            # ── Участники ──────────────────────────────────────────
             participants_names: List[str] = meeting_data.get("participants", [])
-            participants_names = _filter_author_from_list(participants_names, source_message)
+
+            # ════════════════════════════════════════════════════════════
+            # БАТЧ-ФИКС: если source_message НЕ содержит упоминания
+            # ни об одном из participants, значит встреча была извлечена
+            # из ДРУГОГО сообщения — не фильтруем автора.
+            # ════════════════════════════════════════════════════════════
+            author_mentioned_in_batch = _is_author_mentioned_in_batch(
+                participants_names, source_message
+            )
+
+            if author_mentioned_in_batch:
+                participants_names = _filter_author_from_list(participants_names, source_message)
 
             has_all = False
             participant_objects: List[TelegramUser] = []
@@ -171,7 +167,7 @@ class MeetingService:
                 if not clean_name:
                     continue
 
-                if clean_name.lower() in ("все участники", "все", "всем"):
+                if clean_name.lower() in ("все участники", "все", "всем", "all"):
                     has_all = True
                     continue
 
@@ -179,13 +175,30 @@ class MeetingService:
                 if user and not _is_bot_user(user):
                     participant_objects.append(user)
                 elif not user:
-                    logger.warning("Meeting: participant %r not found", raw_name)
+                    logger.warning("participant %r not found, creating placeholder", raw_name)
+                    try:
+                        placeholder = await sync_to_async(TelegramUser.objects.create)(
+                            telegram_id=-(abs(hash(clean_name)) % 1_000_000_000 + 1_000_000_000),
+                            username=clean_name,
+                            full_name=clean_name,
+                            is_bot=False,
+                        )
+                        participant_objects.append(placeholder)
+                    except Exception:
+                        logger.warning("Failed to create placeholder for %s", clean_name)
 
+            # Проверка дубликата
             existing = await sync_to_async(self._check_duplicate_meeting)(
                 clean_title, start_at, topic, participant_objects,
             )
             if existing:
-                logger.info("Duplicate meeting: '%s' at %s, skipping", clean_title, start_at)
+                    # Обновляем is_all_hands при дубликате
+                if has_all and not existing.is_all_hands:
+                    def _patch():
+                        Meeting.objects.filter(id=existing.id).update(is_all_hands=True)
+                        existing.is_all_hands = True
+                    await sync_to_async(_patch)()
+                logger.info("Duplicate, skipping")
                 return existing
 
             meeting = await sync_to_async(Meeting.objects.create)(
@@ -194,19 +207,20 @@ class MeetingService:
                 start_at=start_at,
                 source_message=source_message,
                 creator=source_message.author,
+                is_all_hands=has_all,
             )
 
             if not has_all:
                 for user in participant_objects:
                     await sync_to_async(meeting.participants.add)(user)
 
+            # ═══ Передаём флаг has_all через Python-атрибут ═══
+
             return meeting
 
         except Exception as e:
             logger.error("_create_meeting_from_data error: %s", e, exc_info=True)
             return None
-
-    # ── Проверка дубликата ──────────────────────────────────────
 
     def _check_duplicate_meeting(
         self, title: str, start_at: datetime, topic, participants: List[TelegramUser],
@@ -221,8 +235,6 @@ class MeetingService:
                 return meeting
         return None
 
-    # ── Извлечение ──────────────────────────────────────────────
-
     async def extract_meeting_from_message(self, message: Message) -> Optional[Meeting]:
         now = timezone.localtime(timezone.now())
         meeting_data = await self.llm.extract_meeting_from_message(
@@ -235,7 +247,6 @@ class MeetingService:
     ) -> list[Meeting]:
         if not messages:
             return []
-
         messages = sorted(messages, key=lambda m: m.timestamp)
         context_lines = []
         for msg in messages:
@@ -246,10 +257,8 @@ class MeetingService:
             )
             time_str = timezone.localtime(msg.timestamp).strftime("%H:%M")
             context_lines.append(f"[{time_str}] {author}: {msg.text}")
-
         batch_text = "\n".join(context_lines)
         now = timezone.localtime(timezone.now())
-
         try:
             meetings_data = await self.llm.extract_meetings_from_messages(
                 batch_text, current_context=now.strftime("%Y-%m-%d %H:%M"),
@@ -257,10 +266,8 @@ class MeetingService:
         except Exception as e:
             logger.error("Batch meeting extraction failed: %s", e, exc_info=True)
             return []
-
         if not meetings_data:
             return []
-
         created: list[Meeting] = []
         source_message = messages[-1]
         for meeting_data in meetings_data:
@@ -268,8 +275,6 @@ class MeetingService:
             if meeting:
                 created.append(meeting)
         return created
-
-    # ── Запросы ─────────────────────────────────────────────────
 
     async def get_upcoming_meetings(self, hours_ahead: int = 24) -> List[Meeting]:
         def _query() -> List[Meeting]:
@@ -301,20 +306,38 @@ class MeetingService:
             meeting.save(update_fields=["reminder_sent"])
         await sync_to_async(_update)()
 
-    # ── Отмена / перенос ───────────────────────────────────────
-
-    async def cancel_meeting(
-        self, meeting_id: int, notification_sender=None,
+    async def update_participants(
+        self, meeting_id: int, participant_usernames: List[str],
     ) -> bool:
+        def _update() -> bool:
+            try:
+                meeting = Meeting.objects.get(id=meeting_id)
+                meeting.participants.clear()
+                meeting.is_all_hands = False
+                for raw_name in participant_usernames:
+                    clean_name = raw_name.lstrip("@").strip()
+                    if not clean_name:
+                        continue
+                    if clean_name.lower() in ("все участники", "все", "всем", "all"):
+                        meeting.is_all_hands = True
+                        continue
+                    user = _find_user_by_username(clean_name)
+                    if user and not _is_bot_user(user):
+                        meeting.participants.add(user)
+                meeting.save(update_fields=["is_all_hands"])
+                return True
+            except Meeting.DoesNotExist:
+                return False
+        return await sync_to_async(_update)()
+
+    async def cancel_meeting(self, meeting_id: int, notification_sender=None) -> bool:
         meeting = await self.get_meeting_by_id(meeting_id)
         if not meeting:
             return False
-
         def _cancel():
             meeting.status = "cancelled"
             meeting.save(update_fields=["status"])
         await sync_to_async(_cancel)()
-
         if notification_sender is not None:
             for user in meeting.participants.all():
                 if _is_bot_user(user):
@@ -322,15 +345,11 @@ class MeetingService:
                 await notification_sender.send_meeting_cancelled(user, meeting)
         return True
 
-    async def reschedule_meeting(
-        self, meeting_id: int, new_start_at: datetime, notification_sender=None,
-    ) -> Optional[Meeting]:
+    async def reschedule_meeting(self, meeting_id: int, new_start_at: datetime, notification_sender=None) -> Optional[Meeting]:
         old_meeting = await self.get_meeting_by_id(meeting_id)
         if not old_meeting:
             return None
-
         old_start_at = old_meeting.start_at
-
         def _reschedule():
             old_meeting.start_at = new_start_at
             old_meeting.status = "active"
@@ -338,12 +357,34 @@ class MeetingService:
             old_meeting.daily_reminder_sent = False
             old_meeting.save(update_fields=["start_at", "status", "reminder_sent", "daily_reminder_sent"])
             return old_meeting
-
         meeting = await sync_to_async(_reschedule)()
-
         if notification_sender is not None:
             for user in meeting.participants.all():
                 if _is_bot_user(user):
                     continue
                 await notification_sender.send_meeting_rescheduled(user, meeting, old_start_at)
         return meeting
+
+
+# ══════════════════════════════════════════════════════════════════
+# Вспомогательная функция для батч-фикса
+# ══════════════════════════════════════════════════════════════════
+
+
+def _is_author_mentioned_in_batch(participants: List[str], source_message: Message) -> bool:
+    """
+    Возвращает True, если хотя бы один участник упомянут
+    в тексте source_message. Это значит, что встреча была
+    извлечена ИЗ ЭТОГО сообщения → можно применять фильтр автора.
+    Если ни один участник не упомянут → встреча из другого сообщения
+    в батче → НЕ фильтруем автора.
+    """
+    if not source_message or not source_message.text:
+        return True  # fallback — фильтруем как раньше
+
+    text_lower = source_message.text.lower()
+    for raw_name in participants:
+        clean_name = raw_name.lstrip("@").strip().lower()
+        if clean_name and clean_name in text_lower:
+            return True
+    return False

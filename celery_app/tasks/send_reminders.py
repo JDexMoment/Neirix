@@ -270,8 +270,202 @@ async def _send_daily_digest_async():
 
 
 # ═════════════════════════════════════════════════════════════════════
-#  Celery-задачи
+#  Уведомление о назначении задачи (новый исполнитель)
 # ═════════════════════════════════════════════════════════════════════
+
+async def _send_task_assigned_notification_async(task_id: int):
+    """Отправляет уведомление исполнителям о новой задаче."""
+    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    try:
+        task = await sync_to_async(
+            lambda: Task.objects.filter(id=task_id)
+            .select_related("topic__chat")
+            .prefetch_related("assignees__user")
+            .first()
+        )()
+        if not task:
+            logger.warning("Task %s not found for notification", task_id)
+            return 0
+
+        # Название чата
+        chat_title = ""
+        try:
+            chat_title = task.topic.chat.title or ""
+        except Exception:
+            pass
+        source_block = f"\n📍 Чат: {chat_title}\n" if chat_title else "\n"
+
+        # Форматируем срок
+        due_str = _format_due_date_sync(task)
+
+        sent_count = 0
+        for ta in task.assignees.all():
+            user = ta.user
+            if _is_bot_user(user):
+                continue
+            try:
+                await bot.send_message(
+                    user.telegram_id,
+                    f"📌 <b>Вам назначена задача:</b>\n"
+                    f"<b>{task.title}</b>\n"
+                    f"{due_str}"
+                    f"{source_block}"
+                    f"Используйте /tasks для просмотра всех задач.",
+                    parse_mode="HTML",
+                )
+                sent_count += 1
+            except Exception as e:
+                logger.warning("Failed to notify user %s: %s", user, e)
+
+        logger.info("Task assigned notifications sent: %s for task_id=%s", sent_count, task_id)
+        return sent_count
+    finally:
+        await bot.session.close()
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Уведомление создателю о задаче без исполнителя
+# ═════════════════════════════════════════════════════════════════════
+
+async def _send_unassigned_task_notification_async(task_id: int):
+    """Отправляет создателю уведомление, что у задачи нет исполнителя."""
+    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    try:
+        task = await sync_to_async(
+            lambda: Task.objects.filter(id=task_id)
+            .select_related("creator", "topic__chat")
+            .first()
+        )()
+        if not task:
+            logger.warning("Task %s not found for unassigned notification", task_id)
+            return 0
+
+        creator = task.creator
+        if not creator:
+            logger.warning("Task %s has no creator, skipping notification", task_id)
+            return 0
+
+        # Уже есть исполнитель?
+        assignee_count = await sync_to_async(lambda: task.assignees.count())()
+        if assignee_count > 0:
+            return 0
+
+        chat_title = ""
+        try:
+            chat_title = task.topic.chat.title or ""
+        except Exception:
+            pass
+        source_block = f"\n📍 Чат: {chat_title}\n" if chat_title else "\n"
+
+        due_str = _format_due_date_sync(task)
+
+        # Создаём inline-клавиатуру через aiogram
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="👤 Назначить исполнителя",
+                callback_data=f"task_edit_assignee:{task_id}",
+            )]
+        ])
+
+        try:
+            await bot.send_message(
+                creator.telegram_id,
+                f"📌 <b>Задача без исполнителя:</b>\n"
+                f"<b>{task.title}</b>\n"
+                f"{due_str}"
+                f"{source_block}"
+                f"У задачи нет исполнителя. Напишите @username того, "
+                f"кто должен её выполнить.\n\n"
+                f"<i>Пример: @ivanov</i>",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            logger.info("Unassigned notification sent for task %s to %s", task_id, creator)
+            return 1
+        except Exception as e:
+            logger.warning("Failed to notify creator %s: %s", creator, e)
+            return 0
+    finally:
+        await bot.session.close()
+
+
+def _format_due_date_sync(task) -> str:
+    """Синхронная версия _format_due_date для использования в Celery."""
+    from django.utils import timezone as tz
+    if not task.due_date:
+        return "без срока"
+    dt = task.due_date
+    if tz.is_aware(dt):
+        dt = tz.localtime(dt)
+
+    if task.status == "open" and task.due_date < tz.now():
+        diff = tz.now() - task.due_date
+        days = diff.days
+        hours = diff.seconds // 3600
+        if days > 0:
+            return f"🚨 Просрочено на {days}д {hours}ч"
+        else:
+            return f"🚨 Просрочено на {hours}ч"
+
+    return f"📅 до {dt.strftime('%d.%m.%Y')}"
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Уведомление о назначении встречи (новые участники)
+# ═════════════════════════════════════════════════════════════════════
+
+async def _send_meeting_assigned_notification_async(meeting_id: int):
+    """Отправляет уведомление участникам о новой/изменённой встрече."""
+    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    try:
+        meeting = await sync_to_async(
+            lambda: Meeting.objects.filter(id=meeting_id)
+            .select_related("topic__chat")
+            .prefetch_related("participants")
+            .first()
+        )()
+        if not meeting:
+            logger.warning("Meeting %s not found for notification", meeting_id)
+            return 0
+
+        chat_title = ""
+        try:
+            chat_title = meeting.topic.chat.title or ""
+        except Exception:
+            pass
+        source_block = f"\n📍 Чат: {chat_title}\n" if chat_title else "\n"
+
+        dt = meeting.start_at
+        if timezone.is_aware(dt):
+            dt = timezone.localtime(dt)
+        time_str = dt.strftime("%d.%m.%Y %H:%M")
+
+        sent_count = 0
+        for user in meeting.participants.all():
+            if _is_bot_user(user):
+                continue
+            try:
+                await bot.send_message(
+                    user.telegram_id,
+                    f"📅 <b>Вы приглашены на встречу:</b>\n"
+                    f"<b>{meeting.title}</b>\n"
+                    f"  ⏰ {time_str}"
+                    f"{source_block}"
+                    f"Используйте /meetings для просмотра всех встреч.",
+                    parse_mode="HTML",
+                )
+                sent_count += 1
+            except Exception as e:
+                logger.warning("Failed to notify user %s: %s", user, e)
+
+        logger.info(
+            "Meeting assigned notifications sent: %s for meeting_id=%s",
+            sent_count, meeting_id,
+        )
+        return sent_count
+    finally:
+        await bot.session.close()
 
 @shared_task(name="celery_app.tasks.send_reminders.send_meeting_reminders")
 def send_meeting_reminders():
@@ -296,3 +490,96 @@ def send_overdue_task_reminders():
 @shared_task(name="celery_app.tasks.send_reminders.send_daily_digest")
 def send_daily_digest():
     return _run_async(_send_daily_digest_async())
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_task_assigned_notification")
+def send_task_assigned_notification(task_id: int):
+    """Уведомляет исполнителей о новой задаче."""
+    return _run_async(_send_task_assigned_notification_async(task_id))
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_unassigned_task_notification")
+def send_unassigned_task_notification(task_id: int):
+    """Уведомляет создателя о задаче без исполнителя."""
+    return _run_async(_send_unassigned_task_notification_async(task_id))
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Уведомление создателю о встрече без участников
+# ═════════════════════════════════════════════════════════════════════
+
+async def _send_meeting_without_participants_async(meeting_id: int):
+    """Отправляет создателю уведомление, что у встречи нет участников."""
+    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    try:
+        meeting = await sync_to_async(
+            lambda: Meeting.objects.filter(id=meeting_id)
+            .select_related("creator", "topic__chat")
+            .first()
+        )()
+        if not meeting:
+            logger.warning("Meeting %s not found for notification", meeting_id)
+            return 0
+
+        creator = meeting.creator
+        if not creator:
+            logger.warning("Meeting %s has no creator, skipping notification", meeting_id)
+            return 0
+
+        # Уже есть участники?
+        participant_count = await sync_to_async(lambda: meeting.participants.count())()
+        if participant_count > 0:
+            return 0
+
+        chat_title = ""
+        try:
+            chat_title = meeting.topic.chat.title or ""
+        except Exception:
+            pass
+        source_block = f"\n📍 Чат: {chat_title}\n" if chat_title else "\n"
+
+        dt = meeting.start_at
+        if timezone.is_aware(dt):
+            dt = timezone.localtime(dt)
+        time_str = dt.strftime("%d.%m.%Y %H:%M")
+
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="👤 Назначить участников",
+                callback_data=f"meeting_edit_participants:{meeting_id}",
+            )]
+        ])
+
+        try:
+            await bot.send_message(
+                creator.telegram_id,
+                f"📅 <b>Встреча без участников:</b>\n"
+                f"<b>{meeting.title}</b>\n"
+                f"  ⏰ {time_str}"
+                f"{source_block}"
+                f"У встречи нет участников. Напишите @username тех, "
+                f"кого нужно пригласить.\n\n"
+                f"<i>Пример: @ivanov @petrov</i>",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            logger.info("Meeting without participants notification sent for %s", meeting_id)
+            return 1
+        except Exception as e:
+            logger.warning("Failed to notify creator %s: %s", creator, e)
+            return 0
+    finally:
+        await bot.session.close()
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_meeting_without_participants_notification")
+def send_meeting_without_participants_notification(meeting_id: int):
+    """Уведомляет создателя о встрече без участников."""
+    return _run_async(_send_meeting_without_participants_async(meeting_id))
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_meeting_assigned_notification")
+def send_meeting_assigned_notification(meeting_id: int):
+    """Уведомляет участников о новой/изменённой встрече."""
+    return _run_async(_send_meeting_assigned_notification_async(meeting_id))
