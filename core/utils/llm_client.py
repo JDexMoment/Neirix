@@ -143,7 +143,6 @@ class LLMClient:
         return text.strip()
 
     def _normalize_usernames(self, value):
-        """Normalize usernames from various input formats"""
         if value is None:
             return []
         if isinstance(value, str):
@@ -165,12 +164,21 @@ class LLMClient:
                         result.append(username)
             else:
                 clean = item.strip()
-                if clean and re.match(r"^[A-Za-z0-9_]{1,32}$", clean):
+                if not clean:
+                    continue
+                # ═══ ОСТАВЛЯЕМ "Все участники", "All participants" КАК ЕСТЬ ═══
+                if re.match(r"^[A-Za-z0-9_]{1,32}$", clean):
                     username = f"@{clean}"
                     low = username.lower()
                     if low not in seen:
                         seen.add(low)
                         result.append(username)
+                else:
+                    # Не-username значения (кириллица, пробелы) — оставляем как есть
+                    low = clean.lower()
+                    if low not in seen:
+                        seen.add(low)
+                        result.append(clean)
         return result
 
     def _merge_usernames(self, from_llm, from_regex):

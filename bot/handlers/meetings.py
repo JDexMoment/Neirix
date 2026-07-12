@@ -40,9 +40,10 @@ def _get_upcoming_meetings_for_private(db_user, chat=None) -> List[Meeting]:
     from django.db.models import Q
 
     now = timezone.now()
+    # Участвую лично ИЛИ встреча для всех (is_all_hands)
     query = Q(participants=db_user)
     if chat is not None:
-        query |= Q(topic__chat=chat)
+        query |= Q(topic__chat=chat, is_all_hands=True)
 
     return list(
         Meeting.objects.filter(
@@ -50,7 +51,7 @@ def _get_upcoming_meetings_for_private(db_user, chat=None) -> List[Meeting]:
             start_at__gte=now,
             status='active',
         )
-        .select_related("topic", "topic__chat", "creator", "source_message")
+        .select_related("topic", "topic__chat", "creator")
         .prefetch_related("participants")
         .order_by("start_at", "id")
         .distinct()
@@ -69,7 +70,7 @@ def _get_upcoming_meetings_for_chat(chat, topic=None) -> List[Meeting]:
 
     return list(
         Meeting.objects.filter(**filters)
-        .select_related("topic", "topic__chat", "creator", "source_message")
+        .select_related("topic", "topic__chat", "creator")
         .prefetch_related("participants")
         .order_by("start_at", "id")
         .distinct()
@@ -79,8 +80,7 @@ def _get_upcoming_meetings_for_chat(chat, topic=None) -> List[Meeting]:
 def _format_participants(meeting: Meeting) -> str:
     participants = list(meeting.participants.all())
     if not participants:
-        # Проверяем source_message — если там "все"/"всем"/"@All" → "Все участники"
-        if _meeting_was_all_hands(meeting):
+        if getattr(meeting, 'is_all_hands', False):
             return "Все участники"
         return "не определены"
     names = []
@@ -92,19 +92,6 @@ def _format_participants(meeting: Meeting) -> str:
         else:
             names.append(f"id={p.id}")
     return ", ".join(names)
-
-
-def _meeting_was_all_hands(meeting: Meeting) -> bool:
-    """Проверяет, была ли встреча создана как «для всех» — по source_message."""
-    try:
-        msg = meeting.source_message
-        if not msg or not msg.text:
-            return False
-        text_lower = msg.text.lower()
-        all_keywords = ("все участники", "все", "всем", "у всех", "для всех", "@all")
-        return any(kw in text_lower for kw in all_keywords)
-    except Exception:
-        return False
 
 
 def _format_meeting_time(meeting: Meeting) -> str:

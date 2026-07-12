@@ -318,7 +318,7 @@ class MeetingService:
                     clean_name = raw_name.lstrip("@").strip()
                     if not clean_name:
                         continue
-                    if clean_name.lower() in ("все участники", "все", "всем", "all"):
+                    if clean_name.lower() in ("все участники", "все", "всем", "all", "all participants"):
                         meeting.is_all_hands = True
                         continue
                     user = _find_user_by_username(clean_name)
