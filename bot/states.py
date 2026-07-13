@@ -8,8 +8,10 @@ class RescheduleMeetingStates(StatesGroup):
 
 class EditTaskStates(StatesGroup):
     """Состояния для редактирования задачи."""
+    waiting_for_choice = State()
     waiting_for_due_date = State()
     waiting_for_assignee = State()
+    waiting_for_title = State()
 
 
 class AssignTaskStates(StatesGroup):
@@ -19,4 +21,6 @@ class AssignTaskStates(StatesGroup):
 
 class EditMeetingStates(StatesGroup):
     """Состояния для редактирования встречи."""
+    waiting_for_choice = State()
     waiting_for_participants = State()
+    waiting_for_title = State()

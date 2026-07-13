@@ -26,31 +26,22 @@ from bot.keyboards.inline import (
     meeting_reschedule_cancel_keyboard,
 )
 
+# For meeting_keyboard import inside sync function
+from bot.keyboards.inline import meeting_keyboard as _meeting_keyboard
+
 logger = logging.getLogger(__name__)
 router = Router()
 meeting_service = MeetingService()
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Вспомогательные функции
-# ─────────────────────────────────────────────────────────────────────
-
-
 def _get_upcoming_meetings_for_private(db_user, chat=None) -> List[Meeting]:
     from django.db.models import Q
-
     now = timezone.now()
-    # Участвую лично ИЛИ встреча для всех (is_all_hands)
     query = Q(participants=db_user)
     if chat is not None:
         query |= Q(topic__chat=chat, is_all_hands=True)
-
     return list(
-        Meeting.objects.filter(
-            query,
-            start_at__gte=now,
-            status='active',
-        )
+        Meeting.objects.filter(query, start_at__gte=now, status='active')
         .select_related("topic", "topic__chat", "creator")
         .prefetch_related("participants")
         .order_by("start_at", "id")
@@ -60,14 +51,9 @@ def _get_upcoming_meetings_for_private(db_user, chat=None) -> List[Meeting]:
 
 def _get_upcoming_meetings_for_chat(chat, topic=None) -> List[Meeting]:
     now = timezone.now()
-    filters = {
-        "topic__chat": chat,
-        "start_at__gte": now,
-        "status": "active",
-    }
+    filters = {"topic__chat": chat, "start_at__gte": now, "status": "active"}
     if topic is not None:
         filters["topic"] = topic
-
     return list(
         Meeting.objects.filter(**filters)
         .select_related("topic", "topic__chat", "creator")
@@ -109,26 +95,66 @@ def _format_creator(creator) -> str:
     return creator.full_name or f"id={creator.id}"
 
 
-def _format_meeting_source(meeting: Meeting) -> str:
-    try:
-        chat_title = meeting.topic.chat.title
-        if chat_title:
-            return f"📍 Чат: {chat_title}"
-    except Exception:
-        pass
-    return ""
+def _build_meeting_text(meeting: Meeting) -> str:
+    return (
+        f"• <b>{meeting.title}</b>\n"
+        f"  ⏰ {_format_meeting_time(meeting)}\n"
+        f"  👥 {_format_participants(meeting)}\n"
+        f"  📝 Назначил(а): {_format_creator(meeting.creator)}"
+    )
+
+
+def _build_meeting_text_sync(meeting: Meeting, meeting_id: int):
+    """Синхронная версия — все ORM запросы внутри sync_to_async."""
+    from core.models import Meeting as MeetingModel
+    # Перезагружаем встречу в синхронном контексте
+    m = MeetingModel.objects.filter(id=meeting_id).select_related("topic", "topic__chat", "creator").prefetch_related("participants").first()
+    if not m:
+        return _build_meeting_text(meeting), _meeting_keyboard(meeting_id)
+    
+    participants = list(m.participants.all())
+    if not participants:
+        if getattr(m, 'is_all_hands', False):
+            p_str = "Все участники"
+        else:
+            p_str = "не определены"
+    else:
+        names = []
+        for p in participants:
+            if p.username:
+                names.append(f"@{p.username}")
+            elif p.full_name:
+                names.append(p.full_name)
+            else:
+                names.append(f"id={p.id}")
+        p_str = ", ".join(names)
+    
+    dt = m.start_at
+    from django.utils import timezone as tz
+    if tz.is_aware(dt):
+        dt = tz.localtime(dt)
+    time_str = dt.strftime("%d.%m.%Y %H:%M")
+    
+    creator = m.creator
+    if not creator:
+        c_str = "неизвестен"
+    elif creator.username:
+        c_str = f"@{creator.username}"
+    else:
+        c_str = creator.full_name or f"id={creator.id}"
+    
+    text = (
+        f"• <b>{m.title}</b>\n"
+        f"  ⏰ {time_str}\n"
+        f"  👥 {p_str}\n"
+        f"  📝 Назначил(а): {c_str}"
+    )
+    return text, _meeting_keyboard(meeting_id)
 
 
 def _parse_user_datetime(text: str) -> Optional[datetime]:
     text = text.strip()
-    for fmt in (
-        "%d.%m.%Y %H:%M",
-        "%d.%m.%Y %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%d.%m.%Y",
-        "%Y-%m-%d",
-    ):
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(text, fmt)
             if fmt in ("%d.%m.%Y", "%Y-%m-%d"):
@@ -137,11 +163,6 @@ def _parse_user_datetime(text: str) -> Optional[datetime]:
         except ValueError:
             continue
     return None
-
-
-# ─────────────────────────────────────────────────────────────────────
-# /meetings — список встреч
-# ─────────────────────────────────────────────────────────────────────
 
 
 @router.message(Command("meetings"))
@@ -155,7 +176,6 @@ async def cmd_meetings(message: Message):
     pending_messages = buffer.flush(chat_id, topic_id)
     if pending_messages:
         result = await processor.process_batch(chat_id, topic_id, pending_messages)
-        # Уведомления о задачах без исполнителя
         unassigned_ids = result.get("unassigned_task_ids", [])
         if unassigned_ids:
             from core.services.task_service import TaskService
@@ -165,13 +185,12 @@ async def cmd_meetings(message: Message):
                 task = await task_svc.get_task_by_id(task_id)
                 if task:
                     await notify_creator_about_unassigned_task(task)
-
-        # Уведомления о встречах без участников
         unassigned_meeting_ids = result.get("unassigned_meeting_ids", [])
         if unassigned_meeting_ids:
             from celery_app.tasks.send_reminders import send_meeting_without_participants_notification
             for meeting_id in unassigned_meeting_ids:
                 send_meeting_without_participants_notification.delay(meeting_id)
+
     if not db_user:
         await message.answer("Не удалось определить пользователя.")
         return
@@ -191,26 +210,12 @@ async def cmd_meetings(message: Message):
         return
 
     await message.answer(header)
-
     for m in meetings:
-        mentions = _format_participants(m)
-        local_time = _format_meeting_time(m)
-        title = (m.title or "Без названия").strip()
-        creator_str = _format_creator(m.creator)
-
         await message.answer(
-            f"• <b>{title}</b>\n"
-            f"  ⏰ {local_time}\n"
-            f"  👥 {mentions}\n"
-            f"  📝 Назначил(а): {creator_str}",
+            _build_meeting_text(m),
             parse_mode="HTML",
             reply_markup=meeting_keyboard(m.id),
         )
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Отмена встречи
-# ─────────────────────────────────────────────────────────────────────
 
 
 @router.callback_query(F.data.startswith("meeting_cancel:"))
@@ -220,12 +225,10 @@ async def callback_meeting_cancel(callback: CallbackQuery):
     except (IndexError, ValueError):
         await callback.answer("Некорректный идентификатор.", show_alert=True)
         return
-
     meeting = await meeting_service.get_meeting_by_id(meeting_id)
     if not meeting:
         await callback.answer("Встреча не найдена.", show_alert=True)
         return
-
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.reply(
         f"Вы уверены, что хотите отменить встречу <b>{meeting.title}</b>?",
@@ -242,15 +245,24 @@ async def callback_meeting_cancel_confirm(callback: CallbackQuery):
     except (IndexError, ValueError):
         await callback.answer("Некорректный идентификатор.", show_alert=True)
         return
-
+    meeting = await meeting_service.get_meeting_by_id(meeting_id)
+    meeting_title = meeting.title if meeting else "Встреча"
     success = await meeting_service.cancel_meeting(meeting_id)
-
     if success:
         await callback.answer("Встреча отменена.")
+        # Уведомляем участников
+        if meeting:
+            from celery_app.tasks.send_reminders import send_meeting_cancelled_notification
+            send_meeting_cancelled_notification.delay(meeting_id)
         try:
-            await callback.message.edit_text("❌ Встреча отменена.")
+            await callback.message.delete()
         except Exception:
-            await callback.message.reply("❌ Встреча отменена.")
+            pass
+        try:
+            if callback.message.reply_to_message:
+                await callback.message.reply_to_message.delete()
+        except Exception:
+            pass
     else:
         await callback.answer("Не удалось отменить встречу.", show_alert=True)
 
@@ -262,24 +274,29 @@ async def callback_meeting_cancel_abort(callback: CallbackQuery):
     except (IndexError, ValueError):
         await callback.answer("Ошибка.")
         return
-
-    await callback.answer("Встреча оставлена без изменений.")
+    # Удаляем сообщение-подтверждение и восстанавливаем оригинал
     try:
-        await callback.message.edit_text(
-            callback.message.text + "\n\n↩️ Отмена отменена.",
-            parse_mode="HTML",
-            reply_markup=meeting_keyboard(meeting_id),
-        )
+        await callback.message.delete()
     except Exception:
-        await callback.message.reply(
-            "↩️ Встреча оставлена без изменений.",
-            reply_markup=meeting_keyboard(meeting_id),
-        )
+        pass
+    try:
+        if callback.message.reply_to_message:
+            meeting = await meeting_service.get_meeting_by_id(meeting_id)
+            if meeting:
+                text, markup = await sync_to_async(_build_meeting_text_sync)(meeting, meeting_id)
+                await callback.bot.edit_message_text(
+                    text,
+                    chat_id=callback.message.reply_to_message.chat.id,
+                    message_id=callback.message.reply_to_message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+    except Exception as e:
+        logger.warning("Failed to restore meeting on cancel abort: %s", e)
+    await callback.answer("Встреча оставлена без изменений.")
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Перенос встречи (существующий код)
-# ─────────────────────────────────────────────────────────────────────
+# ── Перенос встречи ──
 
 
 @router.callback_query(F.data.startswith("meeting_reschedule:"))
@@ -289,7 +306,6 @@ async def callback_meeting_reschedule(callback: CallbackQuery, state: FSMContext
     except (IndexError, ValueError):
         await callback.answer("Некорректный идентификатор.", show_alert=True)
         return
-
     meeting = await meeting_service.get_meeting_by_id(meeting_id)
     if not meeting:
         await callback.answer("Встреча не найдена.", show_alert=True)
@@ -299,31 +315,51 @@ async def callback_meeting_reschedule(callback: CallbackQuery, state: FSMContext
     await state.update_data(
         reschedule_meeting_id=meeting_id,
         reschedule_meeting_title=meeting.title,
-        _fsm_started_at=time.time()
+        reschedule_old_time=_format_meeting_time(meeting),
+        reschedule_original_chat_id=callback.message.chat.id,
+        reschedule_original_msg_id=callback.message.message_id,
+        _fsm_started_at=time.time(),
     )
 
-    await callback.message.edit_reply_markup(reply_markup=None)
-
-    await callback.message.reply(
-        f"📅 Перенос встречи <b>{meeting.title}</b>\n\n"
-        f"Текущее время: {_format_meeting_time(meeting)}\n\n"
-        f"Введите новую дату и время в формате:\n"
-        f"<code>25.05.2026 14:00</code>\n\n"
-        f"Или напишите <b>отмена</b> для отмены переноса.\n\n"
-        f"⏱ У вас есть 2 минуты на ответ.",
+    prompt_msg = await callback.bot.send_message(
+        chat_id=callback.message.chat.id,
+        text=f"📅 Перенос встречи <b>{meeting.title}</b>\n\n"
+             f"Текущее время: {_format_meeting_time(meeting)}\n\n"
+             f"Введите новую дату и время в формате:\n"
+             f"<code>25.05.2026 14:00</code>\n\n"
+             f"Или напишите <b>отмена</b> для отмены переноса.\n\n"
+             f"⏱ У вас есть 2 минуты на ответ.",
         parse_mode="HTML",
         reply_markup=meeting_reschedule_cancel_keyboard(),
+    )
+    await state.update_data(
+        reschedule_prompt_chat_id=prompt_msg.chat.id,
+        reschedule_prompt_msg_id=prompt_msg.message_id,
     )
     await callback.answer()
 
 
 @router.message(RescheduleMeetingStates.waiting_for_new_datetime)
 async def process_reschedule_datetime(message: Message, state: FSMContext):
+    data = await state.get_data()
     user_text = (message.text or "").strip()
 
     if user_text.lower() in ("отмена", "cancel", "отменить", "/cancel"):
+        # Удаляем промпт
+        prompt_chat = data.get("reschedule_prompt_chat_id")
+        prompt_msg = data.get("reschedule_prompt_msg_id")
+        if prompt_chat and prompt_msg:
+            try:
+                await message.bot.delete_message(prompt_chat, prompt_msg)
+            except Exception:
+                pass
+        # Удаляем сообщение пользователя
+        try:
+            await message.delete()
+        except Exception:
+            pass
         await state.clear()
-        await message.answer("↩️ Перенос встречи отменён.")
+        await _restore_meeting(message, data)
         return
 
     new_dt = _parse_user_datetime(user_text)
@@ -347,13 +383,13 @@ async def process_reschedule_datetime(message: Message, state: FSMContext):
         )
         return
 
-    data = await state.get_data()
     meeting_id = data.get("reschedule_meeting_id")
     meeting_title = data.get("reschedule_meeting_title", "")
+    old_time = data.get("reschedule_old_time", "")
 
     if not meeting_id:
         await state.clear()
-        await message.answer("⚠️ Ошибка: данные переноса потеряны. Попробуйте заново.")
+        await message.answer("⚠️ Ошибка: данные потеряны. Попробуйте заново.")
         return
 
     updated_meeting = await meeting_service.reschedule_meeting(meeting_id, new_start_at)
@@ -361,65 +397,116 @@ async def process_reschedule_datetime(message: Message, state: FSMContext):
 
     if updated_meeting:
         new_time_str = timezone.localtime(new_start_at).strftime("%d.%m.%Y %H:%M")
+
+        # Редактируем оригинал
+        orig_chat = data.get("reschedule_original_chat_id")
+        orig_msg = data.get("reschedule_original_msg_id")
+        if orig_chat and orig_msg:
+            meeting = await meeting_service.get_meeting_by_id(meeting_id)
+            if meeting:
+                try:
+                    text, markup = await sync_to_async(_build_meeting_text_sync)(meeting, meeting_id)
+                    await message.bot.edit_message_text(
+                        text,
+                        chat_id=orig_chat,
+                        message_id=orig_msg,
+                        parse_mode="HTML",
+                        reply_markup=markup,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to edit rescheduled meeting: %s", e)
+
+        # Удаляем промпт
+        prompt_chat = data.get("reschedule_prompt_chat_id")
+        prompt_msg = data.get("reschedule_prompt_msg_id")
+        if prompt_chat and prompt_msg:
+            try:
+                await message.bot.delete_message(prompt_chat, prompt_msg)
+            except Exception:
+                pass
+
+        # Удаляем сообщение пользователя
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
         await message.answer(
-            f"✅ Встреча <b>{meeting_title}</b> перенесена на {new_time_str}.",
+            f"✅ Время встречи <b>{meeting_title}</b> изменено:\n"
+            f"{old_time} → {new_time_str}",
             parse_mode="HTML",
         )
+
+        # Уведомляем участников об изменении
+        if updated_meeting:
+            _notify_meeting_changed(updated_meeting, f"⏰ Время: {old_time} → {new_time_str}")
     else:
         await message.answer("❌ Не удалось перенести встречу. Возможно, она была удалена.")
 
 
 @router.callback_query(F.data == "meeting_reschedule_cancel")
 async def callback_reschedule_cancel(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
     await state.clear()
-    await callback.answer("Перенос отменён.")
+    # Удаляем промпт-сообщение
     try:
-        await callback.message.edit_text("↩️ Перенос встречи отменён.")
+        await callback.message.delete()
     except Exception:
-        await callback.message.reply("↩️ Перенос встречи отменён.")
+        pass
+    await _restore_meeting_from_callback(callback, data)
+    await callback.answer("Перенос отменён.")
 
 
-# ─────────────────────────────────────────────────────────────────────
-# РЕДАКТИРОВАНИЕ ВСТРЕЧИ — меню выбора
-# ─────────────────────────────────────────────────────────────────────
+# ── Редактирование встречи ──
 
 
 @router.callback_query(F.data.startswith("meeting_edit:"))
-async def callback_meeting_edit(callback: CallbackQuery):
-    """Показывает меню выбора: изменить участников."""
+async def callback_meeting_edit(callback: CallbackQuery, state: FSMContext):
     try:
         meeting_id = int(callback.data.split(":", 1)[1])
     except (IndexError, ValueError):
         await callback.answer("Некорректный идентификатор.", show_alert=True)
         return
-
     meeting = await meeting_service.get_meeting_by_id(meeting_id)
     if not meeting:
         await callback.answer("Встреча не найдена.", show_alert=True)
         return
 
-    participants_str = _format_participants(meeting)
-    time_str = _format_meeting_time(meeting)
-
-    await callback.message.edit_text(
+    helper = await callback.message.answer(
         f"✏️ <b>{meeting.title}</b>\n"
-        f"  ⏰ {time_str}\n"
-        f"  👥 {participants_str}\n\n"
+        f"  ⏰ {_format_meeting_time(meeting)}\n"
+        f"  👥 {_format_participants(meeting)}\n\n"
         f"Что вы хотите изменить?",
         parse_mode="HTML",
         reply_markup=meeting_edit_options_keyboard(meeting_id),
     )
     await callback.answer()
 
-
-# ─────────────────────────────────────────────────────────────────────
-# Редактирование — назад к встрече
-# ─────────────────────────────────────────────────────────────────────
+    await state.set_state(EditMeetingStates.waiting_for_choice)
+    await state.update_data(
+        edit_meeting_id=meeting_id,
+        edit_original_chat_id=callback.message.chat.id,
+        edit_original_msg_id=callback.message.message_id,
+        edit_helper_chat_id=helper.chat.id,
+        edit_helper_msg_id=helper.message_id,
+    )
 
 
 @router.callback_query(F.data.startswith("meeting_back:"))
-async def callback_meeting_back(callback: CallbackQuery):
+async def callback_meeting_back(callback: CallbackQuery, state: FSMContext):
     """Возвращает к просмотру встречи."""
+    data = await state.get_data()
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await _restore_meeting_from_callback(callback, data)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("meeting_edit_participants:"))
+async def callback_meeting_edit_participants(callback: CallbackQuery, state: FSMContext):
     try:
         meeting_id = int(callback.data.split(":", 1)[1])
     except (IndexError, ValueError):
@@ -427,46 +514,13 @@ async def callback_meeting_back(callback: CallbackQuery):
         return
 
     meeting = await meeting_service.get_meeting_by_id(meeting_id)
-    if not meeting:
-        await callback.answer("Встреча не найдена.", show_alert=True)
-        return
-
-    mentions = _format_participants(meeting)
-    local_time = _format_meeting_time(meeting)
-    title = (meeting.title or "Без названия").strip()
-    creator_str = _format_creator(meeting.creator)
-
-    await callback.message.edit_text(
-        f"• <b>{title}</b>\n"
-        f"  ⏰ {local_time}\n"
-        f"  👥 {mentions}\n"
-        f"  📝 Назначил(а): {creator_str}",
-        parse_mode="HTML",
-        reply_markup=meeting_keyboard(meeting_id),
-    )
-    await callback.answer()
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Редактирование — изменение участников
-# ─────────────────────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data.startswith("meeting_edit_participants:"))
-async def callback_meeting_edit_participants(callback: CallbackQuery, state: FSMContext):
-    """Запрашивает новых участников."""
-    try:
-        meeting_id = int(callback.data.split(":", 1)[1])
-    except (IndexError, ValueError):
-        await callback.answer("Некорректный идентификатор.", show_alert=True)
-        return
+    old_participants = _format_participants(meeting) if meeting else ""
+    await state.update_data(edit_old_participants=old_participants)
 
     await state.set_state(EditMeetingStates.waiting_for_participants)
-    await state.update_data(edit_meeting_id=meeting_id)
-
     await callback.message.edit_text(
         "👤 Напишите @username участников (через пробел).\n\n"
-        "Например: <code>@ivanov @petrov</code>\n"
+        f"Текущие: {old_participants}\n\n"
         "<i>(все предыдущие участники будут заменены)</i>\n\n"
         "Или нажмите кнопку отмены.",
         parse_mode="HTML",
@@ -475,9 +529,112 @@ async def callback_meeting_edit_participants(callback: CallbackQuery, state: FSM
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("meeting_edit_title:"))
+async def callback_meeting_edit_title(callback: CallbackQuery, state: FSMContext):
+    try:
+        meeting_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+
+    meeting = await meeting_service.get_meeting_by_id(meeting_id)
+    old_title = meeting.title if meeting else ""
+    await state.update_data(edit_old_title=old_title)
+
+    await state.set_state(EditMeetingStates.waiting_for_title)
+    await callback.message.edit_text(
+        f"✏️ Введите новое название встречи.\n\n"
+        f"Текущее: <b>{old_title}</b>\n\n"
+        "Или нажмите кнопку отмены.",
+        parse_mode="HTML",
+        reply_markup=meeting_edit_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(EditMeetingStates.waiting_for_title)
+async def process_edit_meeting_title(message: Message, state: FSMContext):
+    data = await state.get_data()
+    meeting_id = data.get("edit_meeting_id")
+    if not meeting_id:
+        await state.clear()
+        await message.answer("⚠️ Ошибка: данные потеряны. Попробуйте заново.")
+        return
+
+    new_title = message.text.strip()
+    if new_title.lower() in ("отмена", "cancel", "/cancel"):
+        await state.clear()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.answer("↩️ Редактирование отменено.")
+        return
+
+    if not new_title:
+        await message.answer("❌ Название не может быть пустым.")
+        return
+
+    old_title = data.get("edit_old_title", "")
+    success = await meeting_service.update_title(meeting_id, new_title)
+    await state.clear()
+
+    if success:
+        meeting = await meeting_service.get_meeting_by_id(meeting_id)
+        if meeting:
+            orig_chat = data.get("edit_original_chat_id")
+            orig_msg = data.get("edit_original_msg_id")
+            if orig_chat and orig_msg:
+                try:
+                    text, markup = await sync_to_async(_build_meeting_text_sync)(meeting, meeting_id)
+                    await message.bot.edit_message_text(
+                        text,
+                        chat_id=orig_chat,
+                        message_id=orig_msg,
+                        parse_mode="HTML",
+                        reply_markup=markup,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to edit meeting: %s", e)
+
+            helper_chat = data.get("edit_helper_chat_id")
+            helper_msg = data.get("edit_helper_msg_id")
+            if helper_chat and helper_msg:
+                try:
+                    await message.bot.delete_message(helper_chat, helper_msg)
+                except Exception:
+                    pass
+
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            await message.answer(
+                f"✅ Название встречи изменено:\n"
+                f"{old_title} → {meeting.title}",
+                parse_mode="HTML",
+            )
+
+            _notify_meeting_changed(meeting, f"✏️ Название: {old_title} → {meeting.title}")
+    else:
+        await message.answer("❌ Не удалось обновить название.")
+
+
+@router.callback_query(F.data == "meeting_edit_cancel")
+async def callback_meeting_edit_cancel(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await _restore_meeting_from_callback(callback, data)
+    await callback.answer("Редактирование отменено.")
+
+
 @router.message(EditMeetingStates.waiting_for_participants)
 async def process_edit_participants(message: Message, state: FSMContext):
-    """Принимает новых участников для встречи."""
     data = await state.get_data()
     meeting_id = data.get("edit_meeting_id")
     if not meeting_id:
@@ -486,9 +643,12 @@ async def process_edit_participants(message: Message, state: FSMContext):
         return
 
     text = message.text.strip()
-
     if text.lower() in ("отмена", "cancel", "/cancel", "-"):
         await state.clear()
+        try:
+            await message.delete()
+        except Exception:
+            pass
         await message.answer("↩️ Редактирование отменено.")
         return
 
@@ -501,44 +661,99 @@ async def process_edit_participants(message: Message, state: FSMContext):
         )
         return
 
+    old_participants_str = data.get("edit_old_participants", "")
     success = await meeting_service.update_participants(meeting_id, usernames)
     await state.clear()
 
     if success:
         meeting = await meeting_service.get_meeting_by_id(meeting_id)
         if meeting:
-            participants_str = _format_participants(meeting)
-            time_str = _format_meeting_time(meeting)
+            new_participants_str = _format_participants(meeting)
+
+            # Редактируем оригинал
+            orig_chat = data.get("edit_original_chat_id")
+            orig_msg = data.get("edit_original_msg_id")
+            if orig_chat and orig_msg:
+                try:
+                    text, markup = await sync_to_async(_build_meeting_text_sync)(meeting, meeting_id)
+                    await message.bot.edit_message_text(
+                        text,
+                        chat_id=orig_chat,
+                        message_id=orig_msg,
+                        parse_mode="HTML",
+                        reply_markup=markup,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to edit meeting: %s", e)
+
+            # Удаляем хелпер
+            helper_chat = data.get("edit_helper_chat_id")
+            helper_msg = data.get("edit_helper_msg_id")
+            if helper_chat and helper_msg:
+                try:
+                    await message.bot.delete_message(helper_chat, helper_msg)
+                except Exception:
+                    pass
+
+            # Удаляем сообщение пользователя
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
             await message.answer(
-                f"✅ Участники встречи <b>{meeting.title}</b> обновлены:\n"
-                f"  ⏰ {time_str}\n"
-                f"  👥 {participants_str}",
+                f"✅ Участники встречи <b>{meeting.title}</b> изменены:\n"
+                f"{old_participants_str} → {new_participants_str}",
                 parse_mode="HTML",
             )
-            # Уведомляем новых участников через Celery
-            _notify_meeting_participants(meeting)
-        else:
-            await message.answer("✅ Участники встречи обновлены.")
+
+            from celery_app.tasks.send_reminders import send_meeting_assigned_notification
+            send_meeting_assigned_notification.delay(meeting_id)
     else:
         await message.answer("❌ Не удалось обновить участников.")
 
 
-def _notify_meeting_participants(meeting):
-    """Отправляет уведомление участникам встречи через Celery."""
-    from celery_app.tasks.send_reminders import send_meeting_assigned_notification
-    send_meeting_assigned_notification.delay(meeting.id)
+def _notify_meeting_changed(meeting, change_text):
+    """Отправляет уведомление участникам об изменении встречи через Celery."""
+    from celery_app.tasks.send_reminders import send_meeting_changed_notification
+    send_meeting_changed_notification.delay(meeting.id, change_text)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Отмена редактирования встречи
-# ─────────────────────────────────────────────────────────────────────
+async def _restore_meeting_from_callback(callback, data):
+    orig_chat = data.get("edit_original_chat_id") or data.get("reschedule_original_chat_id")
+    orig_msg = data.get("edit_original_msg_id") or data.get("reschedule_original_msg_id")
+    meeting_id = data.get("edit_meeting_id") or data.get("reschedule_meeting_id")
+    if orig_chat and orig_msg and meeting_id:
+        meeting = await meeting_service.get_meeting_by_id(meeting_id)
+        if meeting:
+            try:
+                text, markup = await sync_to_async(_build_meeting_text_sync)(meeting, meeting_id)
+                await callback.bot.edit_message_text(
+                    text,
+                    chat_id=orig_chat,
+                    message_id=orig_msg,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+            except Exception as e:
+                logger.warning("Failed to restore meeting: %s", e)
 
 
-@router.callback_query(F.data == "meeting_edit_cancel")
-async def callback_meeting_edit_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.answer("Редактирование отменено.")
-    try:
-        await callback.message.edit_text("↩️ Редактирование отменено.")
-    except Exception:
-        await callback.message.reply("↩️ Редактирование отменено.")
+async def _restore_meeting(message, data):
+    orig_chat = data.get("reschedule_original_chat_id")
+    orig_msg = data.get("reschedule_original_msg_id")
+    meeting_id = data.get("reschedule_meeting_id")
+    if orig_chat and orig_msg and meeting_id:
+        meeting = await meeting_service.get_meeting_by_id(meeting_id)
+        if meeting:
+            try:
+                text, markup = await sync_to_async(_build_meeting_text_sync)(meeting, meeting_id)
+                await message.bot.edit_message_text(
+                    text,
+                    chat_id=orig_chat,
+                    message_id=orig_msg,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+            except Exception as e:
+                logger.warning("Failed to restore meeting: %s", e)

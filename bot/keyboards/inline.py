@@ -23,7 +23,7 @@ def task_keyboard(task_id: int):
 
 
 def task_edit_options_keyboard(task_id: int):
-    """Выбор: изменить срок или исполнителя."""
+    """Выбор: изменить срок, исполнителя или название."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="📅 Срок",
@@ -32,6 +32,10 @@ def task_edit_options_keyboard(task_id: int):
     builder.add(InlineKeyboardButton(
         text="👤 Исполнитель",
         callback_data=f"task_edit_assignee:{task_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="✏️ Название",
+        callback_data=f"task_edit_title:{task_id}",
     ))
     builder.add(InlineKeyboardButton(
         text="↩️ Назад к задаче",
@@ -67,30 +71,34 @@ def task_assign_keyboard(task_id: int):
 
 
 def meeting_keyboard(meeting_id: int):
-    """Кнопки 'Перенести', 'Редактировать' и 'Отменить' под каждой встречей."""
+    """Кнопки 'Редактировать' и 'Отменить' под каждой встречей."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
-        text="📅 Перенести",
-        callback_data=f"meeting_reschedule:{meeting_id}",
-    ))
-    builder.add(InlineKeyboardButton(
-        text="✏️ Участники",
+        text="✏️ Редактировать",
         callback_data=f"meeting_edit:{meeting_id}",
     ))
     builder.add(InlineKeyboardButton(
         text="❌ Отменить",
         callback_data=f"meeting_cancel:{meeting_id}",
     ))
-    builder.adjust(3)
+    builder.adjust(2)
     return builder.as_markup()
 
 
 def meeting_edit_options_keyboard(meeting_id: int):
-    """Выбор: изменить участников."""
+    """Выбор: изменить дату, участников или название."""
     builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="📅 Перенести",
+        callback_data=f"meeting_reschedule:{meeting_id}",
+    ))
     builder.add(InlineKeyboardButton(
         text="👤 Участники",
         callback_data=f"meeting_edit_participants:{meeting_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="✏️ Название",
+        callback_data=f"meeting_edit_title:{meeting_id}",
     ))
     builder.add(InlineKeyboardButton(
         text="↩️ Назад к встрече",

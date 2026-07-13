@@ -10,16 +10,15 @@ from aiogram.types import Message, CallbackQuery
 from asgiref.sync import sync_to_async
 from django.utils import timezone
 
-from core.models import Task, TelegramUser, TelegramChat, UserRole
-from core.services.task_service import TaskService, _find_user_by_username, _is_bot_user
+from core.models import Task, TelegramUser
+from core.services.task_service import TaskService, _is_bot_user
 from bot.utils import get_chat_context
 from bot.keyboards.inline import (
     task_keyboard,
     task_edit_options_keyboard,
     task_edit_cancel_keyboard,
-    task_assign_keyboard,
 )
-from bot.states import EditTaskStates, AssignTaskStates
+from bot.states import EditTaskStates
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -40,13 +39,9 @@ def _get_open_tasks_for_private(db_user: TelegramUser) -> List[Task]:
 
 
 def _get_open_tasks_for_chat(chat, topic=None) -> List[Task]:
-    filters = {
-        "topic__chat": chat,
-        "status": "open",
-    }
+    filters = {"topic__chat": chat, "status": "open"}
     if topic:
         filters["topic"] = topic
-
     return list(
         Task.objects.filter(**filters)
         .select_related("creator")
@@ -66,11 +61,7 @@ def _format_due_date(task: Task) -> str:
     dt = task.due_date
     if timezone.is_aware(dt):
         dt = timezone.localtime(dt)
-
-    now = timezone.localtime(timezone.now())
-
     if task.status == "open" and task.due_date < timezone.now():
-        # Просрочено — показываем на сколько
         diff = timezone.now() - task.due_date
         days = diff.days
         hours = diff.seconds // 3600
@@ -78,7 +69,6 @@ def _format_due_date(task: Task) -> str:
             return f"🚨 Просрочено на {days}д {hours}ч"
         else:
             return f"🚨 Просрочено на {hours}ч"
-
     return f"📅 до {dt.strftime('%d.%m.%Y')}"
 
 
@@ -93,7 +83,6 @@ def _format_assignees(task: Task) -> str:
 
 
 def _format_creator(creator) -> str:
-    """Форматирует создателя задачи/встречи."""
     if not creator:
         return "неизвестен"
     if creator.username:
@@ -101,20 +90,13 @@ def _format_creator(creator) -> str:
     return creator.full_name or f"id={creator.id}"
 
 
-def _format_task_source(task: Task) -> str:
-    """Возвращает название чата, откуда задача."""
-    try:
-        chat_title = task.topic.chat.title
-        if chat_title:
-            return f"📍 Чат: {chat_title}"
-    except Exception:
-        pass
-    return ""
-
-
-# ─────────────────────────────────────────────────────────────────────
-# /tasks — список задач
-# ─────────────────────────────────────────────────────────────────────
+def _build_task_text(task: Task) -> str:
+    return (
+        f"<b>{task.title}</b>\n"
+        f"👤 {_format_assignees(task)}\n"
+        f"{_format_due_date(task)}\n"
+        f"📝 Назначил(а): {_format_creator(task.creator)}"
+    )
 
 
 @router.message(Command("tasks"))
@@ -123,7 +105,6 @@ async def cmd_tasks(message: Message):
     if not db_user:
         await message.answer("Не удалось определить пользователя.")
         return
-
     if message.chat.type == "private":
         tasks = await sync_to_async(_get_open_tasks_for_private)(db_user)
         header = "📋 Ваши задачи:"
@@ -133,31 +114,16 @@ async def cmd_tasks(message: Message):
             await message.answer("Не удалось определить чат.")
             return
         header = f"📋 Задачи чата {chat.title}:"
-
     if not tasks:
         await message.answer("Нет открытых задач.")
         return
-
     await message.answer(header)
-
     for i, task in enumerate(tasks, 1):
-        assignee_str = _format_assignees(task)
-        due_str = _format_due_date(task)
-        creator_str = _format_creator(task.creator)
-
         await message.answer(
-            f"{i}. <b>{task.title}</b>\n"
-            f"👤 {assignee_str}\n"
-            f"{due_str}\n"
-            f"📝 Назначил(а): {creator_str}",
+            f"{i}. {_build_task_text(task)}",
             parse_mode="HTML",
             reply_markup=task_keyboard(task.id),
         )
-
-
-# ─────────────────────────────────────────────────────────────────────
-# callback: task_done
-# ─────────────────────────────────────────────────────────────────────
 
 
 @router.callback_query(F.data.startswith("task_done:"))
@@ -167,39 +133,56 @@ async def callback_task_done(callback: CallbackQuery):
     except (IndexError, ValueError):
         await callback.answer("Некорректный идентификатор задачи.", show_alert=True)
         return
-
     db_user = await sync_to_async(_get_telegram_user_by_telegram_id)(callback.from_user.id)
     if not db_user:
         await callback.answer("Пользователь не найден в базе.", show_alert=True)
         return
-
     success = await task_service.mark_task_done(task_id, db_user)
-
     if success:
         await callback.answer("✅ Задача выполнена!")
         try:
-            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.delete()
         except Exception as e:
-            logger.warning("Failed to remove task inline keyboard: %s", e)
-        await callback.message.reply("✅ Задача отмечена как выполненная.")
+            logger.warning("Failed to delete task message: %s", e)
     else:
         await callback.answer("❌ Ошибка: задача не найдена или нет прав.", show_alert=True)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Редактирование задачи — шаг 1: меню выбора
-# ─────────────────────────────────────────────────────────────────────
+@router.callback_query(F.data.startswith("task_back:"))
+async def callback_task_back(callback: CallbackQuery, state: FSMContext):
+    """Возвращает к просмотру задачи (удаляет хелпер, восстанавливает оригинал)."""
+    data = await state.get_data()
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    orig_chat = data.get("edit_original_chat_id")
+    orig_msg = data.get("edit_original_msg_id")
+    task_id = data.get("edit_task_id")
+    if orig_chat and orig_msg and task_id:
+        task = await task_service.get_task_by_id(task_id)
+        if task:
+            try:
+                await callback.bot.edit_message_text(
+                    _build_task_text(task),
+                    chat_id=orig_chat,
+                    message_id=orig_msg,
+                    parse_mode="HTML",
+                    reply_markup=task_keyboard(task_id),
+                )
+            except Exception as e:
+                logger.warning("Failed to restore task: %s", e)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("task_edit:"))
-async def callback_task_edit(callback: CallbackQuery):
-    """Показывает меню выбора: изменить срок или исполнителя."""
+async def callback_task_edit(callback: CallbackQuery, state: FSMContext):
     try:
         task_id = int(callback.data.split(":", 1)[1])
     except (IndexError, ValueError):
         await callback.answer("Некорректный идентификатор.", show_alert=True)
         return
-
     task = await task_service.get_task_by_id(task_id)
     if not task:
         await callback.answer("Задача не найдена.", show_alert=True)
@@ -207,8 +190,9 @@ async def callback_task_edit(callback: CallbackQuery):
 
     assignee_str = _format_assignees(task)
     due_str = _format_due_date(task)
+    old_text = _build_task_text(task)
 
-    await callback.message.edit_text(
+    helper = await callback.message.answer(
         f"✏️ <b>{task.title}</b>\n"
         f"👤 {assignee_str}\n"
         f"{due_str}\n\n"
@@ -218,62 +202,36 @@ async def callback_task_edit(callback: CallbackQuery):
     )
     await callback.answer()
 
-
-# ─────────────────────────────────────────────────────────────────────
-# Редактирование — назад к задаче
-# ─────────────────────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data.startswith("task_back:"))
-async def callback_task_back(callback: CallbackQuery):
-    """Возвращает к просмотру задачи."""
-    try:
-        task_id = int(callback.data.split(":", 1)[1])
-    except (IndexError, ValueError):
-        await callback.answer("Некорректный идентификатор.", show_alert=True)
-        return
-
-    task = await task_service.get_task_by_id(task_id)
-    if not task:
-        await callback.answer("Задача не найдена.", show_alert=True)
-        return
-
-    assignee_str = _format_assignees(task)
-    due_str = _format_due_date(task)
-    creator_str = _format_creator(task.creator)
-
-    await callback.message.edit_text(
-        f"<b>{task.title}</b>\n"
-        f"👤 {assignee_str}\n"
-        f"{due_str}\n"
-        f"📝 Назначил(а): {creator_str}",
-        parse_mode="HTML",
-        reply_markup=task_keyboard(task_id),
+    await state.set_state(EditTaskStates.waiting_for_choice)
+    await state.update_data(
+        edit_task_id=task_id,
+        edit_original_chat_id=callback.message.chat.id,
+        edit_original_msg_id=callback.message.message_id,
+        edit_helper_chat_id=helper.chat.id,
+        edit_helper_msg_id=helper.message_id,
+        edit_old_text=old_text,
     )
-    await callback.answer()
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Редактирование — изменение срока
-# ─────────────────────────────────────────────────────────────────────
 
 
 @router.callback_query(F.data.startswith("task_edit_date:"))
 async def callback_task_edit_date(callback: CallbackQuery, state: FSMContext):
-    """Запрашивает новый срок."""
     try:
         task_id = int(callback.data.split(":", 1)[1])
     except (IndexError, ValueError):
         await callback.answer("Некорректный идентификатор.", show_alert=True)
         return
 
-    await state.set_state(EditTaskStates.waiting_for_due_date)
-    await state.update_data(edit_task_id=task_id)
+    data = await state.get_data()
+    old_due = data.get("edit_old_due", "")
+    task = await task_service.get_task_by_id(task_id)
+    old_due_str = _format_due_date(task) if task else old_due
+    await state.update_data(edit_old_due=old_due_str)
 
+    await state.set_state(EditTaskStates.waiting_for_due_date)
     await callback.message.edit_text(
         "📅 Введите новый срок в формате <code>ДД.ММ.ГГГГ</code> "
         "или <code>ГГГГ-ММ-ДД</code>.\n\n"
-        "Например: <code>15.07.2026</code>\n\n"
+        f"Текущий: {old_due_str}\n\n"
         "Или нажмите кнопку отмены.",
         parse_mode="HTML",
         reply_markup=task_edit_cancel_keyboard(),
@@ -281,9 +239,156 @@ async def callback_task_edit_date(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("task_edit_assignee:"))
+async def callback_task_edit_assignee(callback: CallbackQuery, state: FSMContext):
+    try:
+        task_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+
+    task = await task_service.get_task_by_id(task_id)
+    old_assignees = _format_assignees(task) if task else ""
+    await state.update_data(edit_old_assignees=old_assignees)
+
+    await state.set_state(EditTaskStates.waiting_for_assignee)
+    await callback.message.edit_text(
+        "👤 Напишите @username исполнителя (или несколько через пробел).\n\n"
+        f"Текущий: {old_assignees}\n\n"
+        "Или нажмите кнопку отмены.",
+        parse_mode="HTML",
+        reply_markup=task_edit_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("task_edit_title:"))
+async def callback_task_edit_title(callback: CallbackQuery, state: FSMContext):
+    try:
+        task_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+
+    task = await task_service.get_task_by_id(task_id)
+    old_title = task.title if task else ""
+    await state.update_data(edit_old_title=old_title)
+
+    await state.set_state(EditTaskStates.waiting_for_title)
+    await callback.message.edit_text(
+        f"✏️ Введите новое название задачи.\n\n"
+        f"Текущее: <b>{old_title}</b>\n\n"
+        "Или нажмите кнопку отмены.",
+        parse_mode="HTML",
+        reply_markup=task_edit_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(EditTaskStates.waiting_for_title)
+async def process_edit_title(message: Message, state: FSMContext):
+    data = await state.get_data()
+    task_id = data.get("edit_task_id")
+    if not task_id:
+        await state.clear()
+        await message.answer("⚠️ Ошибка: данные потеряны. Попробуйте заново.")
+        return
+
+    new_title = message.text.strip()
+    if new_title.lower() in ("отмена", "cancel", "/cancel"):
+        await state.clear()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.answer("↩️ Редактирование отменено.")
+        return
+
+    if not new_title:
+        await message.answer("❌ Название не может быть пустым. Попробуйте ещё раз.")
+        return
+
+    old_title = data.get("edit_old_title", "")
+    success = await task_service.update_title(task_id, new_title)
+    await state.clear()
+
+    if success:
+        task = await task_service.get_task_by_id(task_id)
+        if task:
+            new_title_str = task.title
+            orig_chat = data.get("edit_original_chat_id")
+            orig_msg = data.get("edit_original_msg_id")
+            if orig_chat and orig_msg:
+                try:
+                    await message.bot.edit_message_text(
+                        _build_task_text(task),
+                        chat_id=orig_chat,
+                        message_id=orig_msg,
+                        parse_mode="HTML",
+                        reply_markup=task_keyboard(task_id),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to edit task: %s", e)
+
+            # Delete helper
+            helper_chat = data.get("edit_helper_chat_id")
+            helper_msg = data.get("edit_helper_msg_id")
+            if helper_chat and helper_msg:
+                try:
+                    await message.bot.delete_message(helper_chat, helper_msg)
+                except Exception:
+                    pass
+
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            await message.answer(
+                f"✅ Название задачи изменено:\n"
+                f"{old_title} → {new_title_str}",
+                parse_mode="HTML",
+            )
+
+            _notify_task_changed(task, old_title=old_title, new_title=new_title_str)
+    else:
+        await message.answer("❌ Не удалось обновить название.")
+
+
+@router.callback_query(F.data == "task_edit_cancel")
+async def callback_task_edit_cancel(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+
+    # Удаляем хелпер
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    # Восстанавливаем оригинал с кнопками
+    orig_chat = data.get("edit_original_chat_id")
+    orig_msg = data.get("edit_original_msg_id")
+    task_id = data.get("edit_task_id")
+    if orig_chat and orig_msg and task_id:
+        task = await task_service.get_task_by_id(task_id)
+        if task:
+            try:
+                await callback.bot.edit_message_text(
+                    _build_task_text(task),
+                    chat_id=orig_chat,
+                    message_id=orig_msg,
+                    parse_mode="HTML",
+                    reply_markup=task_keyboard(task_id),
+                )
+            except Exception as e:
+                logger.warning("Failed to restore task: %s", e)
+
+    await callback.answer("Редактирование отменено.")
+
+
 @router.message(EditTaskStates.waiting_for_due_date)
 async def process_edit_due_date(message: Message, state: FSMContext):
-    """Принимает новую дату для задачи."""
     data = await state.get_data()
     task_id = data.get("edit_task_id")
     if not task_id:
@@ -292,14 +397,15 @@ async def process_edit_due_date(message: Message, state: FSMContext):
         return
 
     text = message.text.strip()
-
-    # Проверяем отмену
     if text.lower() in ("отмена", "cancel", "/cancel"):
         await state.clear()
+        try:
+            await message.delete()
+        except Exception:
+            pass
         await message.answer("↩️ Редактирование отменено.")
         return
 
-    # Парсим дату
     new_date = None
     for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%y"):
         try:
@@ -318,53 +424,57 @@ async def process_edit_due_date(message: Message, state: FSMContext):
         )
         return
 
+    old_due_str = data.get("edit_old_due", "")
     success = await task_service.update_due_date(task_id, new_date)
     await state.clear()
 
     if success:
         task = await task_service.get_task_by_id(task_id)
         if task:
+            new_due_str = _format_due_date(task)
+            orig_chat = data.get("edit_original_chat_id")
+            orig_msg = data.get("edit_original_msg_id")
+            if orig_chat and orig_msg:
+                try:
+                    await message.bot.edit_message_text(
+                        _build_task_text(task),
+                        chat_id=orig_chat,
+                        message_id=orig_msg,
+                        parse_mode="HTML",
+                        reply_markup=task_keyboard(task_id),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to edit task: %s", e)
+
+            # Удаляем хелпер
+            helper_chat = data.get("edit_helper_chat_id")
+            helper_msg = data.get("edit_helper_msg_id")
+            if helper_chat and helper_msg:
+                try:
+                    await message.bot.delete_message(helper_chat, helper_msg)
+                except Exception:
+                    pass
+
+            # Удаляем сообщение пользователя
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
             await message.answer(
-                f"✅ Срок задачи <b>{task.title}</b> обновлён:\n"
-                f"{_format_due_date(task)}",
+                f"✅ Срок задачи <b>{task.title}</b> изменён:\n"
+                f"{old_due_str} → {new_due_str}",
                 parse_mode="HTML",
             )
-        else:
-            await message.answer("✅ Срок задачи обновлён.")
+
+            # Уведомляем исполнителей об изменении
+            _notify_task_changed(task, old_due_str, new_due_str, None, None)
     else:
-        await message.answer("❌ Не удалось обновить срок задачи.", parse_mode="HTML")
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Редактирование — изменение исполнителя
-# ─────────────────────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data.startswith("task_edit_assignee:"))
-async def callback_task_edit_assignee(callback: CallbackQuery, state: FSMContext):
-    """Запрашивает нового исполнителя."""
-    try:
-        task_id = int(callback.data.split(":", 1)[1])
-    except (IndexError, ValueError):
-        await callback.answer("Некорректный идентификатор.", show_alert=True)
-        return
-
-    await state.set_state(EditTaskStates.waiting_for_assignee)
-    await state.update_data(edit_task_id=task_id)
-
-    await callback.message.edit_text(
-        "👤 Напишите @username исполнителя (или несколько через пробел).\n\n"
-        "Например: <code>@ivanov</code> или <code>@ivanov @petrov</code>\n\n"
-        "Или нажмите кнопку отмены.",
-        parse_mode="HTML",
-        reply_markup=task_edit_cancel_keyboard(),
-    )
-    await callback.answer()
+        await message.answer("❌ Не удалось обновить срок задачи.")
 
 
 @router.message(EditTaskStates.waiting_for_assignee)
 async def process_edit_assignee(message: Message, state: FSMContext):
-    """Принимает нового исполнителя для задачи."""
     data = await state.get_data()
     task_id = data.get("edit_task_id")
     if not task_id:
@@ -373,13 +483,15 @@ async def process_edit_assignee(message: Message, state: FSMContext):
         return
 
     text = message.text.strip()
-
     if text.lower() in ("отмена", "cancel", "/cancel", "-"):
         await state.clear()
+        try:
+            await message.delete()
+        except Exception:
+            pass
         await message.answer("↩️ Редактирование отменено.")
         return
 
-    # Извлекаем @username из текста
     usernames = re.findall(r"@\w+", text)
     if not usernames:
         await message.answer(
@@ -389,114 +501,69 @@ async def process_edit_assignee(message: Message, state: FSMContext):
         )
         return
 
+    old_assignees_str = data.get("edit_old_assignees", "")
     success = await task_service.update_assignees(task_id, usernames)
     await state.clear()
 
     if success:
         task = await task_service.get_task_by_id(task_id)
         if task:
-            assignee_str = _format_assignees(task)
+            new_assignees_str = _format_assignees(task)
+            orig_chat = data.get("edit_original_chat_id")
+            orig_msg = data.get("edit_original_msg_id")
+            if orig_chat and orig_msg:
+                try:
+                    await message.bot.edit_message_text(
+                        _build_task_text(task),
+                        chat_id=orig_chat,
+                        message_id=orig_msg,
+                        parse_mode="HTML",
+                        reply_markup=task_keyboard(task_id),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to edit task: %s", e)
+
+            # Удаляем хелпер
+            helper_chat = data.get("edit_helper_chat_id")
+            helper_msg = data.get("edit_helper_msg_id")
+            if helper_chat and helper_msg:
+                try:
+                    await message.bot.delete_message(helper_chat, helper_msg)
+                except Exception:
+                    pass
+
+            # Удаляем сообщение пользователя
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
             await message.answer(
-                f"✅ Исполнитель задачи <b>{task.title}</b> обновлён:\n"
-                f"👤 {assignee_str}",
+                f"✅ Исполнитель задачи <b>{task.title}</b> изменён:\n"
+                f"{old_assignees_str} → {new_assignees_str}",
                 parse_mode="HTML",
             )
 
-            # Уведомляем новых исполнителей в ЛС
-            await _notify_new_assignees(task)
-        else:
-            await message.answer("✅ Исполнитель задачи обновлён.")
-    else:
-        await message.answer("❌ Не удалось обновить исполнителя.", parse_mode="HTML")
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Уведомление новых исполнителей
-# ─────────────────────────────────────────────────────────────────────
-
-
-async def _notify_new_assignees(task, bot=None):
-    """Отправляет уведомление исполнителям через Celery."""
-    from celery_app.tasks.send_reminders import send_task_assigned_notification
-    send_task_assigned_notification.delay(task.id)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# callback: отмена редактирования
-# ─────────────────────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data == "task_edit_cancel")
-async def callback_task_edit_cancel(callback: CallbackQuery, state: FSMContext):
-    """Отменяет редактирование задачи."""
-    await state.clear()
-    await callback.answer("Редактирование отменено.")
-    try:
-        await callback.message.edit_text("↩️ Редактирование отменено.")
-    except Exception:
-        await callback.message.reply("↩️ Редактирование отменено.")
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Назначение исполнителя для задачи без assignee
-# (через уведомление создателю в ЛС)
-# ─────────────────────────────────────────────────────────────────────
-
-
-async def notify_creator_about_unassigned_task(task: Task, bot=None):
-    """Уведомляет создателя о задаче без исполнителя через Celery."""
-    from celery_app.tasks.send_reminders import send_unassigned_task_notification
-    send_unassigned_task_notification.delay(task.id)
-
-
-@router.message(AssignTaskStates.waiting_for_assignee_username)
-async def process_assign_task(message: Message, state: FSMContext):
-    """Принимает @username для назначения на задачу без исполнителя."""
-    data = await state.get_data()
-    task_id = data.get("assign_task_id")
-    if not task_id:
-        await state.clear()
-        await message.answer("⚠️ Ошибка: данные потеряны. Попробуйте заново.")
-        return
-
-    text = message.text.strip()
-
-    if text.lower() in ("отмена", "cancel", "/cancel", "-"):
-        await state.clear()
-        await message.answer("↩️ Назначение отменено.")
-        return
-
-    usernames = re.findall(r"@\w+", text)
-    if not usernames:
-        await message.answer(
-            "❌ Не найден @username. Напишите в формате <code>@username</code>.\n"
-            "Или напишите <b>отмена</b>.",
-            parse_mode="HTML",
-        )
-        return
-
-    success = await task_service.update_assignees(task_id, usernames)
-    await state.clear()
-
-    if success:
-        task = await task_service.get_task_by_id(task_id)
-        if task:
-            assignee_str = _format_assignees(task)
-            await message.answer(
-                f"✅ Исполнитель назначен!\n"
-                f"<b>{task.title}</b>\n"
-                f"👤 {assignee_str}",
-                parse_mode="HTML",
-            )
             # Уведомляем новых исполнителей
-            await _notify_new_assignees(task)
-        else:
-            await message.answer("✅ Исполнитель назначен.")
+            from celery_app.tasks.send_reminders import send_task_assigned_notification
+            send_task_assigned_notification.delay(task_id)
+
+            # Уведомляем старых исполнителей об изменении
+            _notify_task_changed(task, None, None, old_assignees_str, new_assignees_str)
     else:
-        await message.answer("❌ Не удалось назначить исполнителя.")
+        await message.answer("❌ Не удалось обновить исполнителя.")
 
 
-@router.message(F.text.regexp(r"^@\w+"), AssignTaskStates.waiting_for_assignee_username)
-async def process_assign_task_simple(message: Message, state: FSMContext):
-    """Альтернативный хендлер для @username через AssignTaskStates."""
-    await process_assign_task(message, state)
+def _notify_task_changed(task, old_due=None, new_due=None, old_assign=None, new_assign=None, old_title=None, new_title=None):
+    """Отправляет уведомление исполнителям об изменении задачи через Celery."""
+    changes = []
+    if old_title and new_title and old_title != new_title:
+        changes.append(f"✏️ Название: {old_title} → {new_title}")
+    if old_due and new_due and old_due != new_due:
+        changes.append(f"📅 Срок: {old_due} → {new_due}")
+    if old_assign and new_assign and old_assign != new_assign:
+        changes.append(f"👤 Исполнитель: {old_assign} → {new_assign}")
+    if not changes:
+        return
+    from celery_app.tasks.send_reminders import send_task_changed_notification
+    send_task_changed_notification.delay(task.id, "\n".join(changes))

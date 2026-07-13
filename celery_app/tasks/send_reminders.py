@@ -583,3 +583,166 @@ def send_meeting_without_participants_notification(meeting_id: int):
 def send_meeting_assigned_notification(meeting_id: int):
     """Уведомляет участников о новой/изменённой встрече."""
     return _run_async(_send_meeting_assigned_notification_async(meeting_id))
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Уведомление об изменении задачи (исполнителям)
+# ═════════════════════════════════════════════════════════════════════
+
+async def _send_task_changed_notification_async(task_id: int, changes: str):
+    """Отправляет уведомление исполнителям об изменении задачи."""
+    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    try:
+        task = await sync_to_async(
+            lambda: Task.objects.filter(id=task_id)
+            .select_related("topic__chat")
+            .prefetch_related("assignees__user")
+            .first()
+        )()
+        if not task:
+            return 0
+
+        chat_title = ""
+        try:
+            chat_title = task.topic.chat.title or ""
+        except Exception:
+            pass
+        source_block = f"\n📍 Чат: {chat_title}\n" if chat_title else "\n"
+
+        sent_count = 0
+        for ta in task.assignees.all():
+            user = ta.user
+            if _is_bot_user(user):
+                continue
+            try:
+                await bot.send_message(
+                    user.telegram_id,
+                    f"📌 <b>Задача изменена:</b>\n"
+                    f"<b>{task.title}</b>"
+                    f"{source_block}"
+                    f"{changes}\n\n"
+                    f"Используйте /tasks для просмотра.",
+                    parse_mode="HTML",
+                )
+                sent_count += 1
+            except Exception as e:
+                logger.warning("Failed to notify user %s: %s", user, e)
+        return sent_count
+    finally:
+        await bot.session.close()
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_task_changed_notification")
+def send_task_changed_notification(task_id: int, changes: str):
+    """Уведомляет исполнителей об изменении задачи."""
+    return _run_async(_send_task_changed_notification_async(task_id, changes))
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Уведомление об изменении встречи (участникам)
+# ═════════════════════════════════════════════════════════════════════
+
+async def _send_meeting_changed_notification_async(meeting_id: int, changes: str):
+    """Отправляет уведомление участникам об изменении встречи."""
+    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    try:
+        meeting = await sync_to_async(
+            lambda: Meeting.objects.filter(id=meeting_id)
+            .select_related("topic__chat")
+            .prefetch_related("participants")
+            .first()
+        )()
+        if not meeting:
+            return 0
+
+        chat_title = ""
+        try:
+            chat_title = meeting.topic.chat.title or ""
+        except Exception:
+            pass
+        source_block = f"\n📍 Чат: {chat_title}\n" if chat_title else "\n"
+
+        sent_count = 0
+        for user in meeting.participants.all():
+            if _is_bot_user(user):
+                continue
+            try:
+                await bot.send_message(
+                    user.telegram_id,
+                    f"📅 <b>Встреча изменена:</b>\n"
+                    f"<b>{meeting.title}</b>"
+                    f"{source_block}"
+                    f"{changes}\n\n"
+                    f"Используйте /meetings для просмотра.",
+                    parse_mode="HTML",
+                )
+                sent_count += 1
+            except Exception as e:
+                logger.warning("Failed to notify user %s: %s", user, e)
+        return sent_count
+    finally:
+        await bot.session.close()
+
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_meeting_changed_notification")
+def send_meeting_changed_notification(meeting_id: int, changes: str):
+    """Уведомляет участников об изменении встречи."""
+    return _run_async(_send_meeting_changed_notification_async(meeting_id, changes))
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Уведомление об отмене встречи
+# ═════════════════════════════════════════════════════════════════════
+
+async def _send_meeting_cancelled_notification_async(meeting_id: int):
+    """Отправляет уведомление участникам об отмене встречи."""
+    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    try:
+        meeting = await sync_to_async(
+            lambda: Meeting.objects.filter(id=meeting_id)
+            .select_related("topic__chat")
+            .prefetch_related("participants")
+            .first()
+        )()
+        if not meeting:
+            return 0
+
+        chat_title = ""
+        try:
+            chat_title = meeting.topic.chat.title or ""
+        except Exception:
+            pass
+        source_block = f"\n📍 Чат: {chat_title}\n" if chat_title else "\n"
+
+        dt = meeting.start_at
+        if timezone.is_aware(dt):
+            dt = timezone.localtime(dt)
+        time_str = dt.strftime("%d.%m.%Y %H:%M")
+
+        sent_count = 0
+        for user in meeting.participants.all():
+            if _is_bot_user(user):
+                continue
+            try:
+                await bot.send_message(
+                    user.telegram_id,
+                    f"❌ <b>Встреча отменена:</b>\n"
+                    f"<b>{meeting.title}</b>\n"
+                    f"  ⏰ {time_str}"
+                    f"{source_block}",
+                    parse_mode="HTML",
+                )
+                sent_count += 1
+            except Exception as e:
+                logger.warning("Failed to notify user %s: %s", user, e)
+        return sent_count
+    finally:
+        await bot.session.close()
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_meeting_cancelled_notification")
+def send_meeting_cancelled_notification(meeting_id: int):
+    """Уведомляет участников об отмене встречи."""
+    return _run_async(_send_meeting_cancelled_notification_async(meeting_id))
+

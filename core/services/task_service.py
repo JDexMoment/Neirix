@@ -144,6 +144,17 @@ class TaskService:
                     assignee_objects.append(user)
                 elif not user:
                     logger.warning("Task: assignee %r not found in DB", raw_name)
+                    # Создаём placeholder, чтобы пользователь отображался
+                    try:
+                        placeholder = await sync_to_async(TelegramUser.objects.create)(
+                            telegram_id=-(abs(hash(clean_name)) % 1_000_000_000 + 1_000_000_000),
+                            username=clean_name,
+                            full_name=clean_name,
+                            is_bot=False,
+                        )
+                        assignee_objects.append(placeholder)
+                    except Exception:
+                        logger.warning("Failed to create placeholder for %s", clean_name)
 
             existing = await sync_to_async(self._check_duplicate_task)(
                 clean_title, due_date, topic, assignee_objects,
@@ -308,6 +319,21 @@ class TaskService:
                     user = _find_user_by_username(clean_name)
                     if user and not _is_bot_user(user):
                         TaskAssignee.objects.create(task=task, user=user)
+                return True
+            except Task.DoesNotExist:
+                return False
+        return await sync_to_async(_update)()
+
+    async def update_title(self, task_id: int, new_title: str) -> bool:
+        """Обновляет название задачи."""
+        def _update() -> bool:
+            try:
+                task = Task.objects.get(id=task_id)
+                clean = _clean_title(new_title)
+                if not clean:
+                    return False
+                task.title = clean
+                task.save(update_fields=["title"])
                 return True
             except Task.DoesNotExist:
                 return False

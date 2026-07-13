@@ -330,6 +330,21 @@ class MeetingService:
                 return False
         return await sync_to_async(_update)()
 
+    async def update_title(self, meeting_id: int, new_title: str) -> bool:
+        """Обновляет название встречи."""
+        def _update() -> bool:
+            try:
+                meeting = Meeting.objects.get(id=meeting_id)
+                clean = _clean_title(new_title)
+                if not clean:
+                    return False
+                meeting.title = clean
+                meeting.save(update_fields=["title"])
+                return True
+            except Meeting.DoesNotExist:
+                return False
+        return await sync_to_async(_update)()
+
     async def cancel_meeting(self, meeting_id: int, notification_sender=None) -> bool:
         meeting = await self.get_meeting_by_id(meeting_id)
         if not meeting:
