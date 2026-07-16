@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 from typing import List, Optional
 
@@ -165,14 +165,82 @@ def _parse_user_datetime(text: str) -> Optional[datetime]:
     return None
 
 
-@router.message(Command("meetings"))
-async def cmd_meetings(message: Message):
-    chat, topic, db_user = await get_chat_context(message)
+def _parse_meeting_filters(text: str) -> dict:
+    """Парсит фильтры из текста команды /meetings ..."""
+    filters = {}
+    now = timezone.localtime(timezone.now())
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+    tomorrow_start = today_start + timedelta(days=1)
+    tomorrow_end = tomorrow_start + timedelta(days=1)
+    week_end = today_start + timedelta(days=7)
+    parts = text.lower().split()
+    
+    for part in parts:
+        if part in ("today", "сегодня"):
+            filters["start_at__gte"] = today_start
+            filters["start_at__lt"] = today_end
+            filters["header_suffix"] = "на сегодня"
+        elif part in ("tomorrow", "завтра"):
+            filters["start_at__gte"] = tomorrow_start
+            filters["start_at__lt"] = tomorrow_end
+            filters["header_suffix"] = "на завтра"
+        elif part in ("week", "неделя", "эту неделю"):
+            filters["start_at__gte"] = today_start
+            filters["start_at__lt"] = week_end
+            filters["header_suffix"] = "на эту неделю"
+        elif part.startswith("@"):
+            filters["participant_username"] = part.lstrip("@")
+        elif part in ("my", "мои", "моё"):
+            filters["my"] = True
+    
+    return filters
+
+
+def _apply_meeting_filters(meetings: list, filters: dict, user) -> list:
+    """Применяет фильтры к списку встреч."""
+    result = []
+    now = timezone.now()
+    for m in meetings:
+        include = True
+        
+        # Date range
+        start_from = filters.get("start_at__gte")
+        start_to = filters.get("start_at__lt")
+        if start_from and m.start_at < start_from:
+            include = False
+        if start_to and m.start_at >= start_to:
+            include = False
+        
+        # @username
+        username = filters.get("participant_username")
+        if username:
+            participants = list(m.participants.all())
+            found = False
+            for p in participants:
+                if p.username and p.username.lower() == username.lower():
+                    found = True
+                    break
+            if not found:
+                include = False
+        
+        # My meetings
+        if filters.get("my") and user not in list(m.participants.all()):
+            include = False
+        
+        if include:
+            result.append(m)
+    
+    return result
+
+
+async def _respond_meetings(message: Message, chat, topic, db_user, nlp_filters: dict):
+    """Отвечает пользователю списком встреч с учётом фильтров."""
     buffer = MessageBuffer()
     processor = BatchProcessor()
     chat_id = message.chat.id
     topic_id = message.message_thread_id if getattr(message.chat, 'is_forum', False) else 0
-
+    
     pending_messages = buffer.flush(chat_id, topic_id)
     if pending_messages:
         result = await processor.process_batch(chat_id, topic_id, pending_messages)
@@ -190,25 +258,58 @@ async def cmd_meetings(message: Message):
             from celery_app.tasks.send_reminders import send_meeting_without_participants_notification
             for meeting_id in unassigned_meeting_ids:
                 send_meeting_without_participants_notification.delay(meeting_id)
-
+    
     if not db_user:
         await message.answer("Не удалось определить пользователя.")
         return
-
+    
+    # Convert NLP filters to meeting filters format
+    m_filters = {}
+    if nlp_filters.get("today"):
+        now = timezone.localtime(timezone.now())
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        m_filters["start_at__gte"] = day_start
+        m_filters["start_at__lt"] = day_start + timedelta(days=1)
+        m_filters["header_suffix"] = "на сегодня"
+    elif nlp_filters.get("tomorrow"):
+        now = timezone.localtime(timezone.now())
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = day_start + timedelta(days=1)
+        m_filters["start_at__gte"] = tomorrow
+        m_filters["start_at__lt"] = tomorrow + timedelta(days=1)
+        m_filters["header_suffix"] = "на завтра"
+    elif nlp_filters.get("week"):
+        now = timezone.localtime(timezone.now())
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        m_filters["start_at__gte"] = day_start
+        m_filters["start_at__lt"] = day_start + timedelta(days=7)
+        m_filters["header_suffix"] = "на эту неделю"
+    
+    if nlp_filters.get("username"):
+        m_filters["participant_username"] = nlp_filters["username"]
+    if nlp_filters.get("my"):
+        m_filters["my"] = True
+    
     if message.chat.type == "private":
         meetings = await sync_to_async(_get_upcoming_meetings_for_private)(db_user, chat)
-        header = "📅 Ваши встречи:"
+        base_header = "📅 Ваши встречи"
     else:
         if not chat:
             await message.answer("Не удалось определить чат.")
             return
         meetings = await sync_to_async(_get_upcoming_meetings_for_chat)(chat, topic)
-        header = f"📅 Встречи чата {chat.title}:"
+        base_header = f"📅 Встречи чата {chat.title}"
 
+    if m_filters:
+        meetings = _apply_meeting_filters(meetings, m_filters, db_user)
+    
+    suffix = m_filters.get("header_suffix", "")
+    header = f"{base_header} {suffix}:".strip() if suffix else f"{base_header}:"
+    
     if not meetings:
-        await message.answer("Нет предстоящих встреч.")
+        await message.answer("Нет встреч, соответствующих фильтру.")
         return
-
+    
     await message.answer(header)
     for m in meetings:
         await message.answer(
@@ -216,6 +317,24 @@ async def cmd_meetings(message: Message):
             parse_mode="HTML",
             reply_markup=meeting_keyboard(m.id),
         )
+
+
+async def _handle_nlp_meeting_query(message: Message, intent_type: str, filters: dict):
+    """Обрабатывает NLP-запрос о встречах из личных сообщений."""
+    from bot.utils import get_chat_context as _get_ctx
+    chat, topic, db_user = await _get_ctx(message)
+    if not db_user:
+        await message.answer("Не удалось определить пользователя.")
+        return
+    await _respond_meetings(message, chat, topic, db_user, filters)
+
+
+@router.message(Command("meetings"))
+async def cmd_meetings(message: Message):
+    chat, topic, db_user = await get_chat_context(message)
+    text = message.text or ""
+    m_filters = _parse_meeting_filters(text)
+    await _respond_meetings(message, chat, topic, db_user, m_filters)
 
 
 @router.callback_query(F.data.startswith("meeting_cancel:"))

@@ -7,7 +7,8 @@ from django.db.models import Q
 from django.utils import timezone
 from asgiref.sync import sync_to_async
 
-from core.models import Task, TelegramUser, Message, TaskAssignee, Topic, UserRole
+from core.models import Task, TelegramUser, Message, TaskAssignee, Topic
+from core.services.permissions import user_can_create
 
 if TYPE_CHECKING:
     from core.utils.llm_client import LLMClient
@@ -70,6 +71,7 @@ def _resolve_topic_for_private_message(source_message: Message) -> Optional[Topi
     if not author:
         return source_message.topic
 
+    from core.models import UserRole
     linked_role = (
         UserRole.objects.filter(user=author)
         .select_related("chat")
@@ -119,6 +121,13 @@ class TaskService:
                 return None
 
             topic = await _resolve_topic_for_private_message(source_message)
+                        # ═══ Проверка прав: member не может создавать задачи ═══
+            if not await sync_to_async(user_can_create)(source_message):
+                logger.warning(
+                    "Permission denied: user %s cannot create tasks in chat %s",
+                    source_message.author, source_message.chat,
+                )
+                return None
 
             due_date = None
             raw_due = task_data.get("due_date")
@@ -132,7 +141,17 @@ class TaskService:
                     logger.warning("_create_task_from_data: invalid due_date=%r", raw_due)
 
             assignees: List[str] = task_data.get("assignees", [])
-            assignees = _filter_author_from_list(assignees, source_message)
+            logger.info("DEBUG batch_assignees before filter: %s (source_author=%s, source_text=%r)",
+                       assignees,
+                       source_message.author.username if source_message and source_message.author else "None",
+                       source_message.text[:100] if source_message and source_message.text else "None")
+            
+            # ═══ БАТЧ-ФИКС: не фильтруем автора, если assignee не упомянут в source_message ═══
+            if _is_author_mentioned_in_batch(assignees, source_message):
+                assignees = _filter_author_from_list(assignees, source_message)
+                logger.info("DEBUG batch_assignees filter APPLIED -> %s", assignees)
+            else:
+                logger.info("DEBUG batch_assignees filter SKIPPED (not mentioned in source)")
 
             assignee_objects: List[TelegramUser] = []
             for raw_name in assignees:
@@ -174,6 +193,8 @@ class TaskService:
             )
 
             for user in assignee_objects:
+                logger.info("DEBUG_TASK: Creating TaskAssignee for task_id=%s, user_id=%s, username=%s",
+                           task.id if task else "pending", user.id, user.username)
                 await sync_to_async(TaskAssignee.objects.create)(task=task, user=user)
 
             return task
@@ -278,7 +299,8 @@ class TaskService:
                     logger.warning("mark_task_done: user %s not assignee of task %s", user.id, task_id)
                     return False
                 task.status = "done"
-                task.save(update_fields=["status"])
+                task.completed_at = timezone.now()
+                task.save(update_fields=["status", "completed_at"])
                 return True
             except Task.DoesNotExist:
                 return False
@@ -347,3 +369,15 @@ class TaskService:
                 .prefetch_related("assignees__user")
             )
         return await sync_to_async(_query)()
+
+
+def _is_author_mentioned_in_batch(assignees: List[str], source_message: Message) -> bool:
+    """Возвращает True, если хотя бы один assignee упомянут в тексте source_message."""
+    if not source_message or not source_message.text:
+        return True
+    text_lower = source_message.text.lower()
+    for raw in assignees:
+        clean = raw.lstrip("@").strip().lower()
+        if clean and clean in text_lower:
+            return True
+    return False

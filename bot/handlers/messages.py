@@ -4,8 +4,7 @@ from aiogram import Router, F
 from aiogram.types import Message
 from asgiref.sync import sync_to_async
 
-from core.models import Message as DBMessage, TelegramChat, Topic, TelegramUser
-from core.models import UserRole
+from core.models import Message as DBMessage, TelegramChat, Topic, TelegramUser, UserRole
 from core.services.message_buffer import MessageBuffer, MAX_BATCH_SIZE
 from celery_app.tasks.process_messages import process_target_buffer
 
@@ -23,13 +22,8 @@ def _extract_is_forum(chat) -> bool:
 
 
 def _can_create_in_chat(user: TelegramUser, chat: TelegramChat) -> bool:
-    """
-    Проверяет, может ли пользователь создавать задачи/встречи в этом чате.
-    Для приватного чата — проверяем роль в привязанной группе.
-    """
     target_chat = chat
     if chat.type == "private":
-        # Ищем привязанную группу
         role = (
             UserRole.objects.filter(user=user)
             .select_related("chat")
@@ -38,7 +32,6 @@ def _can_create_in_chat(user: TelegramUser, chat: TelegramChat) -> bool:
         if not role:
             return False
         target_chat = role.chat
-
     user_role = (
         UserRole.objects.filter(user=user, chat=target_chat)
         .values_list("role", flat=True)
@@ -47,14 +40,31 @@ def _can_create_in_chat(user: TelegramUser, chat: TelegramChat) -> bool:
     return user_role in ("manager", "admin")
 
 
+async def _handle_private_nlp(message: Message) -> bool:
+    """
+    Пытается распознать естественно-языковый запрос в личном сообщении
+    через GigaChat. Возвращает True, если запрос обработан.
+    """
+    if message.chat.type != "private":
+        return False
+    
+    from core.services.nlp_router import detect_intent, handle_nlp_command
+    
+    nlp_result = await detect_intent(message.text or "")
+    if not nlp_result:
+        return False
+    
+    logger.info("NLP query: %s", nlp_result)
+    return await handle_nlp_command(message, nlp_result)
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_text_message(message: Message):
     """
     Сохраняет входящее текстовое сообщение в БД.
-    Если автор имеет права manager/admin — кладёт в буфер
-    для батч-обработки (LLM).
-    Если member — сообщение только сохраняется (история/саммари),
-    но не обрабатывается LLM (экономия токенов).
+    В ЛС — сначала проверяет NLP-запрос.
+    Если это запрос (задачи/встречи) — отвечает и НЕ буферизирует.
+    Если это данные — буферизирует как обычно.
     """
 
     @sync_to_async
@@ -143,9 +153,11 @@ async def handle_text_message(message: Message):
 
     db_message, db_user, chat = await save_message()
 
-    # ════════════════════════════════════════════════════════════════
-    # Проверка прав: если member — НЕ кладём в буфер (экономия токенов)
-    # ════════════════════════════════════════════════════════════════
+    # ═══ В ЛС — сначала проверяем NLP-запрос ═══
+    if await _handle_private_nlp(message):
+        return  # запрос обработан, не буферизируем
+
+    # ═══ Проверка прав: только manager/admin попадают в буфер ═══
     can_create = await sync_to_async(_can_create_in_chat)(db_user, chat)
 
     if not can_create:
@@ -153,7 +165,7 @@ async def handle_text_message(message: Message):
             "Member skipped from buffer | user=%s chat=%s text=%r",
             db_user, chat.chat_id, db_message.text[:100],
         )
-        return  # сообщение сохранено в БД, но в буфер не попало
+        return
 
     chat_id = db_message.chat.chat_id
     topic_id = db_message.topic.thread_id

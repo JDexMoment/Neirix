@@ -92,6 +92,7 @@ class Task(models.Model):
     ])
     source_message = models.ForeignKey(Message, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата выполнения")
     # Creator field - who created the task
     creator = models.ForeignKey(TelegramUser, on_delete=models.SET_NULL, null=True, related_name='created_tasks')
     # Напоминание за сутки до дедлайна

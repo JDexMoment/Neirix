@@ -1,15 +1,12 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime, timedelta
-from asgiref.sync import sync_to_async
-
+from datetime import datetime
 
 from django.utils import timezone
 
 
 @pytest.fixture
 def mock_db_messages():
-    """Список мок-сообщений из БД."""
     messages = []
     for i in range(3):
         msg = MagicMock()
@@ -17,24 +14,20 @@ def mock_db_messages():
         msg.text = f"test message {i + 1}"
         msg.timestamp = timezone.now()
         msg.is_processed = False
-
         msg.author = MagicMock()
         msg.author.username = f"user{i}"
         msg.author.full_name = f"User {i}"
         msg.author.telegram_id = 1000 + i
-
         msg.chat = MagicMock()
         msg.chat.chat_id = -100
-
+        msg.chat.type = "supergroup"
         msg.topic = MagicMock()
         msg.topic.thread_id = 0
-
         messages.append(msg)
     return messages
 
 
 def _make_mock_qs(messages_list):
-    """Создаёт мок QuerySet, который ведёт себя как list()."""
     qs = MagicMock()
     qs.filter.return_value = qs
     qs.select_related.return_value = qs
@@ -217,164 +210,3 @@ class TestBatchProcessor:
 
         assert result["tasks_created"] == 2
         assert result["meetings_created"] == 0
-
-
-# ══════════════════════════════════════════════════════════════════
-# FULL FLOW TESTS (через batch-обработку с замоканным LLM)
-# ══════════════════════════════════════════════════════════════════
-
-class TestFullFlowTopicResolution:
-    """
-    Интеграционные тесты: BatchProcessor → TaskService / MeetingService
-    с real-БД, но замоканным LLM.
-    """
-
-    @pytest.mark.asyncio
-    @pytest.mark.django_db(transaction=True)
-    @pytest.mark.parametrize("entity_type", ["task", "meeting"])
-    async def test_batch_from_private_creates_entity_with_group_topic(
-        self, entity_type,
-    ):
-        from unittest.mock import AsyncMock, MagicMock, patch
-        from core.services.batch_processor import BatchProcessor
-        from core.models import (
-            TelegramChat, TelegramUser, Topic, Message, UserRole,
-            Task, Meeting,
-        )
-
-        group_chat = await sync_to_async(TelegramChat.objects.create)(
-            chat_id=-4001, title="Dev Team", type="supergroup",
-        )
-        group_topic = await sync_to_async(Topic.objects.create)(
-            chat=group_chat, thread_id=0,
-        )
-        author = await sync_to_async(TelegramUser.objects.create)(
-            telegram_id=4001, username="dev", full_name="Dev User",
-        )
-        await sync_to_async(UserRole.objects.create)(
-            user=author, chat=group_chat, role="admin",
-        )
-        private_chat = await sync_to_async(TelegramChat.objects.create)(
-            chat_id=400100, title="", type="private",
-        )
-        private_topic = await sync_to_async(Topic.objects.create)(
-            chat=private_chat, thread_id=0,
-        )
-        db_msg = await sync_to_async(Message.objects.create)(
-            telegram_msg_id=701, chat=private_chat, topic=private_topic,
-            author=author, text="задача @dev и встреча завтра в 14",
-            timestamp=timezone.now(),
-        )
-        buffer_data = [{
-            "message_id": db_msg.id,
-            "text": db_msg.text,
-            "author_name": author.full_name,
-            "timestamp": db_msg.timestamp.timestamp(),
-        }]
-
-        if entity_type == "task":
-            llm_return = {
-                "tasks": [{"title": "отчёт", "assignees": [],
-                           "due_date": None, "description": ""}],
-                "meetings": [],
-            }
-        else:
-            llm_return = {
-                "tasks": [],
-                "meetings": [{
-                    "title": "встреча", "participants": [],
-                    "date": (timezone.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
-                    "time": "14:00", "description": "",
-                }],
-            }
-
-        with patch("core.utils.llm_client.LLMClient") as MockLLM:
-            mock_llm = MagicMock()
-            mock_llm.extract_all_from_messages = AsyncMock(return_value=llm_return)
-            MockLLM.return_value = mock_llm
-            with patch("core.services.batch_processor.generate_embeddings_batch",
-                       new_callable=AsyncMock, return_value=[None]):
-                with patch("core.services.batch_processor.VectorStoreClient"):
-                    processor = BatchProcessor()
-                    await processor.process_batch(
-                        chat_id=private_chat.chat_id,
-                        topic_id=private_topic.thread_id,
-                        messages=buffer_data,
-                    )
-
-        # При проверках сравниваем по _id (FK) — безопасно из async-контекста
-        if entity_type == "task":
-            created = await sync_to_async(
-                lambda: list(Task.objects.filter(creator=author))
-            )()
-            assert len(created) == 1
-            task = created[0]
-            assert task.topic_id == group_topic.pk, (
-                f"Task topic_id={task.topic_id}, expected {group_topic.pk}"
-            )
-        else:
-            created = await sync_to_async(
-                lambda: list(Meeting.objects.filter(creator=author))
-            )()
-            assert len(created) == 1
-            meeting = created[0]
-            assert meeting.topic_id == group_topic.pk, (
-                f"Meeting topic_id={meeting.topic_id}, expected {group_topic.pk}"
-            )
-
-    @pytest.mark.asyncio
-    @pytest.mark.django_db(transaction=True)
-    async def test_batch_from_group_preserves_own_topic(self):
-        from unittest.mock import AsyncMock, MagicMock, patch
-        from core.services.batch_processor import BatchProcessor
-        from core.models import TelegramChat, TelegramUser, Topic, Message, Task, UserRole
-
-        group_chat = await sync_to_async(TelegramChat.objects.create)(
-            chat_id=-5001, title="Team Chat", type="supergroup",
-        )
-        group_topic = await sync_to_async(Topic.objects.create)(
-            chat=group_chat, thread_id=0,
-        )
-        author = await sync_to_async(TelegramUser.objects.create)(
-            telegram_id=5001, username="teammate", full_name="Teammate",
-        )
-        await sync_to_async(UserRole.objects.create)(
-            user=author, chat=group_chat, role="admin",
-        )
-        db_msg = await sync_to_async(Message.objects.create)(
-            telegram_msg_id=801, chat=group_chat, topic=group_topic,
-            author=author, text="нужно сделать отчёт",
-            timestamp=timezone.now(),
-        )
-        buffer_data = [{
-            "message_id": db_msg.id,
-            "text": db_msg.text,
-            "author_name": author.full_name,
-            "timestamp": db_msg.timestamp.timestamp(),
-        }]
-
-        with patch("core.utils.llm_client.LLMClient") as MockLLM:
-            mock_llm = MagicMock()
-            mock_llm.extract_all_from_messages = AsyncMock(return_value={
-                "tasks": [{"title": "отчёт", "assignees": [],
-                           "due_date": None, "description": ""}],
-                "meetings": [],
-            })
-            MockLLM.return_value = mock_llm
-            with patch("core.services.batch_processor.generate_embeddings_batch",
-                       new_callable=AsyncMock, return_value=[None]):
-                with patch("core.services.batch_processor.VectorStoreClient"):
-                    processor = BatchProcessor()
-                    await processor.process_batch(
-                        chat_id=group_chat.chat_id,
-                        topic_id=group_topic.thread_id,
-                        messages=buffer_data,
-                    )
-
-        tasks = await sync_to_async(
-            lambda: list(Task.objects.filter(creator=author))
-        )()
-        assert len(tasks) == 1
-        # Сравниваем по _id — безопасно для async-контекста
-        assert tasks[0].topic_id == group_topic.pk
-

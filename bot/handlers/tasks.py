@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from aiogram import Router, F
@@ -38,8 +38,33 @@ def _get_open_tasks_for_private(db_user: TelegramUser) -> List[Task]:
     )
 
 
+def _get_all_tasks_for_private(db_user: TelegramUser) -> List[Task]:
+    return list(
+        Task.objects.filter(
+            assignees__user=db_user,
+        )
+        .select_related("topic__chat", "creator")
+        .prefetch_related("assignees__user")
+        .order_by("due_date", "id")
+        .distinct()
+    )
+
+
 def _get_open_tasks_for_chat(chat, topic=None) -> List[Task]:
     filters = {"topic__chat": chat, "status": "open"}
+    if topic:
+        filters["topic"] = topic
+    return list(
+        Task.objects.filter(**filters)
+        .select_related("creator")
+        .prefetch_related("assignees__user")
+        .order_by("due_date", "id")
+        .distinct()
+    )
+
+
+def _get_all_tasks_for_chat(chat, topic=None) -> List[Task]:
+    filters = {"topic__chat": chat}
     if topic:
         filters["topic"] = topic
     return list(
@@ -91,12 +116,202 @@ def _format_creator(creator) -> str:
 
 
 def _build_task_text(task: Task) -> str:
-    return (
+    text = (
         f"<b>{task.title}</b>\n"
         f"👤 {_format_assignees(task)}\n"
         f"{_format_due_date(task)}\n"
         f"📝 Назначил(а): {_format_creator(task.creator)}"
     )
+    if task.status == "done" and hasattr(task, 'completed_at') and task.completed_at:
+        dt = task.completed_at
+        if timezone.is_aware(dt):
+            dt = timezone.localtime(dt)
+        text += f"\n✅ Выполнено: {dt.strftime('%d.%m.%Y %H:%M')}"
+    return text
+
+
+def _parse_task_filters(text: str, user: TelegramUser) -> dict:
+    """Парсит фильтры из текста команды /tasks ..."""
+    filters = {}
+    now = timezone.localtime(timezone.now())
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+    tomorrow_start = today_start + timedelta(days=1)
+    tomorrow_end = tomorrow_start + timedelta(days=1)
+    week_end = today_start + timedelta(days=7)
+    parts = text.lower().split()
+    
+    for part in parts:
+        if part in ("overdue", "просрочено", "просроченные"):
+            filters["status"] = "open"
+            filters["due_date__lt"] = now
+        elif part in ("today", "сегодня"):
+            filters["due_date__gte"] = today_start
+            filters["due_date__lt"] = today_end
+            filters["header_suffix"] = "на сегодня"
+        elif part in ("tomorrow", "завтра"):
+            filters["due_date__gte"] = tomorrow_start
+            filters["due_date__lt"] = tomorrow_end
+            filters["header_suffix"] = "на завтра"
+        elif part in ("week", "неделя", "эту неделю"):
+            filters["due_date__gte"] = today_start
+            filters["due_date__lt"] = week_end
+            filters["header_suffix"] = "на эту неделю"
+        elif part in ("done", "выполненные", "выполнено"):
+            filters["status"] = "done"
+        elif part in ("my", "мои", "моё"):
+            filters["my"] = True
+        elif part.startswith("@"):
+            filters["assignee_username"] = part.lstrip("@")
+    
+    return filters
+
+
+def _apply_task_filters(tasks: list, filters: dict, user: TelegramUser) -> list:
+    """Применяет фильтры к списку задач."""
+    result = []
+    for task in tasks:
+        include = True
+        
+        # Статус (если не указан — только open)
+        status = filters.get("status", "open")
+        if task.status != status:
+            include = False
+        
+        # Due date
+        due_from = filters.get("due_date__gte")
+        due_to = filters.get("due_date__lt")
+        if due_from and (not task.due_date or task.due_date < due_from):
+            include = False
+        if due_to and (not task.due_date or task.due_date >= due_to):
+            include = False
+        if "due_date__lt" in filters and not due_to:
+            # overdue filter
+            if not task.due_date or task.due_date >= filters["due_date__lt"]:
+                include = False
+        
+        # @username
+        username = filters.get("assignee_username")
+        if username:
+            assignees = [a.user for a in task.assignees.all()]
+            found = False
+            for a in assignees:
+                if a.username and a.username.lower() == username.lower():
+                    found = True
+                    break
+            if not found:
+                include = False
+        
+        # My tasks (in group)
+        if filters.get("my") and user not in [a.user for a in task.assignees.all()]:
+            include = False
+        
+        if include:
+            result.append(task)
+    
+    return result
+
+
+async def _respond_tasks(message: Message, chat, topic, db_user, filters: dict):
+    """Отвечает пользователю списком задач с учётом фильтров."""
+    wants_done = filters.get("status") == "done"
+    
+    if message.chat.type == "private":
+        if wants_done:
+            tasks = await sync_to_async(_get_all_tasks_for_private)(db_user)
+        else:
+            tasks = await sync_to_async(_get_open_tasks_for_private)(db_user)
+        base_header = "📋 Ваши задачи"
+    else:
+        if wants_done:
+            if not filters.get("assignee_username"):
+                filters["my"] = True
+            tasks = await sync_to_async(_get_all_tasks_for_chat)(chat, topic)
+        else:
+            tasks = await sync_to_async(_get_open_tasks_for_chat)(chat, topic)
+        if not chat:
+            await message.answer("Не удалось определить чат.")
+            return
+        if wants_done:
+            base_header = "📋 Мои выполненные задачи"
+        else:
+            base_header = f"📋 Задачи чата {chat.title}"
+    
+    if filters:
+        tasks = _apply_task_filters(tasks, filters, db_user)
+    
+    suffix = filters.get("header_suffix", "")
+    header = f"{base_header} {suffix}:".strip() if suffix else f"{base_header}:"
+    
+    if not tasks:
+        await message.answer("Нет задач, соответствующих фильтру.")
+        return
+    await message.answer(header)
+    
+    if wants_done:
+        lines = []
+        total = len(tasks)
+        shown = tasks[:10] if total > 10 else tasks
+        for i, task in enumerate(shown, 1):
+            lines.append(f"{i}. {_build_task_text(task)}")
+            lines.append("")
+        text = "\n".join(lines).rstrip("\n")
+        if total > 10:
+            text += f"\n\n... и ещё {total - 10} выполненных задач"
+        await message.answer(text, parse_mode="HTML")
+        return
+    
+    for i, task in enumerate(tasks, 1):
+        await message.answer(
+            f"{i}. {_build_task_text(task)}",
+            parse_mode="HTML",
+            reply_markup=task_keyboard(task.id),
+        )
+
+
+async def _handle_nlp_query(message: Message, intent_type: str, filters: dict):
+    """Обрабатывает NLP-запрос из личных сообщений."""
+    from bot.utils import get_chat_context as _get_ctx
+    chat, topic, db_user = await _get_ctx(message)
+    if not db_user:
+        await message.answer("Не удалось определить пользователя.")
+        return
+    
+    # Преобразуем NLP-фильтры в формат _parse_task_filters
+    task_filters = {}
+    if filters.get("overdue"):
+        task_filters["status"] = "open"
+        task_filters["due_date__lt"] = timezone.localtime(timezone.now())
+    elif filters.get("done"):
+        task_filters["status"] = "done"
+    if filters.get("today"):
+        now = timezone.localtime(timezone.now())
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        task_filters["due_date__gte"] = day_start
+        task_filters["due_date__lt"] = day_start + timedelta(days=1)
+        task_filters["header_suffix"] = "на сегодня"
+    elif filters.get("tomorrow"):
+        now = timezone.localtime(timezone.now())
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = day_start + timedelta(days=1)
+        task_filters["due_date__gte"] = tomorrow
+        task_filters["due_date__lt"] = tomorrow + timedelta(days=1)
+        task_filters["header_suffix"] = "на завтра"
+    elif filters.get("week"):
+        now = timezone.localtime(timezone.now())
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        task_filters["due_date__gte"] = day_start
+        task_filters["due_date__lt"] = day_start + timedelta(days=7)
+        task_filters["header_suffix"] = "на эту неделю"
+    
+    if filters.get("username"):
+        task_filters["assignee_username"] = filters["username"]
+    if filters.get("my"):
+        task_filters["my"] = True
+    if filters.get("list_all"):
+        pass  # Покажем все
+    
+    await _respond_tasks(message, chat, topic, db_user, task_filters)
 
 
 @router.message(Command("tasks"))
@@ -105,25 +320,9 @@ async def cmd_tasks(message: Message):
     if not db_user:
         await message.answer("Не удалось определить пользователя.")
         return
-    if message.chat.type == "private":
-        tasks = await sync_to_async(_get_open_tasks_for_private)(db_user)
-        header = "📋 Ваши задачи:"
-    else:
-        tasks = await sync_to_async(_get_open_tasks_for_chat)(chat, topic)
-        if not chat:
-            await message.answer("Не удалось определить чат.")
-            return
-        header = f"📋 Задачи чата {chat.title}:"
-    if not tasks:
-        await message.answer("Нет открытых задач.")
-        return
-    await message.answer(header)
-    for i, task in enumerate(tasks, 1):
-        await message.answer(
-            f"{i}. {_build_task_text(task)}",
-            parse_mode="HTML",
-            reply_markup=task_keyboard(task.id),
-        )
+    text = message.text or ""
+    filters = _parse_task_filters(text, db_user)
+    await _respond_tasks(message, chat, topic, db_user, filters)
 
 
 @router.callback_query(F.data.startswith("task_done:"))

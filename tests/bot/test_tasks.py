@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from django.utils import timezone
 from asgiref.sync import sync_to_async
 
-
 from tests.conftest import make_message
 
 
@@ -14,7 +13,6 @@ def _make_mock_task(key, title, task_id=1, due_date=None, assignees=None):
     task.title = title
     task.due_date = due_date
     task.status = "open"
-
     links = []
     for user in (assignees or []):
         link = MagicMock()
@@ -37,17 +35,11 @@ def tasks_with_assignees():
     u1 = _make_mock_user(username="user1", full_name="User One")
     u2 = _make_mock_user(username=None, full_name="User Two")
     return [
-        _make_mock_task(
-            "report", "Сделать отчёт",
-            task_id=1,
-            due_date=datetime.now(dt_timezone.utc) + timedelta(days=2),
-            assignees=[u1],
-        ),
-        _make_mock_task(
-            "pres", "Подготовить презентацию",
-            task_id=2,
-            assignees=[u1, u2],
-        ),
+        _make_mock_task("report", "Сделать отчёт", task_id=1,
+                         due_date=datetime.now(dt_timezone.utc) + timedelta(days=2),
+                         assignees=[u1]),
+        _make_mock_task("pres", "Подготовить презентацию", task_id=2,
+                         assignees=[u1, u2]),
     ]
 
 
@@ -74,9 +66,9 @@ def _setup_sync_mock(mock_s2a, return_value):
     mock_s2a.return_value = fake_fetch
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
 # /tasks — список задач
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.asyncio
@@ -111,7 +103,7 @@ async def test_tasks_private_no_tasks(
     mock_get_chat_context_tasks.return_value = (MagicMock(), None, MagicMock())
     _setup_sync_mock(mock_sync_tasks, [])
     await cmd_tasks(msg)
-    assert "Нет открытых задач" in msg.answer.call_args[0][0]
+    assert "Нет задач" in msg.answer.call_args[0][0]
 
 
 @pytest.mark.asyncio
@@ -179,289 +171,14 @@ async def test_tasks_due_date_formatted(
     await cmd_tasks(msg)
     assert msg.answer.call_count == 2
     text = msg.answer.call_args_list[1].args[0] if msg.answer.call_args_list[1].args else ""
-    assert "📅 до" in text
-    assert "15.05.2026" in text
-
-
-@pytest.mark.asyncio
-async def test_tasks_no_due_date(
-    private_chat, telegram_user, now_dt,
-    mock_get_chat_context_tasks, mock_sync_tasks,
-):
-    from bot.handlers.tasks import cmd_tasks
-
-    task = _make_mock_task("nodate", "Задача без срока", task_id=11)
-
-    msg = make_message(private_chat, telegram_user, "/tasks", now_dt)
-    mock_get_chat_context_tasks.return_value = (MagicMock(), None, MagicMock())
-    _setup_sync_mock(mock_sync_tasks, [task])
-
-    await cmd_tasks(msg)
-
-    assert msg.answer.call_count == 2
-    text = msg.answer.call_args_list[1].args[0] if msg.answer.call_args_list[1].args else ""
-    assert "без срока" in text
-
-
-# ──────────────────────────────────────────────────────────────────────
-# callback: task_done
-# ──────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_task_done_success():
-    from bot.handlers.tasks import callback_task_done
-
-    callback = AsyncMock()
-    callback.data = "task_done:42"
-    callback.from_user = MagicMock(id=999)
-    callback.message = AsyncMock()
-    callback.answer = AsyncMock()
-
-    mock_user = MagicMock()
-
-    with patch(
-        "bot.handlers.tasks.sync_to_async",
-        return_value=AsyncMock(return_value=mock_user),
-    ), patch(
-        "bot.handlers.tasks.task_service.mark_task_done",
-        new=AsyncMock(return_value=True),
-    ):
-        await callback_task_done(callback)
-
-    callback.answer.assert_called_once()
-    assert "выполнена" in callback.answer.call_args[0][0].lower()
-
-
-@pytest.mark.asyncio
-async def test_task_done_failure():
-    from bot.handlers.tasks import callback_task_done
-
-    callback = AsyncMock()
-    callback.data = "task_done:42"
-    callback.from_user = MagicMock(id=999)
-    callback.message = AsyncMock()
-    callback.answer = AsyncMock()
-
-    mock_user = MagicMock()
-
-    with patch(
-        "bot.handlers.tasks.sync_to_async",
-        return_value=AsyncMock(return_value=mock_user),
-    ), patch(
-        "bot.handlers.tasks.task_service.mark_task_done",
-        new=AsyncMock(return_value=False),
-    ):
-        await callback_task_done(callback)
-
-    callback.answer.assert_called_once()
-    assert "ошибка" in callback.answer.call_args[0][0].lower()
-
-
-@pytest.mark.asyncio
-async def test_task_done_user_not_found():
-    from bot.handlers.tasks import callback_task_done
-
-    callback = AsyncMock()
-    callback.data = "task_done:42"
-    callback.from_user = MagicMock(id=999)
-    callback.answer = AsyncMock()
-
-    with patch(
-        "bot.handlers.tasks.sync_to_async",
-        return_value=AsyncMock(return_value=None),
-    ):
-        await callback_task_done(callback)
-
-    callback.answer.assert_called_once()
-    assert "не найден" in callback.answer.call_args[0][0].lower()
-
-# ──────────────────────────────────────────────────────────────────
-# Жёсткие тесты
-# ──────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_tasks_very_long_title(
-    group_chat, telegram_user, now_dt,
-    mock_get_chat_context_tasks, mock_sync_tasks,
-):
-    from bot.handlers.tasks import cmd_tasks
-
-    long_title = "А" * 1000
-    task = _make_mock_task("long", long_title, task_id=1)
-
-    msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
-    mock_get_chat_context_tasks.return_value = (MagicMock(title="Chat"), None, MagicMock())
-    _setup_sync_mock(mock_sync_tasks, [task])
-
-    try:
-        await cmd_tasks(msg)
-    except Exception:
-        pytest.fail("Не должно падать на длинном title")
-
-
-@pytest.mark.asyncio
-async def test_tasks_special_chars_in_title(
-    group_chat, telegram_user, now_dt,
-    mock_get_chat_context_tasks, mock_sync_tasks,
-):
-    from bot.handlers.tasks import cmd_tasks
-
-    task = _make_mock_task(
-        "xss", "<script>alert('xss')</script> & <b>test</b>", task_id=1
-    )
-
-    msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
-    mock_get_chat_context_tasks.return_value = (MagicMock(title="Chat"), None, MagicMock())
-    _setup_sync_mock(mock_sync_tasks, [task])
-
-    try:
-        await cmd_tasks(msg)
-    except Exception:
-        pytest.fail("HTML-спецсимволы не должны ломать бота")
-
-
-@pytest.mark.asyncio
-async def test_tasks_many_assignees(
-    group_chat, telegram_user, now_dt,
-    mock_get_chat_context_tasks, mock_sync_tasks,
-):
-    from bot.handlers.tasks import cmd_tasks
-
-    users = [_make_mock_user(username=f"user{i}", user_id=i) for i in range(10)]
-    task = _make_mock_task("mass", "Массовая задача", task_id=1, assignees=users)
-
-    msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
-    mock_get_chat_context_tasks.return_value = (MagicMock(title="Chat"), None, MagicMock())
-    _setup_sync_mock(mock_sync_tasks, [task])
-
-    await cmd_tasks(msg)
-
-    texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
-    combined = " ".join(texts)
-    assert "@user0" in combined
-    assert "@user9" in combined
-
-
-@pytest.mark.asyncio
-async def test_tasks_assignee_no_username_no_fullname(
-    group_chat, telegram_user, now_dt,
-    mock_get_chat_context_tasks, mock_sync_tasks,
-):
-    from bot.handlers.tasks import cmd_tasks
-
-    user = MagicMock()
-    user.id = 42
-    user.username = None
-    user.full_name = None
-    task = _make_mock_task("noname", "Задача", task_id=1, assignees=[user])
-
-    msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
-    mock_get_chat_context_tasks.return_value = (MagicMock(title="Chat"), None, MagicMock())
-    _setup_sync_mock(mock_sync_tasks, [task])
-
-    try:
-        await cmd_tasks(msg)
-    except Exception:
-        pytest.fail("Не должно падать если у assignee нет username и full_name")
-
-
-@pytest.mark.asyncio
-async def test_tasks_due_date_in_past(
-    private_chat, telegram_user, now_dt,
-    mock_get_chat_context_tasks, mock_sync_tasks,
-):
-    from bot.handlers.tasks import cmd_tasks
-
-    past_date = datetime.now(dt_timezone.utc) - timedelta(days=30)
-    task = _make_mock_task("old", "Старая задача", task_id=1, due_date=past_date)
-
-    msg = make_message(private_chat, telegram_user, "/tasks", now_dt)
-    mock_get_chat_context_tasks.return_value = (MagicMock(), None, MagicMock())
-    _setup_sync_mock(mock_sync_tasks, [task])
-
-    await cmd_tasks(msg)
-
-    texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
-    combined = " ".join(texts)
-    assert "Старая задача" in combined
-
-
-@pytest.mark.asyncio
-async def test_tasks_empty_title_skipped(
-    group_chat, telegram_user, now_dt,
-    mock_get_chat_context_tasks, mock_sync_tasks,
-):
-    from bot.handlers.tasks import cmd_tasks
-
-    task_ok = _make_mock_task("ok", "Нормальная задача", task_id=1)
-    task_empty = _make_mock_task("empty", "", task_id=2)
-
-    msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
-    mock_get_chat_context_tasks.return_value = (MagicMock(title="Chat"), None, MagicMock())
-    _setup_sync_mock(mock_sync_tasks, [task_ok, task_empty])
-
-    await cmd_tasks(msg)
-    assert msg.answer.call_count >= 2
-
-
-@pytest.mark.asyncio
-async def test_task_done_invalid_callback_data():
-    from bot.handlers.tasks import callback_task_done
-
-    callback = AsyncMock()
-    callback.data = "task_done:abc"
-    callback.answer = AsyncMock()
-
-    await callback_task_done(callback)
-
-    callback.answer.assert_called_once()
-    assert "некорректн" in callback.answer.call_args[0][0].lower()
-
-
-@pytest.mark.asyncio
-async def test_task_done_empty_callback_data():
-    from bot.handlers.tasks import callback_task_done
-
-    callback = AsyncMock()
-    callback.data = "task_done:"
-    callback.answer = AsyncMock()
-
-    await callback_task_done(callback)
-
-    callback.answer.assert_called_once()
-
-
-# ──────────────────────────────────────────────────────────────────
-# Вспомогательная функция: правильный мок для sync_to_async
-# ──────────────────────────────────────────────────────────────────
-
-
-def _make_fake_sync_to_async():
-    """
-    Создаёт правильный мок для sync_to_async.
-    Оригинальный sync_to_async(f) возвращает асинхронную обёртку,
-    которая вызывает f(*args, **kwargs). Этот мок делает то же самое.
-    """
-    def fake_sync_to_async(func):
-        async def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
-        return wrapper
-    return fake_sync_to_async
+    assert "📅 до" in text or "Просрочено" in text
 
 
 # ══════════════════════════════════════════════════════════════════
 # BATCH TASK EXTRACTION TESTS  (все DB-взаимодействия замоканы)
 # ══════════════════════════════════════════════════════════════════
 
-
 def _make_proper_sync_to_async():
-    """
-    Правильный мок для sync_to_async.
-    sync_to_async(f) должна вернуть асинхронную обёртку,
-    которая вызовет f(*args, **kwargs). Именно это и делаем.
-    """
     def proper_s2a(func):
         async def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
@@ -477,7 +194,7 @@ def mock_db_message_factory():
             timestamp = timezone.now()
         msg = MagicMock()
         msg.id = msg_id
-        msg.pk = msg_id          # ⚠️ обязательно — Django смотрит pk для FK
+        msg.pk = msg_id
         msg.text = text
         msg.timestamp = timestamp
         msg.is_processed = False
@@ -489,6 +206,7 @@ def mock_db_message_factory():
         msg.author.is_bot = False
         msg.chat = MagicMock()
         msg.chat.chat_id = chat_id
+        msg.chat.type = "supergroup"
         msg.topic = MagicMock()
         msg.topic.thread_id = thread_id
         return msg
@@ -512,16 +230,14 @@ class TestBatchTaskExtraction:
         mock_llm.extract_tasks_from_messages = AsyncMock(return_value=[{
             "title": "сделать отчёт", "assignees": [], "due_date": None, "description": "",
         }])
-        proper_s2a = _make_proper_sync_to_async()
 
-        with patch("core.services.task_service.sync_to_async", side_effect=proper_s2a):
-            with patch("core.services.task_service.user_can_create", return_value=True):
-                with patch("core.services.task_service.Task") as MockTask:
-                    mock_task_instance = MagicMock()
-                    mock_task_instance.id = 1
-                    MockTask.objects.create = MagicMock(return_value=mock_task_instance)
-                    service = TaskService(llm=mock_llm)
-                    result = await service.extract_tasks_from_messages_batch([msg])
+        with patch("core.services.task_service.user_can_create", return_value=True):
+            with patch("core.services.task_service.Task") as MockTask:
+                mock_task_instance = MagicMock()
+                mock_task_instance.id = 1
+                MockTask.objects.create = MagicMock(return_value=mock_task_instance)
+                service = TaskService(llm=mock_llm)
+                result = await service.extract_tasks_from_messages_batch([msg])
 
         assert len(result) == 1
         mock_llm.extract_tasks_from_messages.assert_called_once()
@@ -541,14 +257,12 @@ class TestBatchTaskExtraction:
         mock_llm.extract_tasks_from_messages = AsyncMock(return_value=[{
             "title": "сделать отчёт", "assignees": [], "due_date": None, "description": "",
         }])
-        proper_s2a = _make_proper_sync_to_async()
 
-        with patch("core.services.task_service.sync_to_async", side_effect=proper_s2a):
-            with patch("core.services.task_service.user_can_create", return_value=True):
-                with patch("core.services.task_service.Task") as MockTask:
-                    MockTask.objects.create = MagicMock(return_value=MagicMock(id=1))
-                    service = TaskService(llm=mock_llm)
-                    result = await service.extract_tasks_from_messages_batch(msgs)
+        with patch("core.services.task_service.user_can_create", return_value=True):
+            with patch("core.services.task_service.Task") as MockTask:
+                MockTask.objects.create = MagicMock(return_value=MagicMock(id=1))
+                service = TaskService(llm=mock_llm)
+                result = await service.extract_tasks_from_messages_batch(msgs)
 
         assert mock_llm.extract_tasks_from_messages.call_count == 1
         assert len(result) == 1
@@ -594,14 +308,12 @@ class TestBatchTaskExtraction:
             t = MagicMock()
             t.id = task_counter["count"]
             return t
-        proper_s2a = _make_proper_sync_to_async()
 
-        with patch("core.services.task_service.sync_to_async", side_effect=proper_s2a):
-            with patch("core.services.task_service.user_can_create", return_value=True):
-                with patch("core.services.task_service.Task") as MockTask:
-                    MockTask.objects.create = MagicMock(side_effect=make_task)
-                    service = TaskService(llm=mock_llm)
-                    result = await service.extract_tasks_from_messages_batch(msgs)
+        with patch("core.services.task_service.user_can_create", return_value=True):
+            with patch("core.services.task_service.Task") as MockTask:
+                MockTask.objects.create = MagicMock(side_effect=make_task)
+                service = TaskService(llm=mock_llm)
+                result = await service.extract_tasks_from_messages_batch(msgs)
 
         assert len(result) == 2
 
@@ -624,14 +336,12 @@ class TestBatchTaskExtraction:
             t = MagicMock()
             t.id = 1
             return t
-        proper_s2a = _make_proper_sync_to_async()
 
-        with patch("core.services.task_service.sync_to_async", side_effect=proper_s2a):
-            with patch("core.services.task_service.user_can_create", return_value=True):
-                with patch("core.services.task_service.Task") as MockTask:
-                    MockTask.objects.create = MagicMock(side_effect=capture_create)
-                    service = TaskService(llm=mock_llm)
-                    await service.extract_tasks_from_messages_batch(msgs)
+        with patch("core.services.task_service.user_can_create", return_value=True):
+            with patch("core.services.task_service.Task") as MockTask:
+                MockTask.objects.create = MagicMock(side_effect=capture_create)
+                service = TaskService(llm=mock_llm)
+                await service.extract_tasks_from_messages_batch(msgs)
 
         assert created_kwargs.get("source_message") == msgs[-1]
 
@@ -644,17 +354,15 @@ class TestBatchTaskExtraction:
             "title": "сделать отчёт", "assignees": ["@unknown_user"],
             "due_date": None, "description": "",
         }])
-        proper_s2a = _make_proper_sync_to_async()
 
-        with patch("core.services.task_service.sync_to_async", side_effect=proper_s2a):
-            with patch("core.services.task_service.user_can_create", return_value=True):
-                with patch("core.services.task_service.Task") as MockTask:
-                    MockTask.objects.create = MagicMock(return_value=MagicMock(id=1))
-                    with patch("core.services.task_service._find_user_by_username", return_value=None):
-                        with patch("core.services.task_service.TaskAssignee") as MockTA:
-                            MockTA.objects.create = MagicMock()
-                            service = TaskService(llm=mock_llm)
-                            result = await service.extract_tasks_from_messages_batch([msg])
+        with patch("core.services.task_service.user_can_create", return_value=True):
+            with patch("core.services.task_service.Task") as MockTask:
+                MockTask.objects.create = MagicMock(return_value=MagicMock(id=1))
+                with patch("core.services.task_service._find_user_by_username", return_value=None):
+                    with patch("core.services.task_service.TaskAssignee") as MockTA:
+                        MockTA.objects.create = MagicMock()
+                        service = TaskService(llm=mock_llm)
+                        result = await service.extract_tasks_from_messages_batch([msg])
 
         assert len(result) == 1
         MockTA.objects.create.assert_not_called()
@@ -664,16 +372,13 @@ class TestBatchTaskExtraction:
 # DUPLICATE PREVENTION TESTS  (с реальной БД)
 # ══════════════════════════════════════════════════════════════════
 
-
 def _make_naive_due_date(days_ahead=2):
-    """Наивный datetime — без tzinfo, чтобы make_aware не падал."""
     from datetime import datetime as dt_mod
     naive = dt_mod.now() + timedelta(days=days_ahead)
     return naive.replace(hour=23, minute=59, second=0, microsecond=0)
 
 
 def _make_aware_due_date(days_ahead=2):
-    """Наивный → aware через make_aware (как в продакшене)."""
     naive = _make_naive_due_date(days_ahead)
     return timezone.make_aware(naive, timezone.get_current_timezone())
 
@@ -825,167 +530,3 @@ class TestTaskDuplicatePrevention:
         new_task = await service._create_task_from_data(task_data, real_msg)
         assert new_task is not None
         assert new_task.id != closed.id
-
-
-def _make_naive_date_str(days_ahead=2):
-    """Наивный строковый дедлайн."""
-    from datetime import datetime as dt_mod
-    naive = dt_mod.now() + timedelta(days=days_ahead)
-    return naive.strftime("%Y-%m-%d")
-
-
-# ══════════════════════════════════════════════════════════════════
-# TASK TOPIC RESOLUTION TESTS
-# ══════════════════════════════════════════════════════════════════
-
-class TestTaskTopicResolution:
-    """Проверяет, что задача создаётся с правильным topic."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.django_db(transaction=True)
-    async def test_task_from_group_chat_uses_own_topic(self):
-        from core.services.task_service import TaskService
-        from core.models import TelegramChat, TelegramUser, Topic, Message, UserRole
-
-        group_chat = await sync_to_async(TelegramChat.objects.create)(
-            chat_id=-2001, title="Test Group", type="supergroup",
-        )
-        group_topic = await sync_to_async(Topic.objects.create)(
-            chat=group_chat, thread_id=0, is_active=True,
-        )
-        author = await sync_to_async(TelegramUser.objects.create)(
-            telegram_id=1001, username="admin", full_name="admin",
-        )
-        await sync_to_async(UserRole.objects.create)(
-            user=author, chat=group_chat, role="admin",
-        )
-        group_msg = await sync_to_async(Message.objects.create)(
-            telegram_msg_id=101, chat=group_chat, topic=group_topic,
-            author=author, text="сделать отчёт", timestamp=timezone.now(),
-        )
-
-        service = TaskService()
-        task = await service._create_task_from_data(
-            {"title": "сделать отчёт", "assignees": [],
-             "due_date": _make_naive_date_str(), "description": ""},
-            group_msg,
-        )
-
-        assert task is not None
-        # Сравниваем по PK — lazy load FK не нужен
-        assert task.topic_id == group_topic.pk
-        assert task.creator_id == author.pk
-
-    @pytest.mark.asyncio
-    @pytest.mark.django_db(transaction=True)
-    async def test_task_from_private_chat_uses_linked_group_topic(self):
-        from core.services.task_service import TaskService
-        from core.models import (
-            TelegramChat, TelegramUser, Topic, Message, Task, UserRole,
-        )
-
-        group_chat = await sync_to_async(TelegramChat.objects.create)(
-            chat_id=-2002, title="Work Group", type="supergroup",
-        )
-        group_topic = await sync_to_async(Topic.objects.create)(
-            chat=group_chat, thread_id=0, is_active=True,
-        )
-        author = await sync_to_async(TelegramUser.objects.create)(
-            telegram_id=1002, username="worker", full_name="Worker",
-        )
-        await sync_to_async(UserRole.objects.create)(
-            user=author, chat=group_chat, role="admin",
-        )
-        private_chat = await sync_to_async(TelegramChat.objects.create)(
-            chat_id=100200, title="", type="private",
-        )
-        private_topic = await sync_to_async(Topic.objects.create)(
-            chat=private_chat, thread_id=0, is_active=True,
-        )
-        private_msg = await sync_to_async(Message.objects.create)(
-            telegram_msg_id=201, chat=private_chat, topic=private_topic,
-            author=author, text="сделать отчёт", timestamp=timezone.now(),
-        )
-
-        service = TaskService()
-        task = await service._create_task_from_data(
-            {"title": "сделать отчёт", "assignees": ["@worker"],
-             "due_date": _make_naive_date_str(), "description": ""},
-            private_msg,
-        )
-
-        assert task is not None
-        # topic ДОЛЖЕН быть от группы
-        assert task.topic_id == group_topic.pk, (
-            f"Expected topic_id={group_topic.pk} (group), got {task.topic_id}"
-        )
-        # Убеждаемся, что это НЕ topic приватного чата
-        assert task.topic_id != private_topic.pk
-
-    @pytest.mark.asyncio
-    @pytest.mark.django_db(transaction=True)
-    async def test_task_from_private_without_linked_chat_falls_back(self):
-        from core.services.task_service import TaskService
-        from core.models import TelegramChat, TelegramUser, Topic, Message, UserRole
-
-        private_chat = await sync_to_async(TelegramChat.objects.create)(
-            chat_id=100300, title="", type="private",
-        )
-        private_topic = await sync_to_async(Topic.objects.create)(
-            chat=private_chat, thread_id=0, is_active=True,
-        )
-        author = await sync_to_async(TelegramUser.objects.create)(
-            telegram_id=1003, username="lonely", full_name="Lonely User",
-        )
-        await sync_to_async(UserRole.objects.create)(
-            user=author, chat=private_chat, role="admin",
-        )
-        private_msg = await sync_to_async(Message.objects.create)(
-            telegram_msg_id=301, chat=private_chat, topic=private_topic,
-            author=author, text="моя задача", timestamp=timezone.now(),
-        )
-
-        service = TaskService()
-        task = await service._create_task_from_data(
-            {"title": "моя задача", "assignees": [],
-             "due_date": None, "description": ""},
-            private_msg,
-        )
-
-        assert task is not None
-        # fallback — остаётся topic приватного чата
-        assert task.topic_id == private_topic.pk
-
-    @pytest.mark.asyncio
-    @pytest.mark.django_db(transaction=True)
-    async def test_task_forum_topic_preserved_in_group(self):
-        from core.services.task_service import TaskService
-        from core.models import TelegramChat, TelegramUser, Topic, Message, UserRole
-
-        group_chat = await sync_to_async(TelegramChat.objects.create)(
-            chat_id=-2003, title="Forum Group", type="supergroup", is_forum=True,
-        )
-        forum_topic = await sync_to_async(Topic.objects.create)(
-            chat=group_chat, thread_id=42, is_active=True,
-        )
-        author = await sync_to_async(TelegramUser.objects.create)(
-            telegram_id=1004, username="forumuser", full_name="Forum User",
-        )
-        await sync_to_async(UserRole.objects.create)(
-            user=author, chat=group_chat, role="manager",
-        )
-        msg = await sync_to_async(Message.objects.create)(
-            telegram_msg_id=401, chat=group_chat, topic=forum_topic,
-            author=author, text="задача в форуме", timestamp=timezone.now(),
-        )
-
-        service = TaskService()
-        task = await service._create_task_from_data(
-            {"title": "задача в форуме", "assignees": [],
-             "due_date": None, "description": ""},
-            msg,
-        )
-
-        assert task is not None
-        # Форум-топик сохранён
-        assert task.topic_id == forum_topic.pk

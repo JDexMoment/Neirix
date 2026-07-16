@@ -8,6 +8,7 @@ from django.utils import timezone
 from asgiref.sync import sync_to_async
 
 from core.models import Meeting, TelegramUser, Message, Topic
+from core.services.permissions import user_can_create
 
 if TYPE_CHECKING:
     from core.utils.llm_client import LLMClient
@@ -139,6 +140,9 @@ class MeetingService:
                 return None
 
             topic = await _resolve_topic_for_private_message(source_message)
+            if not await sync_to_async(user_can_create)(source_message):
+                logger.warning("Permission denied for meeting creation")
+                return None
 
             start_at = _parse_start_at_from_meeting_data(meeting_data)
             if not start_at:
