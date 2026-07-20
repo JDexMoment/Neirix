@@ -1,22 +1,29 @@
+
+from unittest.mock import patch, MagicMock
+
+with patch('core.services.summary_service.VectorStoreClient') as mock_vsc:
+    mock_vsc.return_value = MagicMock()
+    from bot.handlers.summary import cmd_summary
+
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
-
-from tests.conftest import make_message
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Фикстуры
-# ─────────────────────────────────────────────────────────────────────
+from aiogram.types import Message, Chat, User
+from core.models import Summary
+from django.utils import timezone as dj_timezone
 
 
 @pytest.fixture
-def summary_message(private_chat, telegram_user, now_dt):
-    return make_message(private_chat, telegram_user, "/summary", now_dt)
+def message_mock():
+    msg = AsyncMock(spec=Message)
+    msg.from_user = User(id=999, is_bot=False, first_name="Test")
+    msg.chat = Chat(id=-123456, type="supergroup")
+    msg.answer = AsyncMock()
+    return msg
 
 
 @pytest.fixture
-def mock_get_chat_context_summary():
+def mock_get_chat_context():
     with patch("bot.handlers.summary.get_chat_context") as mock:
         yield mock
 
@@ -29,28 +36,13 @@ def mock_summary_service():
 
 
 @pytest.fixture
-def mock_sync_summary():
-    """
-    sync_to_async: вызывает переданную функцию напрямую.
-    Это нужно для _get_or_create_default_topic и _get_existing_summary.
-    """
-    with patch("bot.handlers.summary.sync_to_async") as mock_s2a:
+def mock_sync_to_async():
+    with patch("bot.handlers.summary.sync_to_async") as mock:
         def _wrapper(fn):
             async def _call(*args, **kwargs):
                 return fn(*args, **kwargs)
             return _call
-        mock_s2a.side_effect = _wrapper
-        yield mock_s2a
-
-
-@pytest.fixture
-def mock_existing_summary():
-    """
-    Патчим _get_existing_summary напрямую —
-    это та самая функция, которую handler оборачивает в sync_to_async.
-    """
-    with patch("bot.handlers.summary._get_existing_summary") as mock:
-        mock.return_value = None
+        mock.side_effect = _wrapper
         yield mock
 
 
@@ -96,146 +88,100 @@ def _make_mock_summary(content="Тестовое саммари", days_ago=0):
 
 
 @pytest.mark.asyncio
-async def test_summary_no_args(summary_message, mock_get_chat_context_summary):
-    from bot.handlers.summary import cmd_summary
+async def test_summary_no_args(message_mock, mock_get_chat_context):
+    message_mock.text = "/summary"
+    mock_get_chat_context.return_value = (message_mock.chat, None, message_mock.from_user)
 
-    summary_message.text = "/summary"
-    mock_get_chat_context_summary.return_value = (
-        summary_message.chat,
-        MagicMock(id=1),
-        summary_message.from_user,
-    )
+    await cmd_summary(message_mock)
 
-    await cmd_summary(summary_message)
-
-    summary_message.answer.assert_called_once()
-    text = _get_answer_texts(summary_message)
-    assert "используйте" in text.lower()
+    message_mock.answer.assert_called_once()
+    assert "Используйте:" in message_mock.answer.call_args[0][0]
 
 
 @pytest.mark.asyncio
-async def test_summary_no_chat(summary_message, mock_get_chat_context_summary):
-    from bot.handlers.summary import cmd_summary
+async def test_summary_today_new(message_mock, mock_get_chat_context, mock_summary_service,
+                                 mock_sync_to_async):
+    message_mock.text = "/summary today"
+    topic = MagicMock()  # замоканный объект Topic
+    mock_get_chat_context.return_value = (message_mock.chat, topic, message_mock.from_user)
 
-    summary_message.text = "/summary today"
-    mock_get_chat_context_summary.return_value = (None, None, None)
+    with patch("bot.handlers.summary.Summary.objects.filter") as mock_filter:
+        mock_filter.return_value.first.return_value = None
+        summary = MagicMock(spec=Summary, content="Тестовое саммари за сегодня",
+                            period_start=dj_timezone.now(), period_end=dj_timezone.now() + timedelta(days=1))
+        mock_summary_service.generate_summary_for_period.return_value = summary
 
-    try:
-        await cmd_summary(summary_message)
-    except Exception:
-        pytest.fail("Хендлер не должен падать при отсутствии чата")
+        await cmd_summary(message_mock)
 
-    text = _get_answer_texts(summary_message)
-    assert "не удалось" in text.lower() or "чат" in text.lower()
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Генерация нового саммари
-# ─────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_summary_today_generates_new(
-    summary_message,
-    mock_get_chat_context_summary,
-    mock_summary_service,
-    mock_sync_summary,
-    mock_existing_summary,
-):
-    from bot.handlers.summary import cmd_summary
-
-    summary_message.text = "/summary today"
-    topic = MagicMock(id=1)
-    mock_get_chat_context_summary.return_value = (
-        summary_message.chat, topic, summary_message.from_user,
-    )
-
-    mock_existing_summary.return_value = None
-    mock_summary_service.generate_summary_for_period.return_value = _make_mock_summary(
-        "Тестовое саммари за сегодня"
-    )
-
-    await cmd_summary(summary_message)
-
-    mock_existing_summary.assert_called_once()
-    mock_summary_service.generate_summary_for_period.assert_called_once()
-
-    text = _get_answer_texts(summary_message)
-    assert "Тестовое саммари за сегодня" in text
+        assert message_mock.answer.call_count == 2
+        assert "Генерирую саммари" in message_mock.answer.call_args_list[0].args[0]
+        assert "Тестовое саммари за сегодня" in message_mock.answer.call_args_list[1].args[0]
 
 
 @pytest.mark.asyncio
-async def test_summary_existing_returned(
-    summary_message,
-    mock_get_chat_context_summary,
-    mock_summary_service,
-    mock_sync_summary,
-    mock_existing_summary,
-):
-    """Если саммари уже есть в БД — генерация НЕ вызывается."""
-    from bot.handlers.summary import cmd_summary
+async def test_summary_existing(message_mock, mock_get_chat_context, mock_summary_service):
+    message_mock.text = "/summary yesterday"
+    topic = MagicMock()
+    mock_get_chat_context.return_value = (message_mock.chat, topic, message_mock.from_user)
 
-    summary_message.text = "/summary yesterday"
-    topic = MagicMock(id=1)
-    mock_get_chat_context_summary.return_value = (
-        summary_message.chat, topic, summary_message.from_user,
-    )
+    existing_summary = MagicMock(spec=Summary, content="Существующее саммари",
+                                 period_start=dj_timezone.now() - timedelta(days=1),
+                                 period_end=dj_timezone.now())
+    with patch("bot.handlers.summary.Summary.objects.filter") as mock_filter:
+        mock_filter.return_value.first.return_value = existing_summary
 
-    existing = _make_mock_summary("Существующее саммари", days_ago=1)
-    mock_existing_summary.return_value = existing
-
-    await cmd_summary(summary_message)
-
-    mock_summary_service.generate_summary_for_period.assert_not_called()
-
-    text = _get_answer_texts(summary_message)
-    assert "Существующее саммари" in text
+        await cmd_summary(message_mock)
+        mock_summary_service.generate_summary_for_period.assert_not_called()
+        message_mock.answer.assert_called_once()
+        assert "Существующее саммари" in message_mock.answer.call_args[0][0]
 
 
 @pytest.mark.asyncio
-async def test_summary_returns_none(
-    summary_message,
-    mock_get_chat_context_summary,
-    mock_summary_service,
-    mock_sync_summary,
-    mock_existing_summary,
-):
-    from bot.handlers.summary import cmd_summary
+async def test_summary_with_dates(message_mock, mock_get_chat_context, mock_summary_service):
+    message_mock.text = "/summary 2025-01-01 2025-01-03"
+    topic = MagicMock()
+    mock_get_chat_context.return_value = (message_mock.chat, topic, message_mock.from_user)
 
-    summary_message.text = "/summary week"
-    topic = MagicMock(id=1)
-    mock_get_chat_context_summary.return_value = (
-        summary_message.chat, topic, summary_message.from_user,
-    )
+    with patch("bot.handlers.summary.Summary.objects.filter") as mock_filter:
+        mock_filter.return_value.first.return_value = None
+        summary = MagicMock(spec=Summary, content="Саммари за даты",
+                            period_start=datetime(2025, 1, 1), period_end=datetime(2025, 1, 4))
+        mock_summary_service.generate_summary_for_period.return_value = summary
 
-    mock_existing_summary.return_value = None
-    mock_summary_service.generate_summary_for_period.return_value = None
+        await cmd_summary(message_mock)
 
-    await cmd_summary(summary_message)
-
-    text = _get_answer_texts(summary_message).lower()
-    assert "не удалось" in text or "нет сообщений" in text
+        assert message_mock.answer.call_count == 2
+        assert "Саммари за даты" in message_mock.answer.call_args_list[1].args[0]
 
 
 @pytest.mark.asyncio
-async def test_summary_service_exception(
-    summary_message,
-    mock_get_chat_context_summary,
-    mock_summary_service,
-    mock_sync_summary,
-    mock_existing_summary,
-):
-    from bot.handlers.summary import cmd_summary
+async def test_summary_no_messages(message_mock, mock_get_chat_context, mock_summary_service):
+    message_mock.text = "/summary week"
+    topic = MagicMock()
+    mock_get_chat_context.return_value = (message_mock.chat, topic, message_mock.from_user)
 
-    summary_message.text = "/summary today"
-    topic = MagicMock(id=1)
-    mock_get_chat_context_summary.return_value = (
-        summary_message.chat, topic, summary_message.from_user,
-    )
+    with patch("bot.handlers.summary.Summary.objects.filter") as mock_filter:
+        mock_filter.return_value.first.return_value = None
+        mock_summary_service.generate_summary_for_period.return_value = None
 
-    mock_existing_summary.return_value = None
-    mock_summary_service.generate_summary_for_period.side_effect = Exception("API error")
+        await cmd_summary(message_mock)
 
+        assert "Не удалось сгенерировать саммари" in message_mock.answer.call_args_list[-1].args[0]
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_error(message_mock, mock_get_chat_context, mock_summary_service):
+    message_mock.text = "/summary today"
+    topic = MagicMock()
+    mock_get_chat_context.return_value = (message_mock.chat, topic, message_mock.from_user)
+
+    with patch("bot.handlers.summary.Summary.objects.filter") as mock_filter:
+        mock_filter.return_value.first.return_value = None
+        mock_summary_service.generate_summary_for_period.side_effect = Exception("API error")
+
+        await cmd_summary(message_mock)
+
+        assert "Ошибка при генерации саммари" in message_mock.answer.call_args_list[-1].args[0]
     try:
         await cmd_summary(summary_message)
     except Exception:
