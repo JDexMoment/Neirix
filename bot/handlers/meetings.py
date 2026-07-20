@@ -13,7 +13,7 @@ from django.utils import timezone
 
 from bot.states import RescheduleMeetingStates, EditMeetingStates
 from bot.utils import get_chat_context
-from core.models import Meeting
+from core.models import Meeting, MeetingRecurrence
 from core.services.meeting_service import MeetingService, _is_bot_user
 from core.services.message_buffer import MessageBuffer
 from core.services.batch_processor import BatchProcessor
@@ -23,11 +23,15 @@ from bot.keyboards.inline import (
     meeting_edit_options_keyboard,
     meeting_edit_cancel_keyboard,
     meeting_cancel_confirm_keyboard,
+    meeting_cancel_choice_keyboard,
     meeting_reschedule_cancel_keyboard,
 )
 
 # For meeting_keyboard import inside sync function
 from bot.keyboards.inline import meeting_keyboard as _meeting_keyboard
+from core.services.recurrence_service import RecurrenceService
+
+recurrence_service = RecurrenceService()
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -96,12 +100,15 @@ def _format_creator(creator) -> str:
 
 
 def _build_meeting_text(meeting: Meeting) -> str:
-    return (
+    text = (
         f"• <b>{meeting.title}</b>\n"
         f"  ⏰ {_format_meeting_time(meeting)}\n"
         f"  👥 {_format_participants(meeting)}\n"
         f"  📝 Назначил(а): {_format_creator(meeting.creator)}"
     )
+    if hasattr(meeting, 'recurrence') and meeting.recurrence:
+        text += f"\n  🔄 {meeting.recurrence.human_readable}"
+    return text
 
 
 def _build_meeting_text_sync(meeting: Meeting, meeting_id: int):
@@ -149,6 +156,8 @@ def _build_meeting_text_sync(meeting: Meeting, meeting_id: int):
         f"  👥 {p_str}\n"
         f"  📝 Назначил(а): {c_str}"
     )
+    if m.recurrence:
+        text += f"\n  🔄 {m.recurrence.human_readable}"
     return text, _meeting_keyboard(meeting_id)
 
 
@@ -312,12 +321,13 @@ async def _respond_meetings(message: Message, chat, topic, db_user, nlp_filters:
     
     await message.answer(header)
     for m in meetings:
+        has_rec = _has_recurrence(m)
         await message.answer(
             _build_meeting_text(m),
             parse_mode="HTML",
-            reply_markup=meeting_keyboard(m.id),
+            reply_markup=meeting_keyboard(m.id, has_recurrence=has_rec),
         )
-
+    
 
 async def _handle_nlp_meeting_query(message: Message, intent_type: str, filters: dict):
     """Обрабатывает NLP-запрос о встречах из личных сообщений."""
@@ -328,6 +338,27 @@ async def _handle_nlp_meeting_query(message: Message, intent_type: str, filters:
         return
     await _respond_meetings(message, chat, topic, db_user, filters)
 
+def _has_recurrence(meeting: Meeting) -> bool:
+    """Проверяет, является ли встреча частью повторяющейся серии."""
+    return bool(getattr(meeting, 'recurrence_id', None))
+
+
+def _build_meeting_text_with_recurrence(meeting: Meeting) -> str:
+    """Форматирует текст встречи, добавляя информацию о повторении."""
+    base = _build_meeting_text(meeting)
+    if _has_recurrence(meeting) and meeting.recurrence:
+        # Показываем recurrence
+        rec = meeting.recurrence
+        rec_text = rec.human_readable or f"повтор: {rec.cron_expression}"
+        # Вставляем после строки с временем
+        lines = base.split("\n")
+        new_lines = []
+        for line in lines:
+            new_lines.append(line)
+            if "⏰" in line:
+                new_lines.append(f"  🔄 {rec_text}")
+        base = "\n".join(new_lines)
+    return base
 
 @router.message(Command("meetings"))
 async def cmd_meetings(message: Message):
@@ -348,6 +379,23 @@ async def callback_meeting_cancel(callback: CallbackQuery):
     if not meeting:
         await callback.answer("Встреча не найдена.", show_alert=True)
         return
+
+    # Если встреча часть серии — показываем выбор
+    if _has_recurrence(meeting):
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply(
+            f"❓ <b>{meeting.title}</b> — это повторяющаяся встреча "
+            f"(<i>{meeting.recurrence.human_readable or 'серия'}</i>).\n\n"
+            f"Что вы хотите сделать?",
+            parse_mode="HTML",
+            reply_markup=meeting_cancel_choice_keyboard(
+                meeting_id, meeting.recurrence.id,
+            ),
+        )
+        await callback.answer()
+        return
+
+    # Обычная встреча — стандартное подтверждение
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.reply(
         f"Вы уверены, что хотите отменить встречу <b>{meeting.title}</b>?",
@@ -670,6 +718,8 @@ async def callback_meeting_edit_title(callback: CallbackQuery, state: FSMContext
     )
     await callback.answer()
 
+def _should_apply_to_series(state_data: dict) -> bool:
+    return state_data.get("edit_is_series", False)
 
 @router.message(EditMeetingStates.waiting_for_title)
 async def process_edit_meeting_title(message: Message, state: FSMContext):
@@ -696,6 +746,13 @@ async def process_edit_meeting_title(message: Message, state: FSMContext):
 
     old_title = data.get("edit_old_title", "")
     success = await meeting_service.update_title(meeting_id, new_title)
+    # Если редактируем всю серию — обновляем название во всех будущих
+    if _should_apply_to_series(data) and success:
+        meeting = await meeting_service.get_meeting_by_id(meeting_id)
+        if meeting and meeting.recurrence_id:
+            rec = await sync_to_async(MeetingRecurrence.objects.get)(id=meeting.recurrence_id)
+            await recurrence_service.update_series_title(rec, new_title)
+            logger.info("Series title updated for rec_id=%s", meeting.recurrence_id)
     await state.clear()
 
     if success:
@@ -782,6 +839,13 @@ async def process_edit_participants(message: Message, state: FSMContext):
 
     old_participants_str = data.get("edit_old_participants", "")
     success = await meeting_service.update_participants(meeting_id, usernames)
+    # Если редактируем всю серию — обновляем участников во всех будущих
+    if _should_apply_to_series(data) and success:
+        meeting = await meeting_service.get_meeting_by_id(meeting_id)
+        if meeting and meeting.recurrence_id:
+            rec = await sync_to_async(MeetingRecurrence.objects.get)(id=meeting.recurrence_id)
+            await recurrence_service.update_series_participants(rec, usernames)
+            logger.info("Series participants updated for rec_id=%s", meeting.recurrence_id)
     await state.clear()
 
     if success:
@@ -830,6 +894,180 @@ async def process_edit_participants(message: Message, state: FSMContext):
             send_meeting_assigned_notification.delay(meeting_id)
     else:
         await message.answer("❌ Не удалось обновить участников.")
+
+# ── Отмена ОДНОЙ встречи из серии ──
+
+@router.callback_query(F.data.startswith("meeting_cancel_single:"))
+async def callback_meeting_cancel_single(callback: CallbackQuery):
+    """Отменяет только одну встречу (серия продолжается)."""
+    try:
+        meeting_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+
+    meeting = await meeting_service.get_meeting_by_id(meeting_id)
+    if not meeting:
+        await callback.answer("Встреча не найдена.", show_alert=True)
+        return
+
+    success = await recurrence_service.cancel_single_meeting(meeting)
+    if success:
+        await callback.answer("✅ Встреча отменена. Серия продолжается.")
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        try:
+            if callback.message.reply_to_message:
+                await callback.message.reply_to_message.delete()
+        except Exception:
+            pass
+    else:
+        await callback.answer("❌ Не удалось отменить встречу.", show_alert=True)
+
+
+# ── Отмена ВСЕЙ серии встреч ──
+
+@router.callback_query(F.data.startswith("meeting_cancel_series:"))
+async def callback_meeting_cancel_series(callback: CallbackQuery):
+    """Отменяет всю серию повторяющихся встреч."""
+    try:
+        meeting_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+
+    meeting = await meeting_service.get_meeting_by_id(meeting_id)
+    if not meeting:
+        await callback.answer("Встреча не найдена.", show_alert=True)
+        return
+
+    recurrence_id = meeting.recurrence_id
+    if not recurrence_id:
+        await callback.answer("Эта встреча не является частью серии.", show_alert=True)
+        return
+
+    # Показываем подтверждение
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply(
+        f"🛑 <b>Отмена всей серии</b>\n\n"
+        f"Вы уверены, что хотите отменить ВСЕ повторения встречи "
+        f"<b>{meeting.title}</b>?\n\n"
+        f"Все будущие встречи этой серии будут отменены.",
+        parse_mode="HTML",
+        reply_markup=meeting_cancel_confirm_keyboard(meeting_id),
+    )
+    await callback.answer()
+
+
+# Новая кнопка подтверждения для отмены всей серии
+@router.callback_query(F.data.startswith("meeting_cancel_series_confirm:"))
+async def callback_meeting_cancel_series_confirm(callback: CallbackQuery):
+    """Подтверждает отмену всей серии встреч."""
+    try:
+        meeting_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+
+    meeting = await meeting_service.get_meeting_by_id(meeting_id)
+    if not meeting or not meeting.recurrence_id:
+        await callback.answer("Серия не найдена.", show_alert=True)
+        return
+
+    success = await recurrence_service.cancel_meeting_series(meeting.recurrence_id)
+    if success:
+        await callback.answer("✅ Серия встреч отменена!")
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        try:
+            if callback.message.reply_to_message:
+                await callback.message.reply_to_message.delete()
+        except Exception:
+            pass
+
+        await callback.message.answer(
+            f"🛑 Серия встреч <b>{meeting.title}</b> отменена.\n\n"
+            f"Новые встречи создаваться не будут.",
+            parse_mode="HTML",
+        )
+    else:
+        await callback.answer("❌ Не удалось отменить серию.", show_alert=True)
+
+
+# ── Назад из выбора отмены ──
+
+@router.callback_query(F.data.startswith("meeting_back_single:"))
+async def callback_meeting_back_single(callback: CallbackQuery):
+    """Возвращает к просмотру встречи (из выбора отмены)."""
+    try:
+        meeting_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Ошибка.")
+        return
+    await _restore_meeting_from_simple(callback, meeting_id)
+    await callback.answer()
+
+
+async def _restore_meeting_from_simple(callback, meeting_id):
+    meeting = await meeting_service.get_meeting_by_id(meeting_id)
+    if meeting:
+        try:
+            # Удаляем сообщение с выбором
+            await callback.message.delete()
+        except Exception:
+            pass
+        try:
+            if callback.message.reply_to_message:
+                text, markup = await sync_to_async(_build_meeting_text_sync)(meeting, meeting_id)
+                await callback.bot.edit_message_text(
+                    text,
+                    chat_id=callback.message.reply_to_message.chat.id,
+                    message_id=callback.message.reply_to_message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+        except Exception as e:
+            logger.warning("Failed to restore meeting: %s", e)
+
+
+# ── Редактирование серии встреч ──
+
+@router.callback_query(F.data.startswith("meeting_edit_series:"))
+async def callback_meeting_edit_series(callback: CallbackQuery, state: FSMContext):
+    """Редактирование всей серии встреч."""
+    try:
+        meeting_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+
+    meeting = await meeting_service.get_meeting_by_id(meeting_id)
+    if not meeting or not meeting.recurrence_id:
+        await callback.answer("Эта встреча не является частью серии.", show_alert=True)
+        return
+
+    helper = await callback.message.answer(
+        f"🔄 <b>Редактирование серии: {meeting.title}</b>\n\n"
+        f"Изменения применятся ко ВСЕМ будущим встречам этой серии.\n\n"
+        f"Что хотите изменить?",
+        parse_mode="HTML",
+        reply_markup=meeting_edit_options_keyboard(meeting_id, has_recurrence=True),
+    )
+    await callback.answer()
+
+    await state.set_state(EditMeetingStates.waiting_for_choice)
+    await state.update_data(
+        edit_meeting_id=meeting_id,
+        edit_original_chat_id=callback.message.chat.id,
+        edit_original_msg_id=callback.message.message_id,
+        edit_helper_chat_id=helper.chat.id,
+        edit_helper_msg_id=helper.message_id,
+        edit_is_series=True,  # ← Флаг: редактируем ВСЮ серию
+    )
 
 
 def _notify_meeting_changed(meeting, change_text):

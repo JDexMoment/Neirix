@@ -85,11 +85,13 @@ class Task(models.Model):
     description = models.TextField(blank=True)
     topic = models.ForeignKey(Topic, on_delete=models.CASCADE)
     due_date = models.DateTimeField(null=True, blank=True)
+
     status = models.CharField(max_length=20, default='open', choices=[
         ('open', 'В работе'),
         ('done', 'Выполнено'),
         ('cancelled', 'Отменено')
     ])
+
     source_message = models.ForeignKey(Message, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата выполнения")
@@ -99,6 +101,18 @@ class Task(models.Model):
     daily_reminder_sent = models.BooleanField(default=False)
     # Напоминание о просрочке 
     overdue_reminder_sent = models.BooleanField(default=False)
+
+     # ── Повторяющиеся задачи ──
+    is_template = models.BooleanField(
+        default=False,
+        verbose_name="Шаблон серии",
+        help_text="True = задача-шаблон для повторяющейся серии",
+    )
+    recurrence_group_id = models.UUIDField(
+        null=True, blank=True,
+        verbose_name="ID группы повторений",
+        help_text="Все задачи одной серии имеют одинаковый group_id",
+    )
 
     class Meta:
         indexes = [
@@ -160,6 +174,15 @@ class Meeting(models.Model):
     # Напоминание за сутки до встречи
     daily_reminder_sent = models.BooleanField(default=False)
 
+    # ── Связь с повторяющейся серией ──
+    recurrence = models.ForeignKey(
+        'MeetingRecurrence',
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='instances',
+        verbose_name="Серия повторений",
+    )
+
     def __str__(self):
         return f"{self.title} at {self.start_at}"
 
@@ -177,3 +200,121 @@ class Summary(models.Model):
 
     def __str__(self):
         return f"Summary for {self.topic} ({self.period_start.date()} - {self.period_end.date()})"
+    
+
+class TaskRecurrence(models.Model):
+    """
+    Привязка к задаче-шаблону.
+    Когда задача с TaskRecurrence отмечается как done,
+    создаётся следующая задача по расписанию.
+    """
+    task = models.OneToOneField(
+        Task, on_delete=models.CASCADE,
+        related_name='recurrence',
+        verbose_name="Задача-шаблон",
+    )
+    cron_expression = models.CharField(
+        max_length=100,
+        verbose_name="Cron-выражение",
+        help_text="Пример: '0 18 * * 5' — каждая пятница в 18:00",
+    )
+    human_readable = models.CharField(
+        max_length=255, blank=True, default="",
+        verbose_name="Человекочитаемое описание",
+        help_text="Пример: 'каждую пятницу в 18:00'",
+    )
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name="Активна",
+    )
+    next_occurrence = models.DateTimeField(
+        verbose_name="Следующее выполнение",
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name="Создано",
+    )
+
+    class Meta:
+        verbose_name = "Повторение задачи"
+        verbose_name_plural = "Повторения задач"
+        ordering = ["-next_occurrence"]
+
+    def __str__(self):
+        return f"TaskRecurrence({self.task.title}, {self.human_readable or self.cron_expression})"
+
+
+# ──┐
+#   ├─ Повторяющиеся встречи
+#   └─
+
+class MeetingRecurrence(models.Model):
+    """
+    Шаблон повторяющейся встречи.
+    Хранит расписание и создаёт инстансы Meeting заранее.
+    """
+    title = models.CharField(max_length=500, verbose_name="Название")
+    description = models.TextField(blank=True, default="", verbose_name="Описание")
+    topic = models.ForeignKey(
+        Topic, on_delete=models.CASCADE,
+        verbose_name="Топик",
+    )
+    creator = models.ForeignKey(
+        TelegramUser, null=True, on_delete=models.SET_NULL,
+        verbose_name="Создатель",
+    )
+    cron_expression = models.CharField(
+        max_length=100,
+        verbose_name="Cron-выражение",
+        help_text="Пример: '0 10 * * 1' — каждый понедельник в 10:00",
+    )
+    human_readable = models.CharField(
+        max_length=255, blank=True, default="",
+        verbose_name="Человекочитаемое описание",
+        help_text="Пример: 'каждый понедельник в 10:00'",
+    )
+    duration_minutes = models.IntegerField(
+        default=60,
+        verbose_name="Длительность (мин)",
+    )
+    is_all_hands = models.BooleanField(
+        default=False,
+        verbose_name="Для всех участников",
+    )
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name="Активна",
+    )
+    source_message = models.ForeignKey(
+        Message, null=True, on_delete=models.SET_NULL,
+        verbose_name="Исходное сообщение",
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name="Создано",
+    )
+
+    class Meta:
+        verbose_name = "Серия встреч"
+        verbose_name_plural = "Серии встреч"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"MeetingRecurrence({self.title}, {self.human_readable or self.cron_expression})"
+
+
+class MeetingRecurrenceParticipant(models.Model):
+    """Участники повторяющейся встречи (применяются ко всем инстансам)."""
+    recurring_meeting = models.ForeignKey(
+        MeetingRecurrence, on_delete=models.CASCADE,
+        related_name='participant_links',
+    )
+    user = models.ForeignKey(TelegramUser, on_delete=models.CASCADE)
+
+    class Meta:
+        verbose_name = "Участник серии встреч"
+        verbose_name_plural = "Участники серий встреч"
+        unique_together = [("recurring_meeting", "user")]
+
+    def __str__(self):
+        return f"{self.user} → {self.recurring_meeting.title}"

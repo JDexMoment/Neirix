@@ -10,15 +10,19 @@ from aiogram.types import Message, CallbackQuery
 from asgiref.sync import sync_to_async
 from django.utils import timezone
 
-from core.models import Task, TelegramUser
+from core.models import Task, TelegramUser, TaskRecurrence
 from core.services.task_service import TaskService, _is_bot_user
 from bot.utils import get_chat_context
 from bot.keyboards.inline import (
     task_keyboard,
     task_edit_options_keyboard,
     task_edit_cancel_keyboard,
+    task_cancel_series_confirm_keyboard
 )
 from bot.states import EditTaskStates
+from core.services.recurrence_service import RecurrenceService
+
+recurrence_service = RecurrenceService()
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -122,12 +126,18 @@ def _build_task_text(task: Task) -> str:
         f"{_format_due_date(task)}\n"
         f"📝 Назначил(а): {_format_creator(task.creator)}"
     )
+    if task.is_template and hasattr(task, 'recurrence') and task.recurrence:
+        text += f"\n🔄 {task.recurrence.human_readable}"
+    elif task.is_template:
+        # Нет загруженного recurrence — показываем, что это шаблон
+        text += f"\n🔄 Повторяющаяся"
     if task.status == "done" and hasattr(task, 'completed_at') and task.completed_at:
         dt = task.completed_at
         if timezone.is_aware(dt):
             dt = timezone.localtime(dt)
         text += f"\n✅ Выполнено: {dt.strftime('%d.%m.%Y %H:%M')}"
     return text
+
 
 
 def _parse_task_filters(text: str, user: TelegramUser) -> dict:
@@ -262,10 +272,11 @@ async def _respond_tasks(message: Message, chat, topic, db_user, filters: dict):
         return
     
     for i, task in enumerate(tasks, 1):
+        has_rec = task.is_template and task.recurrence_group_id is not None
         await message.answer(
             f"{i}. {_build_task_text(task)}",
             parse_mode="HTML",
-            reply_markup=task_keyboard(task.id),
+            reply_markup=task_keyboard(task.id, has_recurrence=has_rec),
         )
 
 
@@ -483,6 +494,9 @@ async def callback_task_edit_title(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+def _should_apply_to_series(state_data: dict) -> bool:
+    """Проверяет, редактируем ли мы всю серию."""
+    return state_data.get("edit_is_series", False)
 
 @router.message(EditTaskStates.waiting_for_title)
 async def process_edit_title(message: Message, state: FSMContext):
@@ -509,6 +523,21 @@ async def process_edit_title(message: Message, state: FSMContext):
 
     old_title = data.get("edit_old_title", "")
     success = await task_service.update_title(task_id, new_title)
+    # Если редактируем всю серию — обновляем название во всех будущих
+    if _should_apply_to_series(data) and success:
+        task = await task_service.get_task_by_id(task_id)
+        if task and task.recurrence_group_id:
+            from core.services.recurrence_service import RecurrenceService
+            rec_svc = RecurrenceService()
+            # Обновляем название во всех будущих задачах серии
+            def _update_series_titles():
+                from core.models import Task
+                Task.objects.filter(
+                    recurrence_group_id=task.recurrence_group_id,
+                    status="open",
+                ).exclude(id=task_id).update(title=new_title)
+            await sync_to_async(_update_series_titles)()
+            logger.info("Series title updated for group %s", task.recurrence_group_id)
     await state.clear()
 
     if success:
@@ -702,6 +731,22 @@ async def process_edit_assignee(message: Message, state: FSMContext):
 
     old_assignees_str = data.get("edit_old_assignees", "")
     success = await task_service.update_assignees(task_id, usernames)
+    # Если редактируем всю серию — обновляем исполнителей во всех будущих
+    if _should_apply_to_series(data) and success:
+        task = await task_service.get_task_by_id(task_id)
+        if task and task.recurrence_group_id:
+            def _update_series_assignees():
+                from core.models import Task, TaskAssignee
+                future_tasks = Task.objects.filter(
+                    recurrence_group_id=task.recurrence_group_id,
+                    status="open",
+                ).exclude(id=task_id)
+                for ft in future_tasks:
+                    ft.assignees.all().delete()
+                    for ta in task.assignees.all():
+                        TaskAssignee.objects.create(task=ft, user=ta.user)
+            await sync_to_async(_update_series_assignees)()
+            logger.info("Series assignees updated for group %s", task.recurrence_group_id)
     await state.clear()
 
     if success:
@@ -751,6 +796,113 @@ async def process_edit_assignee(message: Message, state: FSMContext):
             _notify_task_changed(task, None, None, old_assignees_str, new_assignees_str)
     else:
         await message.answer("❌ Не удалось обновить исполнителя.")
+
+# ── Отмена серии задач ──
+
+@router.callback_query(F.data.startswith("task_cancel_series:"))
+async def callback_task_cancel_series(callback: CallbackQuery):
+    """Показывает подтверждение отмены всей серии."""
+    try:
+        task_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+
+    task = await task_service.get_task_by_id(task_id)
+    if not task:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
+
+    # Проверяем, действительно ли это часть серии
+    if not task.recurrence_group_id:
+        await callback.answer("Эта задача не является частью серии.", show_alert=True)
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply(
+        f"🛑 <b>Отмена всей серии</b>\n\n"
+        f"Вы уверены, что хотите отменить ВСЕ повторения задачи "
+        f"<b>{task.title}</b>?\n\n"
+        f"Все будущие задачи этой серии будут отменены.",
+        parse_mode="HTML",
+        reply_markup=task_cancel_series_confirm_keyboard(task_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("task_cancel_series_confirm:"))
+async def callback_task_cancel_series_confirm(callback: CallbackQuery):
+    """Подтверждает отмену всей серии."""
+    try:
+        task_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+
+    task = await task_service.get_task_by_id(task_id)
+    if not task:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
+
+    success = await recurrence_service.cancel_task_series(task)
+    if success:
+        await callback.answer("✅ Серия задач отменена!")
+        try:
+            # Удаляем сообщение-подтверждение
+            await callback.message.delete()
+        except Exception:
+            pass
+        try:
+            # Удаляем оригинал
+            if callback.message.reply_to_message:
+                await callback.message.reply_to_message.delete()
+        except Exception:
+            pass
+
+        await callback.message.answer(
+            f"🛑 Серия задач <b>{task.title}</b> отменена.\n\n"
+            f"Новые задачи создаваться не будут. "
+            f"Если понадобится — просто создайте новую задачу с таким же названием.",
+            parse_mode="HTML",
+        )
+    else:
+        await callback.answer("❌ Не удалось отменить серию.", show_alert=True)
+
+
+# ── Редактирование серии задач ──
+
+@router.callback_query(F.data.startswith("task_edit_series:"))
+async def callback_task_edit_series(callback: CallbackQuery, state: FSMContext):
+    """Редактирование всей серии (название, исполнители, срок)."""
+    try:
+        task_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+
+    task = await task_service.get_task_by_id(task_id)
+    if not task:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
+
+    helper = await callback.message.answer(
+        f"🔄 <b>Редактирование серии: {task.title}</b>\n\n"
+        f"Изменения применятся ко ВСЕМ будущим задачам этой серии.\n\n"
+        f"Что хотите изменить?",
+        parse_mode="HTML",
+        reply_markup=task_edit_options_keyboard(task_id, has_recurrence=True),
+    )
+    await callback.answer()
+
+    await state.set_state(EditTaskStates.waiting_for_choice)
+    await state.update_data(
+        edit_task_id=task_id,
+        edit_original_chat_id=callback.message.chat.id,
+        edit_original_msg_id=callback.message.message_id,
+        edit_helper_chat_id=helper.chat.id,
+        edit_helper_msg_id=helper.message_id,
+        edit_is_series=True,  # ← Флаг: редактируем ВСЮ серию
+    )
 
 
 def _notify_task_changed(task, old_due=None, new_due=None, old_assign=None, new_assign=None, old_title=None, new_title=None):

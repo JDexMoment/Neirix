@@ -40,24 +40,6 @@ def _can_create_in_chat(user: TelegramUser, chat: TelegramChat) -> bool:
     return user_role in ("manager", "admin")
 
 
-async def _handle_private_nlp(message: Message) -> bool:
-    """
-    Пытается распознать естественно-языковый запрос в личном сообщении
-    через GigaChat. Возвращает True, если запрос обработан.
-    """
-    if message.chat.type != "private":
-        return False
-    
-    from core.services.nlp_router import detect_intent, handle_nlp_command
-    
-    nlp_result = await detect_intent(message.text or "")
-    if not nlp_result:
-        return False
-    
-    logger.info("NLP query: %s", nlp_result)
-    return await handle_nlp_command(message, nlp_result)
-
-
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_text_message(message: Message):
     """
@@ -154,8 +136,17 @@ async def handle_text_message(message: Message):
     db_message, db_user, chat = await save_message()
 
     # ═══ В ЛС — сначала проверяем NLP-запрос ═══
-    if await _handle_private_nlp(message):
-        return  # запрос обработан, не буферизируем
+    if message.chat.type == "private":
+        from celery_app.tasks.nlp_processing import process_nlp_message
+        process_nlp_message.delay(
+            chat_id=message.chat.id,
+            user_telegram_id=message.from_user.id,
+            text=message.text or "",
+            db_message_id=db_message.id,
+            telegram_msg_id=message.message_id,
+            message_thread_id=message.message_thread_id or 0,
+        )
+        return 
 
     # ═══ Проверка прав: только manager/admin попадают в буфер ═══
     can_create = await sync_to_async(_can_create_in_chat)(db_user, chat)

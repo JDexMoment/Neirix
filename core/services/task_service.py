@@ -9,6 +9,8 @@ from asgiref.sync import sync_to_async
 
 from core.models import Task, TelegramUser, Message, TaskAssignee, Topic
 from core.services.permissions import user_can_create
+from core.services.recurrence_service import RecurrenceService, parse_recurrence
+
 
 if TYPE_CHECKING:
     from core.utils.llm_client import LLMClient
@@ -197,6 +199,24 @@ class TaskService:
                            task.id if task else "pending", user.id, user.username)
                 await sync_to_async(TaskAssignee.objects.create)(task=task, user=user)
 
+            # ════════════════════════════════════════════════════════════
+            # Повторяющиеся задачи: если LLM вернула recurrence
+            # ════════════════════════════════════════════════════════════
+            recurrence_raw = task_data.get("recurrence")
+            if recurrence_raw:
+                parsed = parse_recurrence(str(recurrence_raw))
+                if parsed:
+                    rec_svc = RecurrenceService()
+                    await rec_svc.create_recurring_task(
+                        task=task,
+                        cron_expression=parsed["cron"],
+                        human_readable=parsed["human"],
+                    )
+                    logger.info(
+                        "Recurring task created | task_id=%s cron=%s human=%s",
+                        task.id, parsed["cron"], parsed["human"],
+                    )
+
             return task
 
         except Exception as e:
@@ -304,7 +324,31 @@ class TaskService:
                 return True
             except Task.DoesNotExist:
                 return False
-        return await sync_to_async(_update)()
+
+        # Сначала выполняем синхронную часть (статус)
+        result = await sync_to_async(_update)()
+        if not result:
+            return False
+
+        # ═══ АСИНХРОННАЯ часть: проверяем рекурренс (НЕ внутри _update!) ═══
+        try:
+            task = await sync_to_async(Task.objects.get)(id=task_id)
+            rec_svc = RecurrenceService()
+            new_task = await rec_svc.on_task_completed(task)
+            if new_task:
+                logger.info(
+                    "Next recurring task created | prev_task_id=%s new_task_id=%s due=%s",
+                    task.id, new_task.id, new_task.due_date,
+                )
+                try:
+                    from celery_app.tasks.send_reminders import send_task_assigned_notification
+                    send_task_assigned_notification.delay(new_task.id)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error("Failed to process recurrence for task %s: %s", task_id, e, exc_info=True)
+
+        return True
 
     # ── Редактирование задачи ────────────────────────────────────
 

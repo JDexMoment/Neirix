@@ -9,6 +9,8 @@ from asgiref.sync import sync_to_async
 
 from core.models import Meeting, TelegramUser, Message, Topic
 from core.services.permissions import user_can_create
+from core.services.recurrence_service import RecurrenceService, parse_recurrence
+
 
 if TYPE_CHECKING:
     from core.utils.llm_client import LLMClient
@@ -218,7 +220,29 @@ class MeetingService:
                 for user in participant_objects:
                     await sync_to_async(meeting.participants.add)(user)
 
-            # ═══ Передаём флаг has_all через Python-атрибут ═══
+                    # ════════════════════════════════════════════════════════════
+            # Повторяющиеся встречи: если LLM вернула recurrence
+            # ════════════════════════════════════════════════════════════
+            recurrence_raw = meeting_data.get("recurrence")
+            if recurrence_raw:
+                parsed = parse_recurrence(str(recurrence_raw))
+                if parsed:
+                    rec_svc = RecurrenceService()
+                    await rec_svc.create_recurring_meeting(
+                        title=clean_title,
+                        topic=topic,
+                        creator=source_message.author,
+                        cron_expression=parsed["cron"],
+                        human_readable=parsed["human"],
+                        participants=participant_objects,
+                        source_message=source_message,
+                        is_all_hands=has_all,
+                        instance_count=2,  # создаём 2 будущих встречи
+                    )
+                    logger.info(
+                        "Recurring meeting created | title=%s cron=%s human=%s",
+                        clean_title, parsed["cron"], parsed["human"],
+                    )
 
             return meeting
 
