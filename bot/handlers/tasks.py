@@ -10,14 +10,15 @@ from aiogram.types import Message, CallbackQuery
 from asgiref.sync import sync_to_async
 from django.utils import timezone
 
-from core.models import Task, TelegramUser, TaskRecurrence
+from core.models import Task, TelegramUser
 from core.services.task_service import TaskService, _is_bot_user
 from bot.utils import get_chat_context
 from bot.keyboards.inline import (
     task_keyboard,
     task_edit_options_keyboard,
     task_edit_cancel_keyboard,
-    task_cancel_series_confirm_keyboard
+    task_cancel_series_confirm_keyboard,
+    task_edit_series_choice_keyboard,
 )
 from bot.states import EditTaskStates
 from core.services.recurrence_service import RecurrenceService
@@ -119,25 +120,23 @@ def _format_creator(creator) -> str:
     return creator.full_name or f"id={creator.id}"
 
 
-def _build_task_text(task: Task) -> str:
+def _build_task_text(task: Task, recurrence_text: str = None) -> str:
     text = (
         f"<b>{task.title}</b>\n"
         f"👤 {_format_assignees(task)}\n"
         f"{_format_due_date(task)}\n"
         f"📝 Назначил(а): {_format_creator(task.creator)}"
     )
-    if task.is_template and hasattr(task, 'recurrence') and task.recurrence:
-        text += f"\n🔄 {task.recurrence.human_readable}"
-    elif task.is_template:
-        # Нет загруженного recurrence — показываем, что это шаблон
+    if recurrence_text:
+        text += f"\n🔄 {recurrence_text}"
+    elif task.recurrence_group_id:
         text += f"\n🔄 Повторяющаяся"
-    if task.status == "done" and hasattr(task, 'completed_at') and task.completed_at:
+    if task.status == "done" and getattr(task, 'completed_at', None):
         dt = task.completed_at
         if timezone.is_aware(dt):
             dt = timezone.localtime(dt)
         text += f"\n✅ Выполнено: {dt.strftime('%d.%m.%Y %H:%M')}"
     return text
-
 
 
 def _parse_task_filters(text: str, user: TelegramUser) -> dict:
@@ -150,7 +149,7 @@ def _parse_task_filters(text: str, user: TelegramUser) -> dict:
     tomorrow_end = tomorrow_start + timedelta(days=1)
     week_end = today_start + timedelta(days=7)
     parts = text.lower().split()
-    
+
     for part in parts:
         if part in ("overdue", "просрочено", "просроченные"):
             filters["status"] = "open"
@@ -173,7 +172,7 @@ def _parse_task_filters(text: str, user: TelegramUser) -> dict:
             filters["my"] = True
         elif part.startswith("@"):
             filters["assignee_username"] = part.lstrip("@")
-    
+
     return filters
 
 
@@ -182,12 +181,12 @@ def _apply_task_filters(tasks: list, filters: dict, user: TelegramUser) -> list:
     result = []
     for task in tasks:
         include = True
-        
+
         # Статус (если не указан — только open)
         status = filters.get("status", "open")
         if task.status != status:
             include = False
-        
+
         # Due date
         due_from = filters.get("due_date__gte")
         due_to = filters.get("due_date__lt")
@@ -199,7 +198,7 @@ def _apply_task_filters(tasks: list, filters: dict, user: TelegramUser) -> list:
             # overdue filter
             if not task.due_date or task.due_date >= filters["due_date__lt"]:
                 include = False
-        
+
         # @username
         username = filters.get("assignee_username")
         if username:
@@ -211,21 +210,49 @@ def _apply_task_filters(tasks: list, filters: dict, user: TelegramUser) -> list:
                     break
             if not found:
                 include = False
-        
+
         # My tasks (in group)
         if filters.get("my") and user not in [a.user for a in task.assignees.all()]:
             include = False
-        
+
         if include:
             result.append(task)
-    
+
     return result
+
+
+def _filter_recurring_tasks(tasks: list) -> list:
+    """Оставляет только одну задачу из каждой серии (ближайшую)."""
+    seen_group_ids = set()
+    result = []
+    for t in tasks:
+        gid = t.recurrence_group_id
+        if gid:
+            if gid in seen_group_ids:
+                continue
+            seen_group_ids.add(gid)
+        result.append(t)
+    return result
+
+
+async def _get_recurrence_text(task: Task) -> str:
+    """Загружает human_readable из TaskRecurrence по recurrence_group_id."""
+    if not task.recurrence_group_id:
+        return None
+    from core.models import TaskRecurrence
+    rec = await sync_to_async(
+        lambda: TaskRecurrence.objects.filter(
+            task__recurrence_group_id=task.recurrence_group_id,
+            is_active=True
+        ).values_list("human_readable", flat=True).first()
+    )()
+    return rec
 
 
 async def _respond_tasks(message: Message, chat, topic, db_user, filters: dict):
     """Отвечает пользователю списком задач с учётом фильтров."""
     wants_done = filters.get("status") == "done"
-    
+
     if message.chat.type == "private":
         if wants_done:
             tasks = await sync_to_async(_get_all_tasks_for_private)(db_user)
@@ -246,35 +273,41 @@ async def _respond_tasks(message: Message, chat, topic, db_user, filters: dict):
             base_header = "📋 Мои выполненные задачи"
         else:
             base_header = f"📋 Задачи чата {chat.title}"
-    
+
     if filters:
         tasks = _apply_task_filters(tasks, filters, db_user)
-    
+
     suffix = filters.get("header_suffix", "")
     header = f"{base_header} {suffix}:".strip() if suffix else f"{base_header}:"
-    
+
     if not tasks:
         await message.answer("Нет задач, соответствующих фильтру.")
         return
     await message.answer(header)
-    
+
+    # ═══ Показываем только одну задачу из каждой серии ═══
+    if not wants_done:
+        tasks = _filter_recurring_tasks(tasks)
+
     if wants_done:
         lines = []
         total = len(tasks)
         shown = tasks[:10] if total > 10 else tasks
         for i, task in enumerate(shown, 1):
-            lines.append(f"{i}. {_build_task_text(task)}")
+            rec_text = await _get_recurrence_text(task)
+            lines.append(f"{i}. {_build_task_text(task, rec_text)}")
             lines.append("")
         text = "\n".join(lines).rstrip("\n")
         if total > 10:
             text += f"\n\n... и ещё {total - 10} выполненных задач"
         await message.answer(text, parse_mode="HTML")
         return
-    
+
     for i, task in enumerate(tasks, 1):
-        has_rec = task.is_template and task.recurrence_group_id is not None
+        rec_text = await _get_recurrence_text(task)
+        has_rec = task.recurrence_group_id is not None
         await message.answer(
-            f"{i}. {_build_task_text(task)}",
+            f"{i}. {_build_task_text(task, rec_text)}",
             parse_mode="HTML",
             reply_markup=task_keyboard(task.id, has_recurrence=has_rec),
         )
@@ -287,7 +320,7 @@ async def _handle_nlp_query(message: Message, intent_type: str, filters: dict):
     if not db_user:
         await message.answer("Не удалось определить пользователя.")
         return
-    
+
     # Преобразуем NLP-фильтры в формат _parse_task_filters
     task_filters = {}
     if filters.get("overdue"):
@@ -314,14 +347,14 @@ async def _handle_nlp_query(message: Message, intent_type: str, filters: dict):
         task_filters["due_date__gte"] = day_start
         task_filters["due_date__lt"] = day_start + timedelta(days=7)
         task_filters["header_suffix"] = "на эту неделю"
-    
+
     if filters.get("username"):
         task_filters["assignee_username"] = filters["username"]
     if filters.get("my"):
         task_filters["my"] = True
     if filters.get("list_all"):
         pass  # Покажем все
-    
+
     await _respond_tasks(message, chat, topic, db_user, task_filters)
 
 
@@ -398,6 +431,19 @@ async def callback_task_edit(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Задача не найдена.", show_alert=True)
         return
 
+    # ═══ Если задача часть серии — показываем выбор ═══
+    has_rec = task.recurrence_group_id is not None
+    if has_rec:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply(
+            f"❓ <b>{task.title}</b> — это повторяющаяся задача.\n\n"
+            f"Что редактировать?",
+            parse_mode="HTML",
+            reply_markup=task_edit_series_choice_keyboard(task_id),
+        )
+        await callback.answer()
+        return
+
     assignee_str = _format_assignees(task)
     due_str = _format_due_date(task)
     old_text = _build_task_text(task)
@@ -407,6 +453,44 @@ async def callback_task_edit(callback: CallbackQuery, state: FSMContext):
         f"👤 {assignee_str}\n"
         f"{due_str}\n\n"
         f"Что вы хотите изменить?",
+        parse_mode="HTML",
+        reply_markup=task_edit_options_keyboard(task_id),
+    )
+    await callback.answer()
+
+    await state.set_state(EditTaskStates.waiting_for_choice)
+    await state.update_data(
+        edit_task_id=task_id,
+        edit_original_chat_id=callback.message.chat.id,
+        edit_original_msg_id=callback.message.message_id,
+        edit_helper_chat_id=helper.chat.id,
+        edit_helper_msg_id=helper.message_id,
+        edit_old_text=old_text,
+    )
+
+
+@router.callback_query(F.data.startswith("task_edit_single:"))
+async def callback_task_edit_single(callback: CallbackQuery, state: FSMContext):
+    """Редактировать ТОЛЬКО ЭТУ задачу (не серию)."""
+    try:
+        task_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+    task = await task_service.get_task_by_id(task_id)
+    if not task:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
+
+    assignee_str = _format_assignees(task)
+    due_str = _format_due_date(task)
+    old_text = _build_task_text(task)
+
+    helper = await callback.message.answer(
+        f"✏️ <b>{task.title}</b>\n"
+        f"👤 {assignee_str}\n"
+        f"{due_str}\n\n"
+        f"Что вы хотите изменить? (только эта задача)",
         parse_mode="HTML",
         reply_markup=task_edit_options_keyboard(task_id),
     )
@@ -494,9 +578,11 @@ async def callback_task_edit_title(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+
 def _should_apply_to_series(state_data: dict) -> bool:
     """Проверяет, редактируем ли мы всю серию."""
     return state_data.get("edit_is_series", False)
+
 
 @router.message(EditTaskStates.waiting_for_title)
 async def process_edit_title(message: Message, state: FSMContext):
@@ -527,15 +613,22 @@ async def process_edit_title(message: Message, state: FSMContext):
     if _should_apply_to_series(data) and success:
         task = await task_service.get_task_by_id(task_id)
         if task and task.recurrence_group_id:
-            from core.services.recurrence_service import RecurrenceService
-            rec_svc = RecurrenceService()
-            # Обновляем название во всех будущих задачах серии
             def _update_series_titles():
-                from core.models import Task
                 Task.objects.filter(
                     recurrence_group_id=task.recurrence_group_id,
                     status="open",
                 ).exclude(id=task_id).update(title=new_title)
+                # ═══ Также обновляем шаблонную задачу в TaskRecurrence ═══
+                from core.models import TaskRecurrence
+                try:
+                    rec = TaskRecurrence.objects.get(
+                        task__recurrence_group_id=task.recurrence_group_id,
+                        is_active=True
+                    )
+                    if rec.task_id != task_id:
+                        Task.objects.filter(id=rec.task_id).update(title=new_title)
+                except TaskRecurrence.DoesNotExist:
+                    pass
             await sync_to_async(_update_series_titles)()
             logger.info("Series title updated for group %s", task.recurrence_group_id)
     await state.clear()
@@ -736,7 +829,7 @@ async def process_edit_assignee(message: Message, state: FSMContext):
         task = await task_service.get_task_by_id(task_id)
         if task and task.recurrence_group_id:
             def _update_series_assignees():
-                from core.models import Task, TaskAssignee
+                from core.models import Task, TaskAssignee, TaskRecurrence
                 future_tasks = Task.objects.filter(
                     recurrence_group_id=task.recurrence_group_id,
                     status="open",
@@ -745,6 +838,20 @@ async def process_edit_assignee(message: Message, state: FSMContext):
                     ft.assignees.all().delete()
                     for ta in task.assignees.all():
                         TaskAssignee.objects.create(task=ft, user=ta.user)
+                # ═══ Также обновляем шаблонную задачу в TaskRecurrence ═══
+                try:
+                    rec = TaskRecurrence.objects.get(
+                        task__recurrence_group_id=task.recurrence_group_id,
+                        is_active=True
+                    )
+                    if rec.task_id != task_id:
+                        # Копируем assignees на шаблон
+                        template_task = rec.task
+                        template_task.assignees.all().delete()
+                        for ta in task.assignees.all():
+                            TaskAssignee.objects.create(task=template_task, user=ta.user)
+                except TaskRecurrence.DoesNotExist:
+                    pass
             await sync_to_async(_update_series_assignees)()
             logger.info("Series assignees updated for group %s", task.recurrence_group_id)
     await state.clear()
@@ -796,6 +903,7 @@ async def process_edit_assignee(message: Message, state: FSMContext):
             _notify_task_changed(task, None, None, old_assignees_str, new_assignees_str)
     else:
         await message.answer("❌ Не удалось обновить исполнителя.")
+
 
 # ── Отмена серии задач ──
 
@@ -901,7 +1009,7 @@ async def callback_task_edit_series(callback: CallbackQuery, state: FSMContext):
         edit_original_msg_id=callback.message.message_id,
         edit_helper_chat_id=helper.chat.id,
         edit_helper_msg_id=helper.message_id,
-        edit_is_series=True,  # ← Флаг: редактируем ВСЮ серию
+        edit_is_series=True,
     )
 
 

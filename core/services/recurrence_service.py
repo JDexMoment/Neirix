@@ -1,9 +1,5 @@
 """
 Сервис для повторяющихся задач и встреч (Recurring Tasks & Meetings).
-
-Зависит от:
-  - core/models.py (TaskRecurrence, MeetingRecurrence, MeetingRecurrenceParticipant)
-  - Дополнительные поля: Meeting.recurrence, Task.is_template, Task.recurrence_group_id
 """
 import logging
 import uuid
@@ -27,91 +23,73 @@ logger = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────
 
 _CRON_WEEKDAYS = {
-    "monday": 1, "понедельник": 1, "пн": 1,
-    "tuesday": 2, "вторник": 2, "вт": 2,
-    "wednesday": 3, "среда": 3, "ср": 3,
-    "thursday": 4, "четверг": 4, "чт": 4,
-    "friday": 5, "пятница": 5, "пт": 5,
-    "saturday": 6, "суббота": 6, "сб": 6,
-    "sunday": 7, "воскресенье": 7, "вс": 7,
+    "monday": 1, "понедельник": 1, "понедельника": 1, "пн": 1,
+    "tuesday": 2, "вторник": 2, "вторника": 2, "вт": 2,
+    "wednesday": 3, "среда": 3, "среду": 3, "ср": 3,
+    "thursday": 4, "четверг": 4, "четверга": 4, "чт": 4,
+    "friday": 5, "пятница": 5, "пятницу": 5, "пятницы": 5, "пт": 5,
+    "saturday": 6, "суббота": 6, "субботу": 6, "сб": 6,
+    "sunday": 7, "воскресенье": 7, "воскресенья": 7, "вс": 7,
 }
 
 
 def parse_recurrence(text: str) -> Optional[dict]:
-    """
-    Парсит человекочитаемое recurrence.
-    Примеры:
-      "каждый понедельник в 10:00"
-      "каждую пятницу"
-      "каждый день в 9:00"
-      "каждое 1-е число в 12:00"
-      "каждый вторник и четверг в 11:00"
-
-    Возвращает:
-      {
-        "cron": "0 10 * * 1",
-        "human": "каждый понедельник в 10:00",
-        "period": "weekly",
-        "days_of_week": [1],
-        "hour": 10,
-        "minute": 0,
-      }
-      или None, если не распознано.
-    """
     if not text:
         return None
 
     text_lower = text.lower().strip()
-    human = text  # сохраняем оригинал
+    human = text
 
-    # Извлекаем время HH:MM
-    hour, minute = 9, 0  # default 9:00
+    hour, minute = 9, 0
     time_match = re.search(r'(\d{1,2}):(\d{2})', text_lower)
     if time_match:
         hour = int(time_match.group(1))
         minute = int(time_match.group(2))
 
-    # Определяем период
     days_of_week = []
     day_of_month = None
 
-    # Ежедневно
     if re.search(r'кажд[ыу][йю] день|ежедневно|every day|daily', text_lower):
         period = "daily"
-    # Ежемесячно по числу
     elif re.search(r'кажд[ыу][йю]\s+\d+-?[еы][еи]?\s+числ[ао]', text_lower):
         period = "monthly"
         num_match = re.search(r'(\d+)', text_lower)
         if num_match:
             day_of_month = int(num_match.group(1))
-    # Еженедельно по дням
     elif re.search(r'кажд[ыу][йю]|every|каждую|each', text_lower):
         period = "weekly"
-        # Ищем дни недели
         for word in text_lower.split():
             if word in _CRON_WEEKDAYS:
                 days_of_week.append(_CRON_WEEKDAYS[word])
-        # Если не нашли явных дней, берём "сегодня + 1 день" ? Нет, лучше день недели исходного сообщения
         if not days_of_week:
-            # Возможно "каждую неделю" без дня — ставим текущий день недели
-            # (будет переопределён при создании)
+            for key, val in _CRON_WEEKDAYS.items():
+                if key in text_lower:
+                    days_of_week.append(val)
+        if not days_of_week:
             period = "weekly"
     else:
-        return None  # Не распознано
+        return None
 
-    # Строим cron
     if period == "daily":
         cron = f"{minute} {hour} * * *"
         human_readable = f"каждый день в {hour:02d}:{minute:02d}"
     elif period == "weekly":
         if days_of_week:
-            cron_days = ",".join(str(d) for d in sorted(days_of_week))
+            cron_days = ",".join(str(d) for d in sorted(set(days_of_week)))
             cron = f"{minute} {hour} * * {cron_days}"
-            day_names = [k for k, v in _CRON_WEEKDAYS.items() if v in days_of_week and not k.isascii()]
-            day_str = ", ".join(set(day_names)) if day_names else f"день(дни) {cron_days}"
+            # Берём одно каноническое имя для каждого дня
+            day_names_raw = [k for k, v in _CRON_WEEKDAYS.items()
+                           if v in set(days_of_week) and not k.isascii()]
+            seen_nums = set()
+            day_names = []
+            for k in day_names_raw:
+                v = _CRON_WEEKDAYS[k]
+                if v not in seen_nums:
+                    seen_nums.add(v)
+                    day_names.append(k)
+            day_str = ", ".join(day_names) if day_names else f"день(дни) {cron_days}"
             human_readable = f"каждый {day_str} в {hour:02d}:{minute:02d}"
         else:
-            # Без указания дня — поставим заглушку, день будет определён при создании
             cron = f"{minute} {hour} * * *"
             human_readable = f"еженедельно в {hour:02d}:{minute:02d}"
     elif period == "monthly":
@@ -125,7 +103,7 @@ def parse_recurrence(text: str) -> Optional[dict]:
         "cron": cron,
         "human": human_readable or human,
         "period": period,
-        "days_of_week": days_of_week,
+        "days_of_week": list(set(days_of_week)),
         "day_of_month": day_of_month,
         "hour": hour,
         "minute": minute,
@@ -133,10 +111,6 @@ def parse_recurrence(text: str) -> Optional[dict]:
 
 
 def get_next_occurrence(cron_expr: str, from_date: Optional[datetime] = None) -> datetime:
-    """
-    Вычисляет следующую дату/время по упрощённому cron.
-    Поддерживает: "M H * * *", "M H * * D", "M H D * *"
-    """
     if from_date is None:
         from_date = timezone.localtime(timezone.now())
 
@@ -147,30 +121,26 @@ def get_next_occurrence(cron_expr: str, from_date: Optional[datetime] = None) ->
 
     minute = int(parts[0])
     hour = int(parts[1])
-    day_of_month = parts[2]  # "*" or number
-    day_of_week = parts[4]   # "*" or number(s)
+    day_of_month = parts[2]
+    day_of_week = parts[4]
 
     candidate = from_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-    # Если время уже прошло сегодня — начинаем с завтра
     if candidate <= from_date:
         candidate += timedelta(days=1)
 
-    # Ежедневно
     if day_of_month == "*" and day_of_week == "*":
         return candidate
 
-    # Еженедельно по дням
     if day_of_week != "*":
         target_days = {int(d) for d in day_of_week.split(",")}
-        max_iterations = 14  # защита от бесконечного цикла
+        max_iterations = 14
         iterations = 0
         while candidate.isoweekday() not in target_days and iterations < max_iterations:
             candidate += timedelta(days=1)
             iterations += 1
         return candidate
 
-    # Ежемесячно
     if day_of_month != "*":
         target_day = int(day_of_month)
         max_iterations = 31
@@ -188,7 +158,6 @@ def get_next_occurrence(cron_expr: str, from_date: Optional[datetime] = None) ->
 # ────────────────────────────────────────────────────────────
 
 class RecurrenceService:
-    """Сервис для управления повторяющимися задачами и встречами."""
 
     # ── Задачи ──────────────────────────────────────────────
 
@@ -198,10 +167,6 @@ class RecurrenceService:
         cron_expression: str,
         human_readable: str,
     ) -> TaskRecurrence:
-        """
-        Создаёт TaskRecurrence для существующей задачи.
-        Задача помечается as is_template=True.
-        """
         next_occ = get_next_occurrence(cron_expression, task.due_date or timezone.now())
 
         def _create():
@@ -220,14 +185,13 @@ class RecurrenceService:
         return await sync_to_async(_create)()
 
     async def on_task_completed(self, task: Task) -> Optional[Task]:
-        """
-        Вызывается после mark_task_done.
-        Если задача — template с активным recurrence, создаёт новую.
-        """
         def _get_recurrence():
+            if not task.recurrence_group_id:
+                return None
             try:
                 return TaskRecurrence.objects.select_related("task").get(
-                    task=task, is_active=True
+                    task__recurrence_group_id=task.recurrence_group_id,
+                    is_active=True,
                 )
             except TaskRecurrence.DoesNotExist:
                 return None
@@ -236,16 +200,20 @@ class RecurrenceService:
         if not recurrence:
             return None
 
-        # Вычисляем следующую дату
+        # Берём оригинальное название из template-задачи
+        original_title = recurrence.task.title if recurrence.task else task.title
+        # Начинаем со следующего дня после due_date (начало дня, а не 23:59)
+        due = task.due_date or timezone.now()
+        local_due = timezone.localtime(due)
+        next_day_start = local_due.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
         next_occ = get_next_occurrence(
             recurrence.cron_expression,
-            from_date=timezone.localtime(timezone.now()),
+            from_date=next_day_start,
         )
 
-        # Создаём следующую задачу
         def _create_next():
             new_task = Task.objects.create(
-                title=task.title,
+                title=original_title,
                 description=task.description,
                 topic=task.topic,
                 due_date=next_occ,
@@ -255,12 +223,10 @@ class RecurrenceService:
                 is_template=False,
                 recurrence_group_id=task.recurrence_group_id,
             )
-            # Копируем assignees
-            for ta in task.assignees.all():
+            for ta in task.assignees.select_related("user").all():
                 from core.models import TaskAssignee
                 TaskAssignee.objects.create(task=new_task, user=ta.user)
 
-            # Обновляем next_occurrence в рекурренсе
             recurrence.next_occurrence = next_occ
             recurrence.save(update_fields=["next_occurrence"])
 
@@ -269,11 +235,6 @@ class RecurrenceService:
         return await sync_to_async(_create_next)()
 
     async def cancel_task_series(self, task: Task) -> bool:
-        """
-        Отменяет всю серию повторяющихся задач:
-        - Деактивирует TaskRecurrence
-        - Отменяет все будущие задачи в группе
-        """
         def _cancel():
             try:
                 recurrence = TaskRecurrence.objects.get(
@@ -286,18 +247,17 @@ class RecurrenceService:
             recurrence.is_active = False
             recurrence.save(update_fields=["is_active"])
 
-            # Отменяем все будущие открытые задачи в группе (кроме текущей)
+            # Отменяем ВСЕ открытые задачи в группе
             Task.objects.filter(
                 recurrence_group_id=task.recurrence_group_id,
                 status="open",
-            ).exclude(id=task.id).update(status="cancelled")
+            ).update(status="cancelled")
 
             return True
 
         return await sync_to_async(_cancel)()
 
     async def get_task_series_tasks(self, task: Task) -> list:
-        """Возвращает все задачи в серии."""
         def _get():
             return list(
                 Task.objects.filter(
@@ -319,10 +279,8 @@ class RecurrenceService:
         source_message: Optional[Message],
         is_all_hands: bool = False,
         instance_count: int = 2,
+        existing_meeting: Optional[Meeting] = None,
     ) -> MeetingRecurrence:
-        """
-        Создаёт MeetingRecurrence + N будущих инстансов Meeting.
-        """
         def _create():
             rec = MeetingRecurrence.objects.create(
                 title=title,
@@ -342,19 +300,32 @@ class RecurrenceService:
                         recurring_meeting=rec, user=user,
                     )
 
-            # Создаём N будущих инстансов
-            next_date = get_next_occurrence(cron_expression)
+            if existing_meeting:
+                existing_meeting.recurrence = rec
+                existing_meeting.save(update_fields=["recurrence"])
+
+            from_date = existing_meeting.start_at if existing_meeting else timezone.now()
+            next_date = get_next_occurrence(cron_expression, from_date + timedelta(hours=1))
+            original_hour = from_date.hour if timezone.is_aware(from_date) else from_date.hour
+            original_minute = from_date.minute if timezone.is_aware(from_date) else from_date.minute
+
             for _ in range(instance_count):
-                Meeting.objects.create(
+                adjusted_date = next_date.replace(hour=original_hour, minute=original_minute, second=0, microsecond=0)
+                if timezone.is_aware(next_date) and timezone.is_naive(adjusted_date):
+                    adjusted_date = timezone.make_aware(adjusted_date, timezone.get_current_timezone())
+                meeting = Meeting.objects.create(
                     title=title,
                     topic=topic,
-                    start_at=next_date,
+                    start_at=adjusted_date,
                     source_message=source_message,
                     creator=creator,
                     status="active",
                     is_all_hands=is_all_hands,
                     recurrence=rec,
                 )
+                if existing_meeting and not is_all_hands:
+                    for user in participants:
+                        meeting.participants.add(user)
                 next_date = get_next_occurrence(cron_expression, next_date + timedelta(hours=1))
 
             return rec
@@ -362,9 +333,7 @@ class RecurrenceService:
         return await sync_to_async(_create)()
 
     async def create_next_meeting_instance(self, recurrence: MeetingRecurrence) -> Meeting:
-        """Создаёт один следующий инстанс встречи."""
         def _create():
-            # Находим последний созданный инстанс
             last_instance = (
                 Meeting.objects.filter(recurrence=recurrence)
                 .order_by("-start_at")
@@ -398,10 +367,6 @@ class RecurrenceService:
         return await sync_to_async(_create)()
 
     async def ensure_meeting_instances(self, recurrence_id: int, min_count: int = 2):
-        """
-        Проверяет, что у рекурренса есть хотя бы min_count будущих инстансов.
-        Если нет — создаёт недостающие.
-        """
         def _count():
             try:
                 rec = MeetingRecurrence.objects.get(id=recurrence_id, is_active=True)
@@ -428,11 +393,6 @@ class RecurrenceService:
             count += 1
 
     async def cancel_meeting_series(self, recurrence_id: int) -> bool:
-        """
-        Отменяет всю серию встреч:
-        - MeetingRecurrence.is_active = False
-        - Все будущие инстансы → cancelled
-        """
         def _cancel():
             try:
                 rec = MeetingRecurrence.objects.get(id=recurrence_id, is_active=True)
@@ -444,7 +404,6 @@ class RecurrenceService:
 
             Meeting.objects.filter(
                 recurrence=rec,
-                start_at__gte=timezone.now(),
                 status="active",
             ).update(status="cancelled")
 
@@ -453,24 +412,14 @@ class RecurrenceService:
         return await sync_to_async(_cancel)()
 
     async def cancel_single_meeting(self, meeting: Meeting) -> bool:
-        """
-        Отменяет только одну встречу (серия продолжается).
-        После отмены проверяет, нужно ли создать новый инстанс взамен.
-        """
         def _cancel():
             meeting.status = "cancelled"
             meeting.save(update_fields=["status"])
             return True
 
-        result = await sync_to_async(_cancel)()
-        if result and meeting.recurrence_id:
-            # Проверяем, не упало ли количество будущих ниже минимума
-            await self.ensure_meeting_instances(meeting.recurrence_id, min_count=2)
-
-        return result
+        return await sync_to_async(_cancel)()
 
     async def update_series_title(self, recurrence, new_title: str) -> bool:
-        """Обновляет название во всех будущих инстансах и в самом рекурренсе."""
         def _update():
             recurrence.title = new_title
             recurrence.save(update_fields=["title"])
@@ -490,7 +439,6 @@ class RecurrenceService:
         return await sync_to_async(_update)()
 
     async def update_series_participants(self, recurrence, usernames: list[str]) -> bool:
-        """Обновляет участников во всех будущих инстансах."""
         from core.services.meeting_service import _find_user_by_username
 
         users = []
@@ -503,14 +451,12 @@ class RecurrenceService:
                 users.append(user)
 
         def _update():
-            # Обновляем список участников рекурренса
             recurrence.participant_links.all().delete()
             for user in users:
                 MeetingRecurrenceParticipant.objects.create(
                     recurring_meeting=recurrence, user=user,
                 )
 
-            # Обновляем во всех будущих встречах
             future_meetings = Meeting.objects.filter(
                 recurrence=recurrence,
                 start_at__gte=timezone.now(),

@@ -18,6 +18,7 @@
     "«задача для @user» — assignee = @user, НЕ автор.",
     "Не выдумывай @username. Если не указан — [].",
     "due_date: строго YYYY-MM-DD или null. date: YYYY-MM-DD. time: HH:MM (с ведущим нулём).",
+    "recurrence — если задача или встреча ПОВТОРЯЕТСЯ («каждую пятницу», «каждый понедельник», «еженедельно», «каждый день», «каждое 1-е число»), добавь поле recurrence с человекочитаемым описанием периодичности через пробел. Например: «каждую пятницу», «каждый понедельник». Если не повторяется — не ставь поле.",
     "Если нет ни задач, ни встреч → {\"tasks\":[], \"meetings\":[]}."
   ],
 
@@ -27,7 +28,8 @@
         "title": "краткое название задачи",
         "assignees": ["@username1", "@username2"],
         "due_date": "YYYY-MM-DD",
-        "description": ""
+        "description": "",
+        "recurrence": "каждую пятницу"
       }
     ],
     "meetings": [
@@ -36,7 +38,8 @@
         "participants": ["@username1", "@username2"],
         "date": "YYYY-MM-DD",
         "time": "HH:MM",
-        "description": ""
+        "description": "",
+        "recurrence": "каждый понедельник"
       }
     ]
   }

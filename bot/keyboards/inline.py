@@ -45,14 +45,6 @@ def task_edit_options_keyboard(task_id: int, has_recurrence: bool = False):
         text="✏️ Название",
         callback_data=f"task_edit_title:{task_id}",
     ))
-    if has_recurrence:
-        builder.add(InlineKeyboardButton(
-            text="🔄 Редактировать серию",
-            callback_data=f"task_edit_series:{task_id}",
-        ))
-        builder.adjust(2, 2)
-    else:
-        builder.adjust(2)
     builder.add(InlineKeyboardButton(
         text="↩️ Назад к задаче",
         callback_data=f"task_back:{task_id}",
@@ -158,14 +150,8 @@ def meeting_edit_options_keyboard(meeting_id: int, has_recurrence: bool = False)
         text="✏️ Название",
         callback_data=f"meeting_edit_title:{meeting_id}",
     ))
-    if has_recurrence:
-        builder.add(InlineKeyboardButton(
-            text="🔄 Редактировать серию",
-            callback_data=f"meeting_edit_series:{meeting_id}",
-        ))
-        builder.adjust(2, 2)
-    else:
-        builder.adjust(2)
+    # ═══ В меню редактирования ВСЕЙ серии кнопка "Редактировать серию" не нужна ═══
+    # (она будет показана на этапе выбора)
     builder.add(InlineKeyboardButton(
         text="↩️ Назад к встрече",
         callback_data=f"meeting_back:{meeting_id}",
@@ -196,6 +182,59 @@ def meeting_cancel_confirm_keyboard(meeting_id: int):
         callback_data=f"meeting_cancel_abort:{meeting_id}",
     ))
     builder.adjust(2)
+    return builder.as_markup()
+
+
+def meeting_cancel_series_confirm_keyboard(meeting_id: int):
+    """Подтверждение отмены ВСЕЙ серии встреч."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="🛑 Да, отменить всю серию",
+        callback_data=f"meeting_cancel_series_confirm:{meeting_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="↩️ Нет, оставить",
+        callback_data=f"meeting_cancel_abort:{meeting_id}",
+    ))
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def meeting_edit_series_choice_keyboard(meeting_id: int):
+    """Выбор: редактировать одну встречу или всю серию."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="✏️ Только эту",
+        callback_data=f"meeting_edit_single:{meeting_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="🔄 Всю серию",
+        callback_data=f"meeting_edit_series:{meeting_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="↩️ Назад",
+        callback_data=f"meeting_back_single:{meeting_id}",
+    ))
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def task_edit_series_choice_keyboard(task_id: int):
+    """Выбор: редактировать одну задачу или всю серию."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="✏️ Только эту",
+        callback_data=f"task_edit_single:{task_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="🔄 Всю серию",
+        callback_data=f"task_edit_series:{task_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="↩️ Назад",
+        callback_data=f"task_back:{task_id}",
+    ))
+    builder.adjust(2, 1)
     return builder.as_markup()
 
 

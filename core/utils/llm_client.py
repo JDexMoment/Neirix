@@ -570,11 +570,19 @@ class LLMClient:
                     continue
                 seen_tasks.add(dedupe_key)
 
+                # ═══ recurrence ═══
+                recurrence = task.get("recurrence")
+                if recurrence and isinstance(recurrence, str):
+                    recurrence = recurrence.strip()
+                else:
+                    recurrence = None
+
                 normalized_tasks.append({
                     "title": title,
                     "assignees": merged,
                     "due_date": due_date,
                     "description": desc,
+                    "recurrence": recurrence,
                 })
 
             # ── Нормализация встреч ─────────────────────────────
@@ -631,11 +639,19 @@ class LLMClient:
                     continue
                 seen_meetings.add(dedupe_key)
 
+                # ═══ recurrence ═══
+                recurrence = meeting.get("recurrence")
+                if recurrence and isinstance(recurrence, str):
+                    recurrence = recurrence.strip()
+                else:
+                    recurrence = None
+
                 normalized_meetings.append({
                     "title": title,
                     "participants": merged,
                     "start_at": start_at,
                     "description": desc,
+                    "recurrence": recurrence,
                 })
 
             logger.info(

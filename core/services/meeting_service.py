@@ -237,7 +237,8 @@ class MeetingService:
                         participants=participant_objects,
                         source_message=source_message,
                         is_all_hands=has_all,
-                        instance_count=2,  # создаём 2 будущих встречи
+                        instance_count=2,
+                        existing_meeting=meeting,  
                     )
                     logger.info(
                         "Recurring meeting created | title=%s cron=%s human=%s",
