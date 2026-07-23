@@ -8,8 +8,14 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from asgiref.sync import sync_to_async
 from django.utils import timezone
+from aiogram.types import BufferedInputFile, CallbackQuery
+from aiogram import F
+from core.services.summary_service import summary_service
+from core.models import Summary
+import logging
 
 from bot.utils import get_chat_context
+from bot.keyboards.inline import export_summary_keyboard
 from core.models import Topic, Summary
 from core.services.summary_service import SummaryService
 
@@ -47,27 +53,28 @@ async def send_summary_response(message: Message, summary: Summary):
 
     header = f"📊 <b>Саммари за период {start_date} — {end_date}</b>"
     content = html.escape(summary.content or "")
-
     full_text = f"{header}\n\n{content}"
-
-    # Telegram limit ~4096, оставляем запас
     chunk_size = 3800
 
     if len(full_text) <= chunk_size:
-        await message.answer(full_text, parse_mode="HTML")
+        await message.answer(
+            full_text,
+            parse_mode="HTML",
+            reply_markup=export_summary_keyboard(summary.id)
+        )
         return
 
+    # Отправляем заголовок без кнопки
     await message.answer(header, parse_mode="HTML")
+    # Части контента, к последней добавляем кнопку
     for i in range(0, len(content), chunk_size):
-        await message.answer(content[i:i + chunk_size], parse_mode="HTML")
-
-
-def _get_existing_summary(topic: Topic, period_start: datetime, period_end: datetime) -> Optional[Summary]:
-    return Summary.objects.filter(
-        topic=topic,
-        period_start=period_start,
-        period_end=period_end,
-    ).first()
+        chunk = content[i:i + chunk_size]
+        is_last = (i + chunk_size >= len(content))
+        await message.answer(
+            chunk,
+            parse_mode="HTML",
+            reply_markup=export_summary_keyboard(summary.id) if is_last else None
+        )
 
 
 def _get_or_create_default_topic(chat) -> Tuple[Topic, bool]:
@@ -171,3 +178,36 @@ async def cmd_summary(message: Message):
     except Exception:
         logger.exception("Summary generation failed")
         await message.answer("⚠️ Ошибка при генерации саммари. Попробуйте позже.")
+
+logger = logging.getLogger(__name__)
+
+@router.callback_query(F.data.startswith("export_pdf:"))
+async def callback_export_pdf(callback: CallbackQuery):
+    """Генерирует PDF со сводкой и отправляет файл пользователю."""
+    try:
+        summary_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор саммари.", show_alert=True)
+        return
+
+    # Безопасно получаем объект, обрабатывая возможное отсутствие
+    try:
+        summary = await sync_to_async(Summary.objects.get)(pk=summary_id)
+    except Summary.DoesNotExist:
+        await callback.answer("Саммари не найдено.", show_alert=True)
+        return
+
+    await callback.answer("Готовлю PDF…")
+
+    try:
+        pdf_bytes = await sync_to_async(summary_service.generate_summary_pdf)(summary)
+    except Exception:
+        logger.exception("PDF generation failed")
+        await callback.message.answer("Ошибка при создании PDF.")
+        return
+
+    file = BufferedInputFile(pdf_bytes, filename=f"summary_{summary.id}.pdf")
+    await callback.message.answer_document(
+        document=file,
+        caption="📄 Сводка в формате PDF"
+    )

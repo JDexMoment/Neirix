@@ -1,6 +1,8 @@
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Optional, List
+from fpdf import FPDF
 import re
 
 from asgiref.sync import sync_to_async
@@ -200,6 +202,50 @@ class SummaryService:
             lines.append(f"- {meeting.title} в {meeting_time} (участники: {participants_str})")
 
         return "\n".join(lines)
+
+    def generate_summary_pdf(self, summary) -> bytes:
+    pdf = FPDF()
+    pdf.add_page()
+
+    # Пытаемся использовать Liberation Serif (аналог Times New Roman)
+    font_regular = '/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf'
+    font_bold = '/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf'
+    if not os.path.exists(font_regular):
+        # fallback на DejaVu Sans
+        font_regular = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+        font_bold = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+
+    if os.path.exists(font_regular):
+        pdf.add_font('Times', '', font_regular, uni=True)
+        pdf.add_font('Times', 'B', font_bold, uni=True)
+        font_family = 'Times'
+    else:
+        # Совсем без шрифта – кириллица не отобразится
+        pdf.set_font('Helvetica', size=12)
+        font_family = None
+
+    # Заголовок
+    start = summary.period_start.strftime('%d.%m.%Y') if summary.period_start else '?'
+    end = summary.period_end.strftime('%d.%m.%Y') if summary.period_end else '?'
+    if font_family:
+        pdf.set_font(font_family, 'B', 14)
+        pdf.cell(0, 10, f'Сводка за период {start} — {end}', ln=True, align='C')
+        pdf.ln(10)
+        pdf.set_font(font_family, '', 12)
+    else:
+        pdf.cell(0, 10, f'Summary {start} — {end}', ln=True, align='C')
+        pdf.ln(10)
+
+    # Тело саммари
+    for line in summary.content.split('\n'):
+        if font_family:
+            pdf.set_font(font_family, '', 12)
+            pdf.multi_cell(0, 10, line)
+        else:
+            pdf.set_font('Helvetica', '', 12)
+            pdf.multi_cell(0, 10, line)
+
+    return pdf.output()
 
     async def _get_similar_context(self, query: str, topic: Topic, limit: int = 5) -> str:
         try:

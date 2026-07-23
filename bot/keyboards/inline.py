@@ -209,6 +209,22 @@ def meeting_reschedule_cancel_keyboard():
     return builder.as_markup()
 
 
+#___________________________________________________________________
+# Саммери (сводки)
+#___________________________________________________________________
+
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardButton
+
+def export_summary_keyboard(summary_id: int):
+    """Клавиатура с кнопкой экспорта саммари в PDF."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="📄 Экспорт в PDF",
+        callback_data=f"export_pdf:{summary_id}"
+    ))
+    return builder.as_markup()
+
 # ─────────────────────────────────────────────────────────────────────
 # Общие
 # ─────────────────────────────────────────────────────────────────────
