@@ -2,6 +2,7 @@ import html
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
+import redis.asyncio as redis
 
 from aiogram import Router
 from aiogram.filters import Command
@@ -13,6 +14,8 @@ from aiogram import F
 from core.services.summary_service import summary_service
 from core.models import Summary
 import logging
+from django.conf import settings
+from core.models import ComparisonSummary
 
 from bot.utils import get_chat_context
 from bot.keyboards.inline import export_summary_keyboard
@@ -23,6 +26,27 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 summary_service = SummaryService()
+
+_redis_client = None
+
+def get_redis():
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.Redis(
+            host=getattr(settings, 'REDIS_HOST', 'localhost'),
+            port=getattr(settings, 'REDIS_PORT', 6379),
+            decode_responses=True
+        )
+    return _redis_client
+
+
+async def _send_long_text(message: Message, text: str, header: str = None, parse_mode: str = "HTML"):
+    """Отправляет длинный текст, разбивая на части по 3800 символов."""
+    chunk_size = 3800
+    if header:
+        await message.answer(header, parse_mode=parse_mode)
+    for i in range(0, len(text), chunk_size):
+        await message.answer(text[i:i + chunk_size], parse_mode=parse_mode)
 
 
 def _make_aware(dt: datetime) -> datetime:
@@ -129,6 +153,73 @@ def _resolve_period(args: list[str], now: datetime) -> Tuple[Optional[datetime],
     end = _make_aware(datetime.combine(end_date_inclusive + timedelta(days=1), datetime.min.time()))
     return start, end, None
 
+@router.message(Command("compare_summary"))
+async def cmd_compare_summary(message: Message):
+    chat, topic, db_user = await get_chat_context(message)
+    if not chat:
+        await message.answer("Не удалось определить чат.")
+        return
+
+    raw_text = message.text or ""
+    args = raw_text.split()
+
+    if len(args) != 5:
+        await message.answer(
+            "Используйте: /compare_summary YYYY-MM-DD YYYY-MM-DD YYYY-MM-DD YYYY-MM-DD\n"
+            "Первые две даты — период 1, вторые две — период 2."
+        )
+        return
+
+    # Парсинг дат с приведением к aware datetime
+    try:
+        p1_start = _make_aware(datetime.strptime(args[1], "%Y-%m-%d"))
+        p1_end = _make_aware(datetime.strptime(args[2], "%Y-%m-%d") + timedelta(days=1))
+        p2_start = _make_aware(datetime.strptime(args[3], "%Y-%m-%d"))
+        p2_end = _make_aware(datetime.strptime(args[4], "%Y-%m-%d") + timedelta(days=1))
+    except ValueError:
+        await message.answer("Неверный формат дат. Используйте YYYY-MM-DD.")
+        return
+
+    # Ограничение длины периодов
+    if (p1_end - p1_start).days > 30 or (p2_end - p2_start).days > 30:
+        await message.answer("Каждый период не должен превышать 30 дней.")
+        return
+
+    # Целевой топик
+    target_topic = topic
+    if not target_topic:
+        target_topic, _ = await sync_to_async(_get_or_create_default_topic)(chat)
+
+    # Rate limiting (1 запрос в час на топик/чат)
+    try:
+        redis_client = get_redis()
+        rate_key = f"compare_limit:{chat.id}:{target_topic.id}"
+        if await redis_client.exists(rate_key):
+            await message.answer("Сравнение можно запрашивать не чаще одного раза в час для одного чата/топика.")
+            return
+        await redis_client.setex(rate_key, 3600, "1")
+    except Exception as e:
+        logger.warning("Redis rate limit failed: %s", e)
+
+    await message.answer("⏳ Генерирую сравнительный анализ, это может занять некоторое время...")
+
+    try:
+        comparison = await summary_service.generate_comparison_summary(
+            target_topic,
+            p1_start, p1_end,
+            p2_start, p2_end
+        )
+        if not comparison:
+            await message.answer("Не удалось сгенерировать сравнение. Возможно, в одном из периодов нет данных.")
+            return
+
+        header = (f"📊 Сравнительный анализ периодов: "
+                  f"{p1_start.date()}–{(p1_end - timedelta(days=1)).date()} и "
+                  f"{p2_start.date()}–{(p2_end - timedelta(days=1)).date()}")
+        await _send_long_text(message, comparison.content, header=header)
+    except Exception:
+        logger.exception("Comparison generation failed")
+        await message.answer("⚠️ Ошибка при генерации сравнительного анализа. Попробуйте позже.")
 
 @router.message(Command("summary"))
 async def cmd_summary(message: Message):

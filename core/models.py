@@ -198,6 +198,14 @@ class Summary(models.Model):
     content = models.TextField()
     generated_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['topic', 'period_start', 'period_end'],
+                name='unique_summary_period'
+            )
+        ]
+
     def __str__(self):
         return f"Summary for {self.topic} ({self.period_start.date()} - {self.period_end.date()})"
     
@@ -318,3 +326,23 @@ class MeetingRecurrenceParticipant(models.Model):
 
     def __str__(self):
         return f"{self.user} → {self.recurring_meeting.title}"
+
+class ComparisonSummary(models.Model):
+    topic = models.ForeignKey(Topic, on_delete=models.CASCADE)
+    period1_start = models.DateTimeField()
+    period1_end = models.DateTimeField()
+    period2_start = models.DateTimeField()
+    period2_end = models.DateTimeField()
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['topic', 'period1_start', 'period1_end', 'period2_start', 'period2_end'],
+                name='unique_comparison_periods'
+            )
+        ]
+
+    def __str__(self):
+        return f"ComparisonSummary for topic {self.topic_id} ({self.period1_start.date()} vs {self.period2_start.date()})"

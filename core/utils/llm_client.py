@@ -29,6 +29,7 @@ TASK_RULES: Dict = _load_json("task_rules.json")
 COMBINED_RULES: Dict = _load_json("combined_rules.json")
 MEETING_RULES: Dict = _load_json("meeting_rules.json")
 SUMMARY_RULES: Dict = _load_json("summary_rules.json")
+COMPARISON_RULES: Dict = _load_json("comparison_rules.json")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Константы
@@ -391,6 +392,24 @@ class LLMClient:
     async def _run_sync(self, func, *args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
 
+    async def generate_comparison_summary(self, summary1_text: str, summary2_text: str) -> str:
+        system_prompt = COMPARISON_RULES['system_prompt']
+        user_prompt = COMPARISON_RULES['user_prompt_template'].format(
+            summary1=summary1_text,
+            summary2=summary2_text
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # Используем общий метод chat_completion с пониженной температурой для стабильности
+        return await self.chat_completion(
+            messages=messages,
+            temperature=0.3,
+            max_tokens=2048,
+        )
     # ──────────────────────────────────────────────────────────────────────
     # chat_completion
     # ──────────────────────────────────────────────────────────────────────

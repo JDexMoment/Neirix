@@ -8,6 +8,7 @@ import re
 from asgiref.sync import sync_to_async
 from django.utils import timezone
 
+from core.models import ComparisonSummary
 from core.models import Topic, Message, Summary, Task, Meeting
 from core.utils.llm_client import LLMClient
 from vector_store.client import VectorStoreClient
@@ -203,99 +204,97 @@ class SummaryService:
 
         return "\n".join(lines)
 
-    def generate_summary_pdf(self, summary) -> bytes:
-    pdf = FPDF()
-    pdf.add_page()
+    async def generate_comparison_summary(
+    self,
+    topic: Topic,
+    period1_start: datetime,
+    period1_end: datetime,
+    period2_start: datetime,
+    period2_end: datetime
+) -> Optional[ComparisonSummary]:
+        # 1. Проверяем кэш
+        cached = await sync_to_async(
+            ComparisonSummary.objects.filter(
+                topic=topic,
+                period1_start=period1_start,
+                period1_end=period1_end,
+                period2_start=period2_start,
+                period2_end=period2_end
+            ).first
+        )()
+        if cached:
+            return cached
 
-    # Пытаемся использовать Liberation Serif (аналог Times New Roman)
-    font_regular = '/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf'
-    font_bold = '/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf'
-    if not os.path.exists(font_regular):
-        # fallback на DejaVu Sans
-        font_regular = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
-        font_bold = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+        # 2. Получаем/генерируем обычные саммари за каждый период
+        summary1 = await self.generate_summary_for_period(topic, period1_start, period1_end)
+        summary2 = await self.generate_summary_for_period(topic, period2_start, period2_end)
 
-    if os.path.exists(font_regular):
-        pdf.add_font('Times', '', font_regular, uni=True)
-        pdf.add_font('Times', 'B', font_bold, uni=True)
-        font_family = 'Times'
-    else:
-        # Совсем без шрифта – кириллица не отобразится
-        pdf.set_font('Helvetica', size=12)
-        font_family = None
+        if not summary1 or not summary2:
+            return None
 
-    # Заголовок
-    start = summary.period_start.strftime('%d.%m.%Y') if summary.period_start else '?'
-    end = summary.period_end.strftime('%d.%m.%Y') if summary.period_end else '?'
-    if font_family:
-        pdf.set_font(font_family, 'B', 14)
-        pdf.cell(0, 10, f'Сводка за период {start} — {end}', ln=True, align='C')
-        pdf.ln(10)
-        pdf.set_font(font_family, '', 12)
-    else:
-        pdf.cell(0, 10, f'Summary {start} — {end}', ln=True, align='C')
-        pdf.ln(10)
-
-    # Тело саммари
-    for line in summary.content.split('\n'):
-        if font_family:
-            pdf.set_font(font_family, '', 12)
-            pdf.multi_cell(0, 10, line)
-        else:
-            pdf.set_font('Helvetica', '', 12)
-            pdf.multi_cell(0, 10, line)
-
-    return pdf.output()
-
-    async def _get_similar_context(self, query: str, topic: Topic, limit: int = 5) -> str:
+        # 3. Вызываем LLM для сравнения
         try:
-            embedding = await self.llm.generate_embedding(query)
-
-            results = await self.vector_store.search_similar(
-                query_embedding=embedding,
-                chat_id=topic.chat.chat_id,
-                topic_id=topic.thread_id,
-                limit=limit,
-                time_range_days=30,
+            comparison_text = await self.llm.generate_comparison_summary(
+                summary1.content,
+                summary2.content
             )
-            if not results:
-                return ""
+        except Exception:
+            logger.exception("LLM comparison failed")
+            return None
 
-            message_ids = [r["payload"].get("message_id") for r in results if r.get("payload") and r["payload"].get("message_id")]
-            if not message_ids:
-                return ""
+        # 4. Сохраняем результат
+        comparison = await sync_to_async(ComparisonSummary.objects.create)(
+            topic=topic,
+            period1_start=period1_start,
+            period1_end=period1_end,
+            period2_start=period2_start,
+            period2_end=period2_end,
+            content=comparison_text
+        )
+        return comparison
 
-            messages = await sync_to_async(
-                lambda: list(
-                    Message.objects.filter(id__in=message_ids)
-                    .select_related("author")
-                    .order_by("timestamp")
-                )
-            )()
+    def generate_summary_pdf(self, summary) -> bytes:
+        pdf = FPDF()
+        pdf.add_page()
 
-            return self._format_messages_context(messages)
+        # Пытаемся использовать Liberation Serif (аналог Times New Roman)
+        font_regular = '/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf'
+        font_bold = '/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf'
+        if not os.path.exists(font_regular):
+            # fallback на DejaVu Sans
+            font_regular = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+            font_bold = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
 
-        except Exception as e:
-            logger.warning("Failed to get similar context: %s", e)
-            return ""
-
-    async def get_daily_summary(self, topic: Topic, date: Optional[datetime] = None) -> Optional[Summary]:
-        if date is None:
-            base_date = timezone.localdate()
+        if os.path.exists(font_regular):
+            pdf.add_font('Times', '', font_regular, uni=True)
+            pdf.add_font('Times', 'B', font_bold, uni=True)
+            font_family = 'Times'
         else:
-            base_date = date.date() if isinstance(date, datetime) else date
+            # Совсем без шрифта – кириллица не отобразится
+            pdf.set_font('Helvetica', size=12)
+            font_family = None
 
-        period_start = timezone.make_aware(datetime.combine(base_date, datetime.min.time()), timezone.get_current_timezone())
-        period_end = period_start + timedelta(days=1)
-        return await self.generate_summary_for_period(topic, period_start, period_end)
-
-    async def get_weekly_summary(self, topic: Topic, week_start: Optional[datetime] = None) -> Optional[Summary]:
-        if week_start is None:
-            today = timezone.localdate()
-            week_start_date = today - timedelta(days=today.weekday())
+        # Заголовок
+        start = summary.period_start.strftime('%d.%m.%Y') if summary.period_start else '?'
+        end = summary.period_end.strftime('%d.%m.%Y') if summary.period_end else '?'
+        if font_family:
+            pdf.set_font(font_family, 'B', 14)
+            pdf.cell(0, 10, f'Сводка за период {start} — {end}', ln=True, align='C')
+            pdf.ln(10)
+            pdf.set_font(font_family, '', 12)
         else:
-            week_start_date = week_start.date() if isinstance(week_start, datetime) else week_start
+            pdf.cell(0, 10, f'Summary {start} — {end}', ln=True, align='C')
+            pdf.ln(10)
 
-        period_start = timezone.make_aware(datetime.combine(week_start_date, datetime.min.time()), timezone.get_current_timezone())
-        period_end = period_start + timedelta(days=7)
-        return await self.generate_summary_for_period(topic, period_start, period_end)
+        # Тело саммари
+        for line in summary.content.split('\n'):
+            if font_family:
+                pdf.set_font(font_family, '', 12)
+                pdf.multi_cell(0, 10, line)
+            else:
+                pdf.set_font('Helvetica', '', 12)
+                pdf.multi_cell(0, 10, line)
+
+        return pdf.output()
+
+   
