@@ -349,3 +349,38 @@ class UserNotificationSettings(models.Model):
 
     def __str__(self):
         return f"Settings for user {self.user}"
+
+
+class MeetingAttendance(models.Model):
+    """Статус подтверждения участия во встрече."""
+    PENDING = 'pending'
+    CONFIRMED = 'confirmed'
+    DECLINED = 'declined'
+
+    STATUS_CHOICES = [
+        (PENDING, 'Ожидание'),
+        (CONFIRMED, 'Подтверждено'),
+        (DECLINED, 'Отказ'),
+    ]
+
+    meeting = models.ForeignKey(
+        Meeting, on_delete=models.CASCADE,
+        related_name='attendances',
+    )
+    user = models.ForeignKey(
+        TelegramUser, on_delete=models.CASCADE,
+        related_name='meeting_attendances',
+    )
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES,
+        default=PENDING,
+    )
+    responded_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Подтверждение участия"
+        verbose_name_plural = "Подтверждения участия"
+        unique_together = ('meeting', 'user')
+
+    def __str__(self):
+        return f"{self.user} → {self.meeting.title}: {self.status}"

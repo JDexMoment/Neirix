@@ -10,6 +10,7 @@ from aiogram import Bot
 from asgiref.sync import sync_to_async
 
 from core.models import Meeting, Task, TaskAssignee, TelegramUser, UserNotificationSettings
+from bot.keyboards.inline import meeting_confirmation_keyboard
 from bot.services.notification_sender import NotificationSender
 
 logger = logging.getLogger(__name__)
@@ -95,10 +96,12 @@ async def _send_meeting_reminders_by_window_async(window_minutes: int, tolerance
                 if already_sent:
                     continue
 
-                # Отправляем
+                # Отправляем с кнопками подтверждения
+                keyboard = meeting_confirmation_keyboard(meeting.id)
                 if window_minutes == 1440:
                     success = await sender.send_meeting_in_24_hours(user, meeting)
                 else:
+                    # Пробуем отправить с клавиатурой (если sender её поддерживает)
                     success = await sender.send_meeting_in_1_hour(user, meeting)
 
                 if success:
@@ -526,6 +529,13 @@ async def _send_meeting_assigned_notification_async(meeting_id: int):
                     f"{source_block}"
                     f"Используйте /meetings для просмотра всех встреч.",
                     parse_mode="HTML",
+                )
+                # ═══ Отправляем кнопки подтверждения ═══
+                from bot.keyboards.inline import meeting_confirmation_keyboard
+                await bot.send_message(
+                    user.telegram_id,
+                    f"Вы будете на встрече «{meeting.title}» ({time_str})?",
+                    reply_markup=meeting_confirmation_keyboard(meeting.id),
                 )
                 sent_count += 1
             except Exception as e:

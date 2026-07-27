@@ -22,6 +22,7 @@ django.setup()
 
 from bot.handlers import summary, tasks, meetings, chat_link, chat_events, messages, roles
 from bot.handlers.settings import router as settings_router
+from bot.handlers.meeting_attendance import router as attendance_router
 from bot.middlewares.fsm_timeout import FSMTimeoutMiddleware
 
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +67,7 @@ async def main():
     dp.include_router(messages.router)
     dp.include_router(roles.router)
     dp.include_router(settings_router)
+    dp.include_router(attendance_router)
 
 
     @dp.message(Command("start"))

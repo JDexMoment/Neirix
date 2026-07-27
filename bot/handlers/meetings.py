@@ -69,7 +69,34 @@ def _get_upcoming_meetings_for_chat(chat, topic=None) -> List[Meeting]:
     )
 
 
-def _format_participants(meeting: Meeting) -> str:
+async def _load_attendance_icons(meetings: list) -> dict:
+    """Загружает статусы подтверждения для списка встреч.
+    Возвращает {meeting_id: {user_id: icon}}.
+    Если на пользователя нет записи — ⏳ (не ответил). """
+    if not meetings:
+        return {}
+    from core.models import MeetingAttendance
+    meeting_ids = [m.id for m in meetings]
+    
+    # Загружаем всех участников встреч
+    all_participants = {}
+    for m in meetings:
+        p_ids = await sync_to_async(lambda m=m: list(m.participants.values_list('id', flat=True)))()
+        all_participants[m.id] = {pid: '⏳' for pid in p_ids}
+    
+    # Загружаем ответивших
+    attendances = await sync_to_async(
+        lambda: list(MeetingAttendance.objects.filter(meeting_id__in=meeting_ids))
+    )()
+    for a in attendances:
+        icon = "✅" if a.status == "confirmed" else "❌"
+        if a.meeting_id in all_participants and a.user_id in all_participants[a.meeting_id]:
+            all_participants[a.meeting_id][a.user_id] = icon
+    
+    return all_participants
+
+
+def _format_participants(meeting: Meeting, attendance_icons: dict = None) -> str:
     participants = list(meeting.participants.all())
     if not participants:
         if getattr(meeting, 'is_all_hands', False):
@@ -77,12 +104,14 @@ def _format_participants(meeting: Meeting) -> str:
         return "не определены"
     names = []
     for p in participants:
-        if p.username:
-            names.append(f"@{p.username}")
-        elif p.full_name:
-            names.append(p.full_name)
+        icon = ""
+        if attendance_icons:
+            icon = attendance_icons.get(p.id, "") or attendance_icons.get(p.id, "")
+        name = f"@{p.username}" if p.username else (p.full_name or f"id={p.id}")
+        if icon:
+            names.append(f"{icon}{name}")
         else:
-            names.append(f"id={p.id}")
+            names.append(name)
     return ", ".join(names)
 
 
@@ -101,11 +130,11 @@ def _format_creator(creator) -> str:
     return creator.full_name or f"id={creator.id}"
 
 
-def _build_meeting_text(meeting: Meeting) -> str:
+def _build_meeting_text(meeting: Meeting, attendance_icons: dict = None) -> str:
     text = (
         f"• <b>{meeting.title}</b>\n"
         f"  ⏰ {_format_meeting_time(meeting)}\n"
-        f"  👥 {_format_participants(meeting)}\n"
+        f"  👥 {_format_participants(meeting, attendance_icons)}\n"
         f"  📝 Назначил(а): {_format_creator(meeting.creator)}"
     )
     if getattr(meeting, 'recurrence_id', None):
@@ -322,10 +351,13 @@ async def _respond_meetings(message: Message, chat, topic, db_user, nlp_filters:
     await message.answer(header)
     # ═══ Показываем только одну ближайшую встречу из каждой серии ═══
     meetings = _filter_recurring_meetings(meetings)
+    # ═══ Загружаем статусы подтверждения ═══
+    attendance_data = await _load_attendance_icons(meetings)
     for m in meetings:
         has_rec = _has_recurrence(m)
+        icons = attendance_data.get(m.id)
         await message.answer(
-            _build_meeting_text(m),
+            _build_meeting_text(m, icons),
             parse_mode="HTML",
             reply_markup=meeting_keyboard(m.id, has_recurrence=has_rec),
         )
@@ -1045,24 +1077,11 @@ async def callback_meeting_back_single(callback: CallbackQuery):
 
 
 async def _restore_meeting_from_simple(callback, meeting_id):
-    meeting = await meeting_service.get_meeting_by_id(meeting_id)
-    if meeting:
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        try:
-            if callback.message.reply_to_message:
-                text, markup = await sync_to_async(_build_meeting_text_sync)(meeting, meeting_id)
-                await callback.bot.edit_message_text(
-                    text,
-                    chat_id=callback.message.reply_to_message.chat.id,
-                    message_id=callback.message.reply_to_message.message_id,
-                    parse_mode="HTML",
-                    reply_markup=markup,
-                )
-        except Exception as e:
-            logger.warning("Failed to restore meeting: %s", e)
+    """Удаляет сообщение (статистику или информацию)."""
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
 
 
 # ── Редактирование серии встреч ──

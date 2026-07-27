@@ -308,3 +308,37 @@ def settings_back_keyboard():
         callback_data="settings_back",
     ))
     return builder.as_markup()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Подтверждение участия во встречах
+# ─────────────────────────────────────────────────────────────────────
+
+
+def meeting_confirmation_keyboard(meeting_id: int):
+    """Кнопки подтверждения участия в напоминании."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="✅ Буду",
+        callback_data=f"meeting_confirm:{meeting_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="❌ Не смогу",
+        callback_data=f"meeting_decline:{meeting_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="📋 Кто идёт?",
+        callback_data=f"meeting_attendance_status:{meeting_id}",
+    ))
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def meeting_attendance_status_keyboard(meeting_id: int):
+    """Кнопка 'Назад' после просмотра статистики."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="↩️ Назад к встрече",
+        callback_data=f"meeting_back_single:{meeting_id}",
+    ))
+    return builder.as_markup()

@@ -107,6 +107,9 @@ class BatchProcessor:
                         )
                         if meeting:
                             meetings_created += 1
+                            # ═══ Отправляем уведомление участникам ═══
+                            from celery_app.tasks.send_reminders import send_meeting_assigned_notification
+                            send_meeting_assigned_notification.delay(meeting.id)
                             if truly_empty:
                                 unassigned_meeting_ids.append(meeting.id)
                     except Exception as e:
