@@ -10,6 +10,10 @@ BEAT_SCHEDULE = {
         "task": "celery_app.tasks.send_reminders.send_meeting_24h_reminders",
         "schedule": crontab(minute="*/30"), #30
     },
+    'meeting-15min-reminders': {
+        'task': 'celery_app.tasks.send_reminders.send_meeting_15min_reminders',
+        'schedule': crontab(minute='*/5'),  # каждые 5 минут
+    },
 
     # ─── Напоминания о задачах ───────────────────────────────────────
     "send-task-24h-reminders": {

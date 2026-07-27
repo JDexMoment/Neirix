@@ -266,3 +266,45 @@ def confirm_keyboard(action: str, item_id: int):
     ))
     builder.adjust(2)
     return builder.as_markup()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Настройки уведомлений (/settings)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def settings_main_keyboard():
+    """Главная клавиатура настроек."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="🔔 Время напоминания о встрече",
+        callback_data="settings_cycle_meeting_time",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="📅 Дайджест: вкл/выкл",
+        callback_data="settings_toggle_digest",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="🕐 Время дайджеста",
+        callback_data="settings_cycle_digest_time",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="📝 Напоминания о задачах: вкл/выкл",
+        callback_data="settings_toggle_task",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="🔔 Напоминания о встречах: вкл/выкл",
+        callback_data="settings_toggle_meeting",
+    ))
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def settings_back_keyboard():
+    """Кнопка 'Назад к настройкам'."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="↩️ Назад к настройкам",
+        callback_data="settings_back",
+    ))
+    return builder.as_markup()

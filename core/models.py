@@ -1,5 +1,7 @@
 from django.db import models
 import uuid
+from datetime import time as dtime
+
 
 class Department(models.Model):
     name = models.CharField(max_length=100, unique=True)
@@ -318,3 +320,32 @@ class MeetingRecurrenceParticipant(models.Model):
 
     def __str__(self):
         return f"{self.user} → {self.recurring_meeting.title}"
+    
+
+class UserNotificationSettings(models.Model):
+    """Настройки уведомлений для каждого пользователя."""
+    user = models.OneToOneField(
+        TelegramUser, on_delete=models.CASCADE,
+        related_name='notif_settings',
+    )
+    meeting_reminder_minutes = models.IntegerField(
+        default=60,
+        choices=[(15, '15 минут'), (60, '1 час'), (1440, '1 день')],
+        verbose_name="Напоминание о встрече",
+    )
+    digest_time = models.TimeField(
+        null=True, blank=True, default=dtime(9, 0),
+        verbose_name="Время дайджеста",
+    )
+    digest_enabled = models.BooleanField(default=True, verbose_name="Дайджест включён")
+    task_reminder_enabled = models.BooleanField(default=True, verbose_name="Напоминания о задачах")
+    meeting_reminder_enabled = models.BooleanField(default=True, verbose_name="Напоминания о встречах")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Настройки уведомлений"
+        verbose_name_plural = "Настройки уведомлений"
+
+    def __str__(self):
+        return f"Settings for user {self.user}"

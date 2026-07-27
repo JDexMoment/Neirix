@@ -7,11 +7,6 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
-print("BASE_DIR:", BASE_DIR)
-print("sys.path includes BASE_DIR:", str(BASE_DIR) in sys.path)
-print("Files in BASE_DIR:", list(BASE_DIR.iterdir()))
-print("Files in config:", list((BASE_DIR / 'config').iterdir()))
-
 import django
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -22,44 +17,38 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from django.conf import settings
 
-# Настройка Django
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 django.setup()
 
-
-# Импортируем роутеры из handlers
 from bot.handlers import summary, tasks, meetings, chat_link, chat_events, messages, roles
+from bot.handlers.settings import router as settings_router
 from bot.middlewares.fsm_timeout import FSMTimeoutMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 async def set_bot_commands(bot: Bot):
     """Регистрирует команды бота в меню Telegram."""
-
-    # Команды для всех чатов (и личных, и групповых)
     commands = [
         BotCommand(command="tasks", description="📋 Список открытых задач"),
         BotCommand(command="meetings", description="📅 Предстоящие встречи"),
         BotCommand(command="summary", description="📊 Саммари обсуждений"),
         BotCommand(command="link_chat", description="🔗 Получить код привязки чата"),
+        BotCommand(command="role", description="👤 Управление ролями"),
+        BotCommand(command="settings", description="⚙️ Настройки уведомлений"),
         BotCommand(command="help", description="📖 Справка по командам"),
     ]
-
-    # Устанавливаем для личных чатов
     await bot.set_my_commands(
         commands=commands,
         scope=BotCommandScopeAllPrivateChats(),
     )
-
-    # Устанавливаем для групповых чатов
     await bot.set_my_commands(
         commands=commands,
         scope=BotCommandScopeAllGroupChats(),
     )
-
-    # Дефолтный список (fallback)
     await bot.set_my_commands(commands=commands)
+
 
 async def main():
     bot = Bot(
@@ -69,13 +58,6 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.middleware(FSMTimeoutMiddleware())
 
-    original_send = bot.send_message
-    async def logged_send(chat_id, text, **kwargs):
-        logger.info(f"Sending to {chat_id}: {text[:50]}")
-        return await original_send(chat_id, text, **kwargs)
-    bot.send_message = logged_send
-
-    # Подключаем роутеры
     dp.include_router(chat_events.router)
     dp.include_router(chat_link.router)
     dp.include_router(summary.router)
@@ -83,6 +65,7 @@ async def main():
     dp.include_router(meetings.router)
     dp.include_router(messages.router)
     dp.include_router(roles.router)
+    dp.include_router(settings_router)
 
 
     @dp.message(Command("start"))
@@ -94,7 +77,7 @@ async def main():
                 "1. Добавьте меня в группу и выдайте права администратора.\n"
                 "2. В группе отправьте команду /link_chat — я пришлю код.\n"
                 "3. Скопируйте код и отправьте его сюда, в личные сообщения.\n\n"
-                "После привязки вам станут доступны команды /summary, /task, /meetings, /role."
+                "После привязки вам станут доступны команды /summary, /tasks, /meetings, /role, /settings."
             )
         else:
             await message.answer(
@@ -102,30 +85,43 @@ async def main():
                 "используйте команду /link_chat (доступна администраторам)."
             )
 
+
     @dp.message(Command("help"))
     async def cmd_help(message: Message):
         await message.answer(
-            "📖 <b>Доступные команды:</b>\n\n"
-            "📋 <b>Задачи:</b>\n"
-            "/tasks — список открытых задач\n\n"
-            "📅 <b>Встречи:</b>\n"
-            "/meetings — список предстоящих встреч\n\n"
-            "📊 <b>Саммари:</b>\n"
-            "/summary today — саммари за сегодня\n"
-            "/summary yesterday — за вчера\n"
-            "/summary week — за прошлую неделю\n"
-            "/summary YYYY-MM-DD YYYY-MM-DD — за период\n\n"
-            "🔗 <b>Привязка:</b>\n"
-            "/link_chat — получить код привязки чата и получить роль\n\n"
-            "Роли бывают: member - участник чата, manager - создатель заданий\встреч, admin - полный доступ.\n"
-            "/role                    — показать свою роль\n"
-            "/role list               — список участников чата с ролями\n"
-            "/role set @user manager  — назначить роль (только admin)\n"
-            "/role set @user member   — понизить (только admin)\n"
-            "💡 Задачи и встречи распознаются автоматически из сообщений.\n"
-            "Используйте кнопки под задачами и встречами для управления.",
+            "📖 <b>Как пользоваться ботом</b>\n\n"
+            "<b>📌 Работа в ЛС</b>\n"
+            "Вы можете создавать задачи и встречи прямо из личных сообщений:\n"
+            "• <code>задача для @user — сделать X до пятницы</code>\n"
+            "• <code>назначь встречу с клиентом на завтра в 14:00 для @user</code>\n"
+            "• <code>какие у меня задачи?</code> — список ваших задач\n"
+            "• <code>кто участник встречи X?</code> — вопрос о конкретной\n"
+            "• <code>перенеси встречу X на завтра</code> — изменение\n"
+            "• <code>каждую пятницу @user должен отправлять отчет</code> — повторяющиеся\n\n"
+            "Бот понимает естественный язык — пишите как человеку.\n\n"
+            "<b>📋 Команды</b>\n"
+            "/tasks [today|tomorrow|week|overdue] — задачи\n"
+            "/meetings [today|tomorrow|week] — встречи\n"
+            "/summary [today|yesterday|week|period] — саммари\n"
+            "/settings — настройки уведомлений (только в ЛС)\n\n"
+            "<b>👤 Роли</b>\n"
+            "/role — показать свою роль\n"
+            "/role list — список участников с ролями\n"
+            "/role set @user manager — назначить менеджера (admin)\n"
+            "/role set @user member — понизить (admin)\n\n"
+            "• <b>admin</b> — полный доступ, управление ролями\n"
+            "• <b>manager</b> — может создавать задачи и встречи\n"
+            "• <b>member</b> — только чтение\n\n"
+            "<b>🔧 Управление</b>\n"
+            "Используйте кнопки под задачами и встречами:\n"
+            "✅ Выполнено | ✏️ Редактировать | ❌ Отменить\n"
+            "Для повторяющихся: 🛑 Отменить серию\n\n"
+            "<b>🔗 Привязка чата</b>\n"
+            "/link_chat — получить код привязки (в группе, admin)\n"
+            "Отправьте код в ЛС боту.",
             parse_mode="HTML",
         )
+
 
     logger.info("Бот запущен")
     try:
@@ -133,6 +129,7 @@ async def main():
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
+
 
 if __name__ == '__main__':
     asyncio.run(main())

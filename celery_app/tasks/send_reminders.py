@@ -9,7 +9,7 @@ from django.utils import timezone
 from aiogram import Bot
 from asgiref.sync import sync_to_async
 
-from core.models import Meeting, Task, TaskAssignee, TelegramUser
+from core.models import Meeting, Task, TaskAssignee, TelegramUser, UserNotificationSettings
 from bot.services.notification_sender import NotificationSender
 
 logger = logging.getLogger(__name__)
@@ -32,98 +32,107 @@ def _is_bot_user(user: TelegramUser) -> bool:
 
 
 # ═════════════════════════════════════════════════════════════════════
-#  Окна поиска
+#  Универсальное напоминание о встрече (с учётом настроек пользователя)
 # ═════════════════════════════════════════════════════════════════════
 
-# «за 1 час»:  50–70 мин  (раньше 55–65)
-MEETING_1H_WINDOW = (50, 70)
+async def _send_meeting_reminders_by_window_async(window_minutes: int, tolerance: int = 10):
+    """
+    Отправляет напоминания о встречах, которые начнутся через ~window_minutes минут.
+    Для каждого пользователя проверяет его настройки (meeting_reminder_minutes).
+    Если у пользователя стоит другое время — пропускаем (он получит напоминание в другой таске).
 
-# «за 24 часа»: 22–26 ч  (раньше 23–25)
-MEETING_24H_WINDOW = (22, 26)
+    window_minutes: целевое время до встречи (15, 60 или 1440)
+    tolerance: разброс в минутах (по умолчанию ±10 минут)
+    """
+    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    sender = NotificationSender(bot)
+    try:
+        now = timezone.now()
+        window_start = now + timedelta(minutes=window_minutes - tolerance)
+        window_end = now + timedelta(minutes=window_minutes + tolerance)
+
+        meetings = await sync_to_async(list)(
+            Meeting.objects.filter(
+                status="active",
+                start_at__gte=window_start,
+                start_at__lte=window_end,
+            )
+            .prefetch_related("participants")
+            .select_related("topic__chat")
+        )
+
+        sent_count = 0
+        for meeting in meetings:
+            participants = await sync_to_async(list)(meeting.participants.all())
+            for user in participants:
+                if _is_bot_user(user):
+                    continue
+
+                # ═══ Проверяем настройки пользователя ═══
+                settings_obj = await sync_to_async(
+                    lambda: UserNotificationSettings.objects.filter(
+                        user=user, meeting_reminder_enabled=True
+                    ).first()
+                )()
+
+                if not settings_obj:
+                    # Нет настроек — используем значение по умолчанию (60 мин)
+                    if window_minutes != 60:
+                        continue
+                elif settings_obj.meeting_reminder_minutes != window_minutes:
+                    # У пользователя другое время — пропускаем
+                    continue
+
+                # Проверяем, не отправляли ли уже
+                reminder_field = None
+                if window_minutes == 1440:
+                    reminder_field = "daily_reminder_sent"
+                    already_sent = meeting.daily_reminder_sent
+                else:
+                    reminder_field = "reminder_sent"
+                    already_sent = meeting.reminder_sent
+
+                if already_sent:
+                    continue
+
+                # Отправляем
+                if window_minutes == 1440:
+                    success = await sender.send_meeting_in_24_hours(user, meeting)
+                else:
+                    success = await sender.send_meeting_in_1_hour(user, meeting)
+
+                if success:
+                    sent_count += 1
+
+            # Отмечаем отправленным только если хоть один получил
+            if window_minutes == 1440:
+                if not meeting.daily_reminder_sent and sent_count > 0:
+                    meeting.daily_reminder_sent = True
+                    await sync_to_async(meeting.save)(update_fields=["daily_reminder_sent"])
+            else:
+                if not meeting.reminder_sent and sent_count > 0:
+                    meeting.reminder_sent = True
+                    await sync_to_async(meeting.save)(update_fields=["reminder_sent"])
+
+        logger.info(
+            "Meeting reminders [%d min] total: %s",
+            window_minutes, sent_count,
+        )
+        return sent_count
+    finally:
+        await bot.session.close()
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Напоминание о встрече за ~1 час
-# ─────────────────────────────────────────────────────────────────────
+# ── Старые функции больше не нужны — всё идёт через универсальную ──
 
 async def _send_meeting_1h_reminders_async():
-    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
-    sender = NotificationSender(bot)
-    try:
-        now = timezone.now()
-        window_start = now + timedelta(minutes=MEETING_1H_WINDOW[0])
-        window_end = now + timedelta(minutes=MEETING_1H_WINDOW[1])
-
-        meetings = await sync_to_async(list)(
-            Meeting.objects.filter(
-                status="active",
-                reminder_sent=False,
-                start_at__gte=window_start,
-                start_at__lte=window_end,
-            )
-            .prefetch_related("participants")
-            .select_related("topic__chat")
-        )
-
-        sent_count = 0
-        for meeting in meetings:
-            participants = await sync_to_async(list)(meeting.participants.all())
-            for user in participants:
-                if _is_bot_user(user):
-                    continue
-                if await sender.send_meeting_in_1_hour(user, meeting):
-                    sent_count += 1
-
-            meeting.reminder_sent = True
-            await sync_to_async(meeting.save)(update_fields=["reminder_sent"])
-            logger.info("Meeting 1h reminder sent | meeting_id=%s", meeting.id)
-
-        logger.info("Meeting 1h reminders total: %s", sent_count)
-        return sent_count
-    finally:
-        await bot.session.close()
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  Напоминание о встрече за ~24 часа
-# ─────────────────────────────────────────────────────────────────────
+    return await _send_meeting_reminders_by_window_async(60, tolerance=10)
 
 async def _send_meeting_24h_reminders_async():
-    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
-    sender = NotificationSender(bot)
-    try:
-        now = timezone.now()
-        window_start = now + timedelta(hours=MEETING_24H_WINDOW[0])
-        window_end = now + timedelta(hours=MEETING_24H_WINDOW[1])
+    return await _send_meeting_reminders_by_window_async(1440, tolerance=120)  # ±2 часа
 
-        meetings = await sync_to_async(list)(
-            Meeting.objects.filter(
-                status="active",
-                daily_reminder_sent=False,
-                start_at__gte=window_start,
-                start_at__lte=window_end,
-            )
-            .prefetch_related("participants")
-            .select_related("topic__chat")
-        )
-
-        sent_count = 0
-        for meeting in meetings:
-            participants = await sync_to_async(list)(meeting.participants.all())
-            for user in participants:
-                if _is_bot_user(user):
-                    continue
-                if await sender.send_meeting_in_24_hours(user, meeting):
-                    sent_count += 1
-
-            meeting.daily_reminder_sent = True
-            await sync_to_async(meeting.save)(update_fields=["daily_reminder_sent"])
-            logger.info("Meeting 24h reminder sent | meeting_id=%s", meeting.id)
-
-        logger.info("Meeting 24h reminders total: %s", sent_count)
-        return sent_count
-    finally:
-        await bot.session.close()
+async def _send_meeting_15min_reminders_async():
+    return await _send_meeting_reminders_by_window_async(15, tolerance=5)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -159,6 +168,19 @@ async def _send_task_24h_reminders_async():
             for user in assignees:
                 if _is_bot_user(user):
                     continue
+
+                # ═══ Проверяем настройки пользователя ═══
+                settings_obj = await sync_to_async(
+                    lambda: UserNotificationSettings.objects.filter(
+                        user=user, task_reminder_enabled=True
+                    ).first()
+                )()
+                if settings_obj and not settings_obj.task_reminder_enabled:
+                    continue
+                if not settings_obj:
+                    # Нет настроек — шлём по умолчанию
+                    pass
+
                 if await sender.send_task_in_24_hours(user, task):
                     sent_count += 1
 
@@ -200,6 +222,16 @@ async def _send_overdue_task_reminders_async():
             for user in assignees:
                 if _is_bot_user(user):
                     continue
+
+                # ═══ Проверяем настройки пользователя ═══
+                settings_obj = await sync_to_async(
+                    lambda: UserNotificationSettings.objects.filter(
+                        user=user, task_reminder_enabled=True
+                    ).first()
+                )()
+                if settings_obj and not settings_obj.task_reminder_enabled:
+                    continue
+
                 if await sender.send_task_overdue(user, task):
                     sent_count += 1
 
@@ -226,6 +258,17 @@ async def _send_daily_digest_async():
         today_end = today_start + timedelta(days=1)
         sent_count = 0
 
+        # Получаем пользователей с включённым дайджестом
+        digest_users = await sync_to_async(list)(
+            UserNotificationSettings.objects.filter(
+                digest_enabled=True,
+                digest_time__hour=now.hour,
+            ).select_related("user")
+        )
+
+        # Если есть пользователи с кастомным временем — шлём им отдельно
+        # (для остальных — стандартный дайджест через TaskAssignee)
+
         # ── Задачи на сегодня ──────────────────────────────────────
         today_task_links = await sync_to_async(list)(
             TaskAssignee.objects.filter(
@@ -240,6 +283,14 @@ async def _send_daily_digest_async():
         for ta in today_task_links:
             if _is_bot_user(ta.user):
                 continue
+
+            # Проверяем digest_enabled для пользователя
+            user_digest = [du for du in digest_users if du.user_id == ta.user_id]
+            if user_digest:
+                # У этого пользователя кастомное время — пропускаем,
+                # он получит дайджест в своё время
+                continue
+
             if await sender.send_task_today(ta.user, ta.task):
                 sent_count += 1
 
@@ -260,6 +311,12 @@ async def _send_daily_digest_async():
             for user in participants:
                 if _is_bot_user(user):
                     continue
+
+                # Проверяем digest_enabled для пользователя
+                user_digest = [du for du in digest_users if du.user_id == user.id]
+                if user_digest:
+                    continue
+
                 if await sender.send_meeting_today(user, meeting):
                     sent_count += 1
 
@@ -287,7 +344,6 @@ async def _send_task_assigned_notification_async(task_id: int):
             logger.warning("Task %s not found for notification", task_id)
             return 0
 
-        # Название чата
         chat_title = ""
         try:
             chat_title = task.topic.chat.title or ""
@@ -295,7 +351,6 @@ async def _send_task_assigned_notification_async(task_id: int):
             pass
         source_block = f"\n📍 Чат: {chat_title}\n" if chat_title else "\n"
 
-        # Форматируем срок
         due_str = _format_due_date_sync(task)
 
         sent_count = 0
@@ -303,6 +358,16 @@ async def _send_task_assigned_notification_async(task_id: int):
             user = ta.user
             if _is_bot_user(user):
                 continue
+
+            # ═══ Проверяем настройки пользователя ═══
+            settings_obj = await sync_to_async(
+                lambda: UserNotificationSettings.objects.filter(
+                    user=user, task_reminder_enabled=True
+                ).first()
+            )()
+            if settings_obj and not settings_obj.task_reminder_enabled:
+                continue
+
             try:
                 await bot.send_message(
                     user.telegram_id,
@@ -345,7 +410,6 @@ async def _send_unassigned_task_notification_async(task_id: int):
             logger.warning("Task %s has no creator, skipping notification", task_id)
             return 0
 
-        # Уже есть исполнитель?
         assignee_count = await sync_to_async(lambda: task.assignees.count())()
         if assignee_count > 0:
             return 0
@@ -359,7 +423,6 @@ async def _send_unassigned_task_notification_async(task_id: int):
 
         due_str = _format_due_date_sync(task)
 
-        # Создаём inline-клавиатуру через aiogram
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
@@ -416,7 +479,6 @@ def _format_due_date_sync(task) -> str:
 # ═════════════════════════════════════════════════════════════════════
 
 async def _send_meeting_assigned_notification_async(meeting_id: int):
-    """Отправляет уведомление участникам о новой/изменённой встрече."""
     bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
     try:
         meeting = await sync_to_async(
@@ -445,6 +507,16 @@ async def _send_meeting_assigned_notification_async(meeting_id: int):
         for user in meeting.participants.all():
             if _is_bot_user(user):
                 continue
+
+            # ═══ Проверяем настройки пользователя ═══
+            settings_obj = await sync_to_async(
+                lambda: UserNotificationSettings.objects.filter(
+                    user=user, meeting_reminder_enabled=True
+                ).first()
+            )()
+            if settings_obj and not settings_obj.meeting_reminder_enabled:
+                continue
+
             try:
                 await bot.send_message(
                     user.telegram_id,
@@ -467,14 +539,28 @@ async def _send_meeting_assigned_notification_async(meeting_id: int):
     finally:
         await bot.session.close()
 
+
+# ═════════════════════════════════════════════════════════════════════
+#  Celery-задачи
+# ═════════════════════════════════════════════════════════════════════
+
+
 @shared_task(name="celery_app.tasks.send_reminders.send_meeting_reminders")
 def send_meeting_reminders():
+    """Напоминания за 1 час (или 15 минут — по настройкам пользователя)."""
     return _run_async(_send_meeting_1h_reminders_async())
 
 
 @shared_task(name="celery_app.tasks.send_reminders.send_meeting_24h_reminders")
 def send_meeting_24h_reminders():
+    """Напоминания за 1 день."""
     return _run_async(_send_meeting_24h_reminders_async())
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_meeting_15min_reminders")
+def send_meeting_15min_reminders():
+    """Напоминания за 15 минут."""
+    return _run_async(_send_meeting_15min_reminders_async())
 
 
 @shared_task(name="celery_app.tasks.send_reminders.send_task_24h_reminders")
@@ -494,95 +580,37 @@ def send_daily_digest():
 
 @shared_task(name="celery_app.tasks.send_reminders.send_task_assigned_notification")
 def send_task_assigned_notification(task_id: int):
-    """Уведомляет исполнителей о новой задаче."""
     return _run_async(_send_task_assigned_notification_async(task_id))
 
 
 @shared_task(name="celery_app.tasks.send_reminders.send_unassigned_task_notification")
 def send_unassigned_task_notification(task_id: int):
-    """Уведомляет создателя о задаче без исполнителя."""
     return _run_async(_send_unassigned_task_notification_async(task_id))
-
-
-# ═════════════════════════════════════════════════════════════════════
-#  Уведомление создателю о встрече без участников
-# ═════════════════════════════════════════════════════════════════════
-
-async def _send_meeting_without_participants_async(meeting_id: int):
-    """Отправляет создателю уведомление, что у встречи нет участников."""
-    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
-    try:
-        meeting = await sync_to_async(
-            lambda: Meeting.objects.filter(id=meeting_id)
-            .select_related("creator", "topic__chat")
-            .first()
-        )()
-        if not meeting:
-            logger.warning("Meeting %s not found for notification", meeting_id)
-            return 0
-
-        creator = meeting.creator
-        if not creator:
-            logger.warning("Meeting %s has no creator, skipping notification", meeting_id)
-            return 0
-
-        # Уже есть участники?
-        participant_count = await sync_to_async(lambda: meeting.participants.count())()
-        if participant_count > 0:
-            return 0
-
-        chat_title = ""
-        try:
-            chat_title = meeting.topic.chat.title or ""
-        except Exception:
-            pass
-        source_block = f"\n📍 Чат: {chat_title}\n" if chat_title else "\n"
-
-        dt = meeting.start_at
-        if timezone.is_aware(dt):
-            dt = timezone.localtime(dt)
-        time_str = dt.strftime("%d.%m.%Y %H:%M")
-
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="👤 Назначить участников",
-                callback_data=f"meeting_edit_participants:{meeting_id}",
-            )]
-        ])
-
-        try:
-            await bot.send_message(
-                creator.telegram_id,
-                f"📅 <b>Встреча без участников:</b>\n"
-                f"<b>{meeting.title}</b>\n"
-                f"  ⏰ {time_str}"
-                f"{source_block}"
-                f"У встречи нет участников. Напишите @username тех, "
-                f"кого нужно пригласить.\n\n"
-                f"<i>Пример: @ivanov @petrov</i>",
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-            logger.info("Meeting without participants notification sent for %s", meeting_id)
-            return 1
-        except Exception as e:
-            logger.warning("Failed to notify creator %s: %s", creator, e)
-            return 0
-    finally:
-        await bot.session.close()
 
 
 @shared_task(name="celery_app.tasks.send_reminders.send_meeting_without_participants_notification")
 def send_meeting_without_participants_notification(meeting_id: int):
-    """Уведомляет создателя о встрече без участников."""
     return _run_async(_send_meeting_without_participants_async(meeting_id))
 
 
 @shared_task(name="celery_app.tasks.send_reminders.send_meeting_assigned_notification")
 def send_meeting_assigned_notification(meeting_id: int):
-    """Уведомляет участников о новой/изменённой встрече."""
     return _run_async(_send_meeting_assigned_notification_async(meeting_id))
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_task_changed_notification")
+def send_task_changed_notification(task_id: int, changes: str):
+    return _run_async(_send_task_changed_notification_async(task_id, changes))
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_meeting_changed_notification")
+def send_meeting_changed_notification(meeting_id: int, changes: str):
+    return _run_async(_send_meeting_changed_notification_async(meeting_id, changes))
+
+
+@shared_task(name="celery_app.tasks.send_reminders.send_meeting_cancelled_notification")
+def send_meeting_cancelled_notification(meeting_id: int):
+    return _run_async(_send_meeting_cancelled_notification_async(meeting_id))
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -590,7 +618,6 @@ def send_meeting_assigned_notification(meeting_id: int):
 # ═════════════════════════════════════════════════════════════════════
 
 async def _send_task_changed_notification_async(task_id: int, changes: str):
-    """Отправляет уведомление исполнителям об изменении задачи."""
     bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
     try:
         task = await sync_to_async(
@@ -614,6 +641,15 @@ async def _send_task_changed_notification_async(task_id: int, changes: str):
             user = ta.user
             if _is_bot_user(user):
                 continue
+
+            settings_obj = await sync_to_async(
+                lambda: UserNotificationSettings.objects.filter(
+                    user=user, task_reminder_enabled=True
+                ).first()
+            )()
+            if settings_obj and not settings_obj.task_reminder_enabled:
+                continue
+
             try:
                 await bot.send_message(
                     user.telegram_id,
@@ -632,18 +668,11 @@ async def _send_task_changed_notification_async(task_id: int, changes: str):
         await bot.session.close()
 
 
-@shared_task(name="celery_app.tasks.send_reminders.send_task_changed_notification")
-def send_task_changed_notification(task_id: int, changes: str):
-    """Уведомляет исполнителей об изменении задачи."""
-    return _run_async(_send_task_changed_notification_async(task_id, changes))
-
-
 # ═════════════════════════════════════════════════════════════════════
 #  Уведомление об изменении встречи (участникам)
 # ═════════════════════════════════════════════════════════════════════
 
 async def _send_meeting_changed_notification_async(meeting_id: int, changes: str):
-    """Отправляет уведомление участникам об изменении встречи."""
     bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
     try:
         meeting = await sync_to_async(
@@ -666,6 +695,15 @@ async def _send_meeting_changed_notification_async(meeting_id: int, changes: str
         for user in meeting.participants.all():
             if _is_bot_user(user):
                 continue
+
+            settings_obj = await sync_to_async(
+                lambda: UserNotificationSettings.objects.filter(
+                    user=user, meeting_reminder_enabled=True
+                ).first()
+            )()
+            if settings_obj and not settings_obj.meeting_reminder_enabled:
+                continue
+
             try:
                 await bot.send_message(
                     user.telegram_id,
@@ -684,19 +722,11 @@ async def _send_meeting_changed_notification_async(meeting_id: int, changes: str
         await bot.session.close()
 
 
-
-@shared_task(name="celery_app.tasks.send_reminders.send_meeting_changed_notification")
-def send_meeting_changed_notification(meeting_id: int, changes: str):
-    """Уведомляет участников об изменении встречи."""
-    return _run_async(_send_meeting_changed_notification_async(meeting_id, changes))
-
-
 # ═════════════════════════════════════════════════════════════════════
 #  Уведомление об отмене встречи
 # ═════════════════════════════════════════════════════════════════════
 
 async def _send_meeting_cancelled_notification_async(meeting_id: int):
-    """Отправляет уведомление участникам об отмене встречи."""
     bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
     try:
         meeting = await sync_to_async(
@@ -741,8 +771,65 @@ async def _send_meeting_cancelled_notification_async(meeting_id: int):
         await bot.session.close()
 
 
-@shared_task(name="celery_app.tasks.send_reminders.send_meeting_cancelled_notification")
-def send_meeting_cancelled_notification(meeting_id: int):
-    """Уведомляет участников об отмене встречи."""
-    return _run_async(_send_meeting_cancelled_notification_async(meeting_id))
+# ═════════════════════════════════════════════════════════════════════
+#  Уведомление создателю о встрече без участников
+# ═════════════════════════════════════════════════════════════════════
 
+async def _send_meeting_without_participants_async(meeting_id: int):
+    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    try:
+        meeting = await sync_to_async(
+            lambda: Meeting.objects.filter(id=meeting_id)
+            .select_related("creator", "topic__chat")
+            .first()
+        )()
+        if not meeting:
+            return 0
+
+        creator = meeting.creator
+        if not creator:
+            return 0
+
+        participant_count = await sync_to_async(lambda: meeting.participants.count())()
+        if participant_count > 0:
+            return 0
+
+        chat_title = ""
+        try:
+            chat_title = meeting.topic.chat.title or ""
+        except Exception:
+            pass
+        source_block = f"\n📍 Чат: {chat_title}\n" if chat_title else "\n"
+
+        dt = meeting.start_at
+        if timezone.is_aware(dt):
+            dt = timezone.localtime(dt)
+        time_str = dt.strftime("%d.%m.%Y %H:%M")
+
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="👤 Назначить участников",
+                callback_data=f"meeting_edit_participants:{meeting_id}",
+            )]
+        ])
+
+        try:
+            await bot.send_message(
+                creator.telegram_id,
+                f"📅 <b>Встреча без участников:</b>\n"
+                f"<b>{meeting.title}</b>\n"
+                f"  ⏰ {time_str}"
+                f"{source_block}"
+                f"У встречи нет участников. Напишите @username тех, "
+                f"кого нужно пригласить.\n\n"
+                f"<i>Пример: @ivanov @petrov</i>",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            return 1
+        except Exception as e:
+            logger.warning("Failed to notify creator %s: %s", creator, e)
+            return 0
+    finally:
+        await bot.session.close()

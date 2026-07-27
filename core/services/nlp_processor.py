@@ -70,6 +70,31 @@ def _extract_title_from_text(text: str, intent: str) -> str:
     return ""
 
 
+def _extract_task_title_from_text(text: str) -> str:
+    """Пытается извлечь название задачи из текста, если LLM не смог."""
+    if not text:
+        return ""
+    t = text
+    # Убираем префикс "назначь/создай/добавь/новую задачу"
+    t = re.sub(r'^(?:назначь|создай|добавь|новую)\s+задач[уи]\s+', '', t)
+    # Убираем "задачу/задачи" в начале (если не было префикса)
+    t = re.sub(r'^задач[ауи]\s+', '', t)
+    # Убираем "для @username"
+    t = re.sub(r'для\s+@\w+\s*', '', t)
+    # Убираем начальные разделители (тире, двоеточие, запятые, пробелы)
+    t = re.sub(r'^[\s\-–—,:=]+', '', t)
+    # Берём текст до "до" (дата) или до конца
+    m = re.search(r'^(.+?)(?:\s+до\s||$)', t)
+    if m:
+        candidate = m.group(1).strip().rstrip('.,!?')
+        if candidate and len(candidate) > 3:
+            return candidate
+    candidate = t.strip().rstrip('.,!?')
+    if candidate and len(candidate) > 3:
+        return candidate
+    return ""
+
+
 def _parse_assignees(raw: str) -> List[str]:
     if not raw:
         return []
@@ -516,6 +541,9 @@ async def _handle_create_task(bot, chat_id: int, user_telegram_id: int, text: st
     from core.services.task_service import TaskService
 
     title = nlp_result.get("title", "")
+    if not title:
+        # ═══ Пробуем извлечь название из текста ═══
+        title = _extract_task_title_from_text(text)
     if not title:
         await _send(bot, chat_id, "Не удалось определить название задачи.", thread_id=thread_id)
         return
