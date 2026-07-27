@@ -45,8 +45,7 @@ async def handle_text_message(message: Message):
     """
     Сохраняет входящее текстовое сообщение в БД.
     В ЛС — сначала проверяет NLP-запрос.
-    Если это запрос (задачи/встречи) — отвечает и НЕ буферизирует.
-    Если это данные — буферизирует как обычно.
+    Если это ответ на сообщение бота с задачей/встречей — создаёт комментарий.
     """
 
     @sync_to_async
@@ -135,7 +134,34 @@ async def handle_text_message(message: Message):
 
     db_message, db_user, chat = await save_message()
 
-    # ═══ В ЛС — сначала проверяем NLP-запрос ═══
+    # ═══ Проверяем, не является ли это комментарием к задаче/встрече ═══
+    # Если пользователь ответил на сообщение бота, в котором есть **название**
+    if message.reply_to_message and message.reply_to_message.text:
+        from bot.handlers.comments import _extract_title_from_msg, _find_task_by_title, _find_meeting_by_title, _add_comment
+        replied_text = message.reply_to_message.text
+        title = _extract_title_from_msg(replied_text)
+        if title:
+            comment_text = message.text.strip()
+            if len(comment_text) >= 2:
+                chat_id_num = chat.chat_id
+                task = await _find_task_by_title(chat_id_num, title)
+                meeting = None
+                if not task:
+                    meeting = await _find_meeting_by_title(chat_id_num, title)
+                if task or meeting:
+                    kwargs = {"author_id": message.from_user.id, "text": comment_text}
+                    if task:
+                        kwargs["task_id"] = task.id
+                    elif meeting:
+                        kwargs["meeting_id"] = meeting.id
+                    result = await _add_comment(**kwargs)
+                    if result:
+                        target = "задачи" if task else "встречи"
+                        await message.reply(f"💬 Комментарий добавлен к {target} «{title}»")
+                        logger.info("Comment added via reply: %s → %s", db_user, title)
+                    return  # не буферизируем комментарий
+
+    # ═══ В ЛС — через Celery (не блокируем бота) ═══
     if message.chat.type == "private":
         from celery_app.tasks.nlp_processing import process_nlp_message
         process_nlp_message.delay(
@@ -146,7 +172,7 @@ async def handle_text_message(message: Message):
             telegram_msg_id=message.message_id,
             message_thread_id=message.message_thread_id or 0,
         )
-        return 
+        return
 
     # ═══ Проверка прав: только manager/admin попадают в буфер ═══
     can_create = await sync_to_async(_can_create_in_chat)(db_user, chat)

@@ -7,9 +7,10 @@ from aiogram.types import InlineKeyboardButton
 # ─────────────────────────────────────────────────────────────────────
 
 
-def task_keyboard(task_id: int, has_recurrence: bool = False):
+def task_keyboard(task_id: int, has_recurrence: bool = False, comment_count: int = 0):
     """Кнопки 'Выполнено' и 'Редактировать' под каждой задачей.
-       Если задача — часть серии, добавляем 'Отменить серию'."""
+       Если задача — часть серии, добавляем 'Отменить серию'.
+       Если есть комментарии — добавляем кнопку '💬 (n)'."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="✅ Выполнено",
@@ -24,9 +25,15 @@ def task_keyboard(task_id: int, has_recurrence: bool = False):
             text="🛑 Отменить серию",
             callback_data=f"task_cancel_series:{task_id}",
         ))
-        builder.adjust(2, 1)
+    if comment_count > 0:
+        builder.add(InlineKeyboardButton(
+            text=f"💬 {comment_count}",
+            callback_data=f"task_info:{task_id}",
+        ))
+    if has_recurrence:
+        builder.adjust(2, 1, 1) if comment_count > 0 else builder.adjust(2, 1)
     else:
-        builder.adjust(2)
+        builder.adjust(2, 1) if comment_count > 0 else builder.adjust(2)
     return builder.as_markup()
 
 
@@ -93,9 +100,10 @@ def task_cancel_series_confirm_keyboard(task_id: int):
 # ─────────────────────────────────────────────────────────────────────
 
 
-def meeting_keyboard(meeting_id: int, has_recurrence: bool = False):
+def meeting_keyboard(meeting_id: int, has_recurrence: bool = False, comment_count: int = 0):
     """Кнопки 'Редактировать' и 'Отменить' под каждой встречей.
-       Если встреча часть серии — добавляем кнопку отмены всей серии."""
+       Если встреча часть серии — добавляем кнопку отмены всей серии.
+       Если есть комментарии — добавляем кнопку '💬 (n)'."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="✏️ Редактировать",
@@ -110,9 +118,15 @@ def meeting_keyboard(meeting_id: int, has_recurrence: bool = False):
             text="🛑 Отменить всю серию",
             callback_data=f"meeting_cancel_series:{meeting_id}",
         ))
-        builder.adjust(2, 1)
+    if comment_count > 0:
+        builder.add(InlineKeyboardButton(
+            text=f"💬 {comment_count}",
+            callback_data=f"meeting_info:{meeting_id}",
+        ))
+    if has_recurrence:
+        builder.adjust(2, 1, 1) if comment_count > 0 else builder.adjust(2, 1)
     else:
-        builder.adjust(2)
+        builder.adjust(2, 1) if comment_count > 0 else builder.adjust(2)
     return builder.as_markup()
 
 

@@ -303,13 +303,17 @@ async def _respond_tasks(message: Message, chat, topic, db_user, filters: dict):
         await message.answer(text, parse_mode="HTML")
         return
 
+    from bot.handlers.comments import _get_comment_counts
+    task_ids = [t.id for t in tasks]
+    comment_counts = await _get_comment_counts(task_ids=task_ids)
     for i, task in enumerate(tasks, 1):
         rec_text = await _get_recurrence_text(task)
         has_rec = task.recurrence_group_id is not None
+        c_count = comment_counts.get(task.id, 0)
         await message.answer(
             f"{i}. {_build_task_text(task, rec_text)}",
             parse_mode="HTML",
-            reply_markup=task_keyboard(task.id, has_recurrence=has_rec),
+            reply_markup=task_keyboard(task.id, has_recurrence=has_rec, comment_count=c_count),
         )
 
 

@@ -353,13 +353,17 @@ async def _respond_meetings(message: Message, chat, topic, db_user, nlp_filters:
     meetings = _filter_recurring_meetings(meetings)
     # ═══ Загружаем статусы подтверждения ═══
     attendance_data = await _load_attendance_icons(meetings)
+    from bot.handlers.comments import _get_comment_counts
+    meeting_ids = [m.id for m in meetings]
+    comment_counts = await _get_comment_counts(meeting_ids=meeting_ids)
     for m in meetings:
         has_rec = _has_recurrence(m)
         icons = attendance_data.get(m.id)
+        c_count = comment_counts.get(m.id, 0)
         await message.answer(
             _build_meeting_text(m, icons),
             parse_mode="HTML",
-            reply_markup=meeting_keyboard(m.id, has_recurrence=has_rec),
+            reply_markup=meeting_keyboard(m.id, has_recurrence=has_rec, comment_count=c_count),
         )
 
 

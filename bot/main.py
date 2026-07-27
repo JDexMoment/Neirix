@@ -22,6 +22,7 @@ django.setup()
 
 from bot.handlers import summary, tasks, meetings, chat_link, chat_events, messages, roles
 from bot.handlers.settings import router as settings_router
+from bot.handlers.comments import router as comments_router
 from bot.handlers.meeting_attendance import router as attendance_router
 from bot.middlewares.fsm_timeout import FSMTimeoutMiddleware
 
@@ -38,6 +39,8 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="link_chat", description="🔗 Получить код привязки чата"),
         BotCommand(command="role", description="👤 Управление ролями"),
         BotCommand(command="settings", description="⚙️ Настройки уведомлений"),
+        BotCommand(command="task_info", description="💬 Комментарии к задаче"),
+        BotCommand(command="meeting_info", description="💬 Комментарии ко встрече"),
         BotCommand(command="help", description="📖 Справка по командам"),
     ]
     await bot.set_my_commands(
@@ -67,6 +70,7 @@ async def main():
     dp.include_router(messages.router)
     dp.include_router(roles.router)
     dp.include_router(settings_router)
+    dp.include_router(comments_router)
     dp.include_router(attendance_router)
 
 

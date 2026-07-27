@@ -384,3 +384,30 @@ class MeetingAttendance(models.Model):
 
     def __str__(self):
         return f"{self.user} → {self.meeting.title}: {self.status}"
+
+
+class Comment(models.Model):
+    """Комментарий к задаче или встрече."""
+    task = models.ForeignKey(
+        Task, null=True, blank=True, on_delete=models.CASCADE,
+        related_name='comments', verbose_name="Задача",
+    )
+    meeting = models.ForeignKey(
+        Meeting, null=True, blank=True, on_delete=models.CASCADE,
+        related_name='comments', verbose_name="Встреча",
+    )
+    author = models.ForeignKey(
+        TelegramUser, on_delete=models.CASCADE,
+        verbose_name="Автор",
+    )
+    text = models.TextField(verbose_name="Текст комментария")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Комментарий"
+        verbose_name_plural = "Комментарии"
+        ordering = ['created_at']
+
+    def __str__(self):
+        target = self.task.title if self.task else (self.meeting.title if self.meeting else "?")
+        return f"💬 {self.author} → {target}: {self.text[:50]}"
