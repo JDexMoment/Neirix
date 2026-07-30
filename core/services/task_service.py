@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, TYPE_CHECKING
 
 from django.db.models import Q
@@ -61,10 +61,6 @@ def _filter_author_from_list(names: List[str], source_message: Message) -> List[
 
 @sync_to_async
 def _resolve_topic_for_private_message(source_message: Message) -> Optional[Topic]:
-    """
-    Если source_message пришёл из приватного чата, находит Topic
-    привязанной группы (через UserRole). Иначе возвращает исходный topic.
-    """
     chat = source_message.chat
     if chat.type != "private":
         return source_message.topic
@@ -123,7 +119,7 @@ class TaskService:
                 return None
 
             topic = await _resolve_topic_for_private_message(source_message)
-                        # ═══ Проверка прав: member не может создавать задачи ═══
+
             if not await sync_to_async(user_can_create)(source_message):
                 logger.warning(
                     "Permission denied: user %s cannot create tasks in chat %s",
@@ -147,8 +143,7 @@ class TaskService:
                        assignees,
                        source_message.author.username if source_message and source_message.author else "None",
                        source_message.text[:100] if source_message and source_message.text else "None")
-            
-            # ═══ БАТЧ-ФИКС: не фильтруем автора, если assignee не упомянут в source_message ═══
+
             if _is_author_mentioned_in_batch(assignees, source_message):
                 assignees = _filter_author_from_list(assignees, source_message)
                 logger.info("DEBUG batch_assignees filter APPLIED -> %s", assignees)
@@ -165,7 +160,6 @@ class TaskService:
                     assignee_objects.append(user)
                 elif not user:
                     logger.warning("Task: assignee %r not found in DB", raw_name)
-                    # Создаём placeholder, чтобы пользователь отображался
                     try:
                         placeholder = await sync_to_async(TelegramUser.objects.create)(
                             telegram_id=-(abs(hash(clean_name)) % 1_000_000_000 + 1_000_000_000),
@@ -198,6 +192,46 @@ class TaskService:
                 logger.info("DEBUG_TASK: Creating TaskAssignee for task_id=%s, user_id=%s, username=%s",
                            task.id if task else "pending", user.id, user.username)
                 await sync_to_async(TaskAssignee.objects.create)(task=task, user=user)
+
+            # ════════════════════════════════════════════════════════════
+            # Приоритет задачи
+            # ════════════════════════════════════════════════════════════
+            # ═══ Fallback: парсим priority из текста сообщения ═══
+            if not task_data.get("priority") and source_message and source_message.text:
+                text_lower = source_message.text.lower()
+                if any(w in text_lower for w in ["срочно", "срочная", "asap", "быстрее", "как можно"]):
+                    task_data["priority"] = "critical"
+                elif any(w in text_lower for w in ["важно", "важная", "приоритет"]):
+                    task_data["priority"] = "high"
+                elif any(w in text_lower for w in ["когда будет время", "свободен", "не срочно"]):
+                    task_data["priority"] = "low"
+
+            # ═══ Fix: если due_date сильно в прошлом (>7 дней) — пробуем следующий месяц ═══
+            if due_date and due_date < timezone.now() - timedelta(days=7):
+                try:
+                    new_month = due_date.month + 1
+                    new_year = due_date.year
+                    if new_month > 12:
+                        new_month = 1
+                        new_year += 1
+                    from calendar import monthrange
+                    last_day = monthrange(new_year, new_month)[1]
+                    new_day = min(due_date.day, last_day)
+                    corrected_due = due_date.replace(year=new_year, month=new_month, day=new_day,
+                                                     hour=23, minute=59, second=0, microsecond=0)
+                    # ═══ Сохраняем исправленную дату в БД ═══
+                    await sync_to_async(Task.objects.filter(id=task.id).update)(due_date=corrected_due)
+                    due_date = corrected_due
+                    logger.info("Due date corrected | task_id=%s", task.id)
+                except (ValueError, AttributeError):
+                    pass
+
+            priority_raw = task_data.get("priority")
+            if priority_raw:
+                valid = {"critical", "high", "normal", "low"}
+                if priority_raw.lower() in valid:
+                    await sync_to_async(Task.objects.filter(id=task.id).update)(priority=priority_raw.lower())
+                    logger.info("Priority set | task_id=%s priority=%s", task.id, priority_raw)
 
             # ════════════════════════════════════════════════════════════
             # Повторяющиеся задачи: если LLM вернула recurrence
@@ -294,7 +328,6 @@ class TaskService:
     # ── Запросы ─────────────────────────────────────────────────
 
     async def get_task_by_id(self, task_id: int) -> Optional[Task]:
-        """Получает задачу по ID с prefetch_related assignees."""
         def _get():
             return (
                 Task.objects.filter(id=task_id)
@@ -325,12 +358,10 @@ class TaskService:
             except Task.DoesNotExist:
                 return False
 
-        # Сначала выполняем синхронную часть (статус)
         result = await sync_to_async(_update)()
         if not result:
             return False
 
-        # ═══ АСИНХРОННАЯ часть: проверяем рекурренс (НЕ внутри _update!) ═══
         try:
             task = await sync_to_async(Task.objects.get)(id=task_id)
             rec_svc = RecurrenceService()
@@ -353,7 +384,6 @@ class TaskService:
     # ── Редактирование задачи ────────────────────────────────────
 
     async def update_due_date(self, task_id: int, new_due_date_str: str) -> bool:
-        """Обновляет due_date задачи по строке вида 'YYYY-MM-DD'."""
         def _update() -> bool:
             try:
                 task = Task.objects.get(id=task_id)
@@ -371,13 +401,10 @@ class TaskService:
     async def update_assignees(
         self, task_id: int, assignee_usernames: List[str],
     ) -> bool:
-        """Заменяет исполнителей задачи. Если список пуст — удаляет всех."""
         def _update() -> bool:
             try:
                 task = Task.objects.get(id=task_id)
-                # Удаляем старых исполнителей
                 TaskAssignee.objects.filter(task=task).delete()
-                # Добавляем новых
                 for raw_name in assignee_usernames:
                     clean_name = raw_name.lstrip("@").strip()
                     if not clean_name:
@@ -391,7 +418,6 @@ class TaskService:
         return await sync_to_async(_update)()
 
     async def update_title(self, task_id: int, new_title: str) -> bool:
-        """Обновляет название задачи."""
         def _update() -> bool:
             try:
                 task = Task.objects.get(id=task_id)
@@ -416,7 +442,6 @@ class TaskService:
 
 
 def _is_author_mentioned_in_batch(assignees: List[str], source_message: Message) -> bool:
-    """Возвращает True, если хотя бы один assignee упомянут в тексте source_message."""
     if not source_message or not source_message.text:
         return True
     text_lower = source_message.text.lower()

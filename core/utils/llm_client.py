@@ -577,12 +577,35 @@ class LLMClient:
                 else:
                     recurrence = None
 
+                # ═══ priority из LLM ═══
+                priority = task.get("priority")
+                if priority and priority not in ("critical", "high", "normal", "low"):
+                    priority = None
+                if not priority:
+                    # Fallback из названия задачи
+                    title_lower = title.lower()
+                    if any(w in title_lower for w in ["срочно", "срочная", "asap", "быстрее"]):
+                        priority = "critical"
+                    elif any(w in title_lower for w in ["важно", "важная", "приоритет"]):
+                        priority = "high"
+                if not priority:
+                    # ═══ Fallback из ИСХОДНОГО текста (LLM мог вырезать ключевые слова) ═══
+                    text_lower = content_text.lower()
+                    if any(w in text_lower for w in ["срочно", "срочная", "asap", "быстрее", "как можно скорее", "как можно быстрее", "быстро"]):
+                        priority = "critical"
+                    elif any(w in text_lower for w in ["важно", "важная", "приоритет", "важное", "важный", "приоритетная"]):
+                        priority = "high"
+                    elif any(w in text_lower for w in ["не срочно", "когда будет время", "когда будешь свободен", "как появится время", "как будет время", "свободен", "неспешно"]):
+                        priority = "low"
+                    else:
+                        priority = "normal"  # ═══ Явно ставим normal для всех остальных ═══
+
                 normalized_tasks.append({
                     "title": title,
                     "assignees": merged,
                     "due_date": due_date,
                     "description": desc,
-                    "recurrence": recurrence,
+                    "priority": priority,
                 })
 
             # ── Нормализация встреч ─────────────────────────────

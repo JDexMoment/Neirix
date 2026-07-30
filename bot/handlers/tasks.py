@@ -120,9 +120,20 @@ def _format_creator(creator) -> str:
     return creator.full_name or f"id={creator.id}"
 
 
+def _get_priority_emoji(task) -> str:
+    p = getattr(task, 'priority', 'normal') or 'normal'
+    return {
+        'critical': '🔴 ',
+        'high': '🟡 ',
+        'normal': '',
+        'low': '⚪ ',
+    }.get(p, '')
+
+
 def _build_task_text(task: Task, recurrence_text: str = None) -> str:
+    emoji = _get_priority_emoji(task)
     text = (
-        f"<b>{task.title}</b>\n"
+        f"{emoji}<b>{task.title}</b>\n"
         f"👤 {_format_assignees(task)}\n"
         f"{_format_due_date(task)}\n"
         f"📝 Назначил(а): {_format_creator(task.creator)}"
@@ -170,6 +181,8 @@ def _parse_task_filters(text: str, user: TelegramUser) -> dict:
             filters["status"] = "done"
         elif part in ("my", "мои", "моё"):
             filters["my"] = True
+        elif part in ("important", "важные", "важно", "срочно"):
+            filters["important"] = True
         elif part.startswith("@"):
             filters["assignee_username"] = part.lstrip("@")
 
@@ -213,6 +226,10 @@ def _apply_task_filters(tasks: list, filters: dict, user: TelegramUser) -> list:
 
         # My tasks (in group)
         if filters.get("my") and user not in [a.user for a in task.assignees.all()]:
+            include = False
+
+        # ═══ Фильтр "важные" ═══
+        if filters.get("important") and getattr(task, 'priority', 'normal') not in ('critical', 'high'):
             include = False
 
         if include:
@@ -276,6 +293,11 @@ async def _respond_tasks(message: Message, chat, topic, db_user, filters: dict):
 
     if filters:
         tasks = _apply_task_filters(tasks, filters, db_user)
+
+    # ═══ Сортировка: приоритетные → normal → low, внутри по дате ═══
+    priority_order = {'critical': 0, 'high': 1, 'normal': 2, 'low': 3}
+    tasks.sort(key=lambda t: (priority_order.get(getattr(t, 'priority', 'normal') or 'normal', 2),
+                               getattr(t, 'due_date', None) or timezone.now()))
 
     suffix = filters.get("header_suffix", "")
     header = f"{base_header} {suffix}:".strip() if suffix else f"{base_header}:"
@@ -1015,6 +1037,37 @@ async def callback_task_edit_series(callback: CallbackQuery, state: FSMContext):
         edit_helper_msg_id=helper.message_id,
         edit_is_series=True,
     )
+
+
+@router.callback_query(F.data.startswith("task_cycle_priority:"))
+async def callback_task_cycle_priority(callback: CallbackQuery):
+    """Циклически меняет приоритет задачи."""
+    try:
+        task_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный ID.", show_alert=True)
+        return
+
+    priority_cycle = ['normal', 'high', 'critical', 'low']
+    task = await task_service.get_task_by_id(task_id)
+    if not task:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
+
+    current = getattr(task, 'priority', 'normal') or 'normal'
+    try:
+        idx = priority_cycle.index(current)
+    except ValueError:
+        idx = 0
+    new_priority = priority_cycle[(idx + 1) % len(priority_cycle)]
+
+    from core.models import Task as TaskModel
+    await sync_to_async(TaskModel.objects.filter(id=task_id).update)(priority=new_priority)
+
+    task = await task_service.get_task_by_id(task_id)
+    # ═══ Редактируем helper на новый helper (обновляем только кнопки), а оригинал не трогаем ═══
+    # Просто отвечаем callback'ом — пользователь увидит новое сообщение при следующем /tasks
+    await callback.answer(f"🔽 Приоритет изменён: {new_priority}")
 
 
 def _notify_task_changed(task, old_due=None, new_due=None, old_assign=None, new_assign=None, old_title=None, new_title=None):

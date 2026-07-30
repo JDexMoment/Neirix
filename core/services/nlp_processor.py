@@ -569,6 +569,19 @@ async def _handle_create_task(bot, chat_id: int, user_telegram_id: int, text: st
         "description": "",
     }
 
+    # ═══ Определяем приоритет из текста (fallback, если LLM не вернул) ═══
+    priority = nlp_result.get("priority")
+    if not priority:
+        text_lower = text.lower()
+        if any(w in text_lower for w in ["срочно", "срочная", "asap", "быстрее", "как можно"]):
+            priority = "critical"
+        elif any(w in text_lower for w in ["важно", "важная", "приоритет", "важное"]):
+            priority = "high"
+        elif any(w in text_lower for w in ["когда будет время", "не срочно", "неспешно", "свободен"]):
+            priority = "low"
+    if priority:
+        task_data["priority"] = priority
+
     ts = TaskService()
     task = await ts._create_task_from_data(task_data, source_msg)
     if not task:

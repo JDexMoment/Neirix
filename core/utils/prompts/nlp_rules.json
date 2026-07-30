@@ -31,13 +31,16 @@
   ],
 
   "response_format": {
-    "intent": "edit_task",
+    "intent": "show_tasks",
+    "filter": "tomorrow",
     "title": "название",
     "new_title": "новое название",
     "new_assignee": "ivanov",
-    "new_date": "2026-07-30",
-    "new_time": "18:00",
-    "filter": "week",
-    "username": "ivanov"
+    "new_date": "2026-07-18",
+    "new_time": "14:00",
+    "date": "2026-07-15",
+    "username": "ivanov",
+    "recurrence": "каждую пятницу",
+    "priority": "high"
   }
 }

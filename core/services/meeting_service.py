@@ -78,6 +78,24 @@ def _parse_start_at_from_meeting_data(meeting_data: dict) -> Optional[datetime]:
         return None
     try:
         naive_dt = datetime.strptime(f"{raw_date} {raw_time}", "%Y-%m-%d %H:%M")
+        from datetime import timedelta as dt_td
+        # ═══ Fix: если дата в прошлом >7 дней — сдвигаем на месяц вперёд ═══
+        from django.utils import timezone as tz
+        aware_dt = timezone.make_aware(naive_dt, current_tz) if timezone.is_naive(naive_dt) else naive_dt
+        if aware_dt < tz.now() - dt_td(days=7):
+            # Сдвигаем на месяц вперёд
+            month = naive_dt.month + 1
+            year = naive_dt.year
+            if month > 12:
+                month = 1
+                year += 1
+            try:
+                from calendar import monthrange
+                last_day = monthrange(year, month)[1]
+                day = min(naive_dt.day, last_day)
+                naive_dt = naive_dt.replace(year=year, month=month, day=day)
+            except ValueError:
+                pass
         return timezone.make_aware(naive_dt, current_tz)
     except ValueError:
         logger.warning("Invalid meeting date/time | date=%r time=%r", raw_date, raw_time)

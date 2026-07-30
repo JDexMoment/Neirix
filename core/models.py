@@ -94,6 +94,18 @@ class Task(models.Model):
         ('cancelled', 'Отменено')
     ])
 
+    priority = models.CharField(
+    max_length=20,
+    default='normal',
+    choices=[
+        ('critical', '🔴 Критический'),
+        ('high', '🟡 Высокий'),
+        ('normal', '🟢 Средний'),
+        ('low', '⚪ Низкий'),
+    ],
+    verbose_name="Приоритет",
+)
+
     source_message = models.ForeignKey(Message, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата выполнения")

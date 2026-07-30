@@ -53,6 +53,10 @@ def task_edit_options_keyboard(task_id: int, has_recurrence: bool = False):
         callback_data=f"task_edit_title:{task_id}",
     ))
     builder.add(InlineKeyboardButton(
+        text="🔽 Приоритет",
+        callback_data=f"task_cycle_priority:{task_id}",
+    ))
+    builder.add(InlineKeyboardButton(
         text="↩️ Назад к задаче",
         callback_data=f"task_back:{task_id}",
     ))
