@@ -73,6 +73,22 @@ class BatchProcessor:
             llm = LLMClient()
             result = await llm.extract_all_from_messages(authorized_messages)
 
+            # ═══ Проект: 'сделать проект: a, b, c' -> одна задача + подзадачи ═══
+            if result:
+                try:
+                    from core.services.task_service import create_project_task_from_text
+                    project_task = await create_project_task_from_text(source_message)
+                    if project_task:
+                        tasks_created += 1
+                        logger.info(
+                            "Project task created | id=%s title=%s",
+                            project_task.id, project_task.title,
+                        )
+                        # отдельные задачи из LLM не создаём — они стали подзадачами
+                        result = {"tasks": [], "meetings": result.get("meetings", [])}
+                except Exception as e:
+                    logger.warning("Project detection failed: %s", e)
+
             if result:
                 for task_data in result.get("tasks", []):
                     try:

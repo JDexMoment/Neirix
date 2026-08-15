@@ -24,3 +24,9 @@ class EditMeetingStates(StatesGroup):
     waiting_for_choice = State()
     waiting_for_participants = State()
     waiting_for_title = State()
+
+
+class SubTaskStates(StatesGroup):
+    """Состояния для подзадач."""
+    waiting_for_subtask_title = State()
+    waiting_for_subtask_assignee = State()

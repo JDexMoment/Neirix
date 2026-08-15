@@ -43,6 +43,28 @@ def _clean_title(title: str) -> str:
     return cleaned
 
 
+def _clean_project_parent(parent: str) -> str:
+    """Чистит родительский заголовок проекта.
+
+    Из '[15.08.2026 14:56] Евгений: задача для @X и @Y на август это
+    сделать проект' делает 'сделать проект'.
+    """
+    p = parent
+    p = re.sub(r"\[[^\]]*\]", "", p)          # [14:56] / [15.08...]
+    p = p.split(":")[-1]                        # убираем 'Автор:' в начале
+    p = _USERNAME_RE.sub("", p)                # @username
+    p = re.sub(r"(?i)\bзадача\s+для\b", "", p)
+    p = re.sub(r"(?i)\bэто\b", "", p)
+    p = re.sub(
+        r"(?i)\bна\s+(?:январ\w*|феврал\w*|март\w*|апрел\w*|ма\w*|июн\w*|"
+        r"июл\w*|август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*)\b",
+        "", p,
+    )
+    p = re.sub(r"\s+\bи\b\s+", " ", p)         # одинокий союз 'и'
+    p = re.sub(r"\s+", " ", p).strip(" \t-–—,:")
+    return p
+
+
 def _is_author_mentioned(source_message: Message) -> bool:
     if not source_message.author or not source_message.author.username:
         return False
@@ -194,6 +216,22 @@ class TaskService:
                 await sync_to_async(TaskAssignee.objects.create)(task=task, user=user)
 
             # ════════════════════════════════════════════════════════════
+            # Подзадачи (переданы явно, напр. для проекта)
+            # ════════════════════════════════════════════════════════════
+            subtasks_data = task_data.get("subtasks")
+            if subtasks_data:
+                try:
+                    from core.services.subtask_service import create_subtasks_for_task
+                    created = await create_subtasks_for_task(task, subtasks_data)
+                    if created:
+                        logger.info(
+                            "Subtasks created | task_id=%s count=%s",
+                            task.id, len(created),
+                        )
+                except Exception as e:
+                    logger.warning("Subtasks creation failed: %s", e)
+
+            # ════════════════════════════════════════════════════════════
             # Приоритет задачи
             # ════════════════════════════════════════════════════════════
             # ═══ Fallback: парсим priority из текста сообщения ═══
@@ -332,7 +370,7 @@ class TaskService:
             return (
                 Task.objects.filter(id=task_id)
                 .select_related("topic", "creator")
-                .prefetch_related("assignees__user")
+                .prefetch_related("assignees__user", "subtasks__assignees")
                 .first()
             )
         return await sync_to_async(_get)()
@@ -450,3 +488,57 @@ def _is_author_mentioned_in_batch(assignees: List[str], source_message: Message)
         if clean and clean in text_lower:
             return True
     return False
+
+
+async def create_project_task_from_text(source_message: Message) -> Optional[Task]:
+    """Если source_message.text — 'проект: a, b, c', создаёт ОДНУ задачу-родителя
+    с подзадачами и возвращает её. Иначе None.
+
+    Работает и для группы, и для ЛС: берём ТЕКСТ исходного сообщения
+    (а не то, что вернул LLM — он может разбить проект на 5 отдельных задач).
+    """
+    from core.services.subtask_service import (
+        _split_project_title,
+        _parse_sub_item,
+    )
+
+    text = (getattr(source_message, "text", None) or "").strip()
+    parent, items = _split_project_title(text)
+    if not parent or len(items) < 2:
+        return None
+
+    clean_title = _clean_project_parent(parent) or _clean_title(text)
+    if not clean_title:
+        return None
+
+    # исполнители родителя — @username из текста до двоеточия проекта
+    parent_assignees = ["@" + u for u in re.findall(r"@(\w+)", parent)]
+    if not parent_assignees:
+        parent_assignees = ["@" + u for u in re.findall(r"@(\w+)", text)]
+
+    subtasks_data = []
+    max_due = None
+    for it in items:
+        t, users, due = _parse_sub_item(it)
+        if not t:
+            continue
+        subtasks_data.append({
+            "title": t,
+            "assignees": ["@" + u for u in users],
+            "due_date": due,
+        })
+        if due and (max_due is None or due > max_due):
+            max_due = due
+    if not subtasks_data:
+        return None
+
+    ts = TaskService()
+    task_data = {
+        "title": clean_title,
+        "assignees": list(dict.fromkeys(parent_assignees)),
+        "due_date": max_due.strftime("%Y-%m-%d") if max_due else None,
+        "description": "",
+        "subtasks": subtasks_data,
+    }
+    task = await ts._create_task_from_data(task_data, source_message)
+    return task

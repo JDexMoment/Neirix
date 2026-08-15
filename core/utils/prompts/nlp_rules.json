@@ -5,6 +5,7 @@
     "ДОПУСТИМЫЕ intent (только эти): show_tasks, show_meetings, create_task, create_meeting, reschedule_meeting, cancel_meeting, edit_task, edit_meeting, unknown",
     "show_tasks/show_meetings: запрос списка. Если про КОНКРЕТНУЮ («во сколько встреча с X?», «когда задача?», «кто назначил?», «кто участник?», «как называется?», «кто ответственный?», «какого числа?») — ОБЯЗАТЕЛЬНО укажи title с точным названием. Если просто список — title не ставь.",
     "create_task: title=название, new_assignee=@username, new_date=дата (YYYY-MM-DD).",
+    "create_task: если сообщение описывает проект с подзадачами (через двоеточие или список, напр. «Сделать проект: код, тесты, дока») — верни поле subtasks (массив подзадач с title/assignees/due_date). Если подзадач нет — не ставь поле.",
     "create_meeting: title=название, new_assignee=@username, new_date, new_time.",
     "edit_task: title=название задачи, new_title, new_assignee, new_date. Для переноса/изменения срока задачи — ТОЛЬКО edit_task, НЕ reschedule_meeting, НЕ reschedule_task.",
     "edit_meeting: title=название встречи, new_title, new_assignee, new_date, new_time.",
@@ -31,16 +32,17 @@
   ],
 
   "response_format": {
-    "intent": "show_tasks",
-    "filter": "tomorrow",
+    "intent": "edit_task",
     "title": "название",
     "new_title": "новое название",
     "new_assignee": "ivanov",
-    "new_date": "2026-07-18",
-    "new_time": "14:00",
-    "date": "2026-07-15",
+    "new_date": "2026-07-30",
+    "new_time": "18:00",
+    "filter": "week",
     "username": "ivanov",
-    "recurrence": "каждую пятницу",
-    "priority": "high"
+    "subtasks": [
+      {"title": "подзадача 1", "assignees": ["@user"], "due_date": "YYYY-MM-DD"},
+      {"title": "подзадача 2", "assignees": [], "due_date": null}
+    ]
   }
 }

@@ -84,7 +84,7 @@ def _extract_task_title_from_text(text: str) -> str:
     # Убираем начальные разделители (тире, двоеточие, запятые, пробелы)
     t = re.sub(r'^[\s\-–—,:=]+', '', t)
     # Берём текст до "до" (дата) или до конца
-    m = re.search(r'^(.+?)(?:\s+до\s||$)', t)
+    m = re.search(r'^(.+?)(?:\s+до\s|$)', t)
     if m:
         candidate = m.group(1).strip().rstrip('.,!?')
         if candidate and len(candidate) > 3:
@@ -170,7 +170,7 @@ async def _find_tasks(chat_id: int, title: str, user_telegram_id: int = 0) -> li
     tasks = await sync_to_async(
         lambda: list(Task.objects.filter(
             topic__chat__chat_id=effective_chat_id, status="open", title__icontains=title
-        ).select_related("creator").prefetch_related("assignees__user").order_by("-id"))
+        ).select_related("creator").prefetch_related("assignees__user", "subtasks__assignees").order_by("-id"))
     )()
     if tasks:
         return tasks
@@ -179,7 +179,7 @@ async def _find_tasks(chat_id: int, title: str, user_telegram_id: int = 0) -> li
         all_tasks = await sync_to_async(
             lambda: list(Task.objects.filter(
                 topic__chat__chat_id=effective_chat_id, status="open"
-            ).select_related("creator").prefetch_related("assignees__user"))
+            ).select_related("creator").prefetch_related("assignees__user", "subtasks__assignees"))
         )()
         scored = [(sum(1 for w in words if w in t.title.lower()), t) for t in all_tasks if sum(1 for w in words if w in t.title.lower()) > 0]
         scored.sort(key=lambda x: -x[0])
@@ -272,7 +272,7 @@ async def detect_intent(text: str) -> Optional[dict]:
         {"role": "user", "content": prompt},
     ]
     try:
-        raw = await llm.chat_completion(messages=messages, temperature=0.1, max_tokens=200)
+        raw = await llm.chat_completion(messages=messages, temperature=0.1, max_tokens=1500)
         cleaned = raw.strip()
         if "```json" in cleaned:
             cleaned = cleaned.split("```json")[1].split("```")[0]
@@ -494,7 +494,7 @@ async def _show_single_task(bot, chat_id: int, nlp_result: dict, text: str, thre
     if answer_parts:
         await _send(bot, chat_id, "\n".join(answer_parts), parse_mode="HTML", thread_id=thread_id)
     has_rec = task.is_template and task.recurrence_group_id is not None
-    markup = _task_kb(task.id, has_recurrence=has_rec)
+    markup = _task_kb(task.id, has_recurrence=has_rec, has_subtasks=bool(task.subtasks.all()))
     await _send(bot, chat_id, _build_task_text(task), parse_mode="HTML",
                 reply_markup=markup, thread_id=thread_id)
 
@@ -557,6 +557,29 @@ async def _handle_create_task(bot, chat_id: int, user_telegram_id: int, text: st
         return
 
     source_msg = await sync_to_async(DBMessage.objects.get)(id=db_message_id)
+
+    # ═══ Проект из исходного текста (надёжнее, чем subtasks от LLM) ═══
+    from core.services.task_service import create_project_task_from_text
+    project_task = await create_project_task_from_text(source_msg)
+    if project_task:
+        assignee_exists = await sync_to_async(lambda: project_task.assignees.exists())()
+        if assignee_exists:
+            a_qs = await sync_to_async(
+                lambda: list(project_task.assignees.select_related("user").all())
+            )()
+            names = [
+                f"@{a.user.username}" if a.user.username
+                else (a.user.full_name or f"id={a.user.id}")
+                for a in a_qs
+            ]
+            assignee_str = ", ".join(names)
+        else:
+            assignee_str = "не назначен"
+        due_str = project_task.due_date.strftime("%d.%m.%Y") if project_task.due_date else "без срока"
+        await _send(bot, chat_id,
+            f"✅ <b>{project_task.title}</b>\n👤 {assignee_str}\n📅 до {due_str}",
+            parse_mode="HTML", thread_id=thread_id)
+        return
 
     assignees = []
     if username:

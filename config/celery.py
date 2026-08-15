@@ -13,3 +13,8 @@ app.conf.beat_schedule = {
     **(app.conf.beat_schedule or {}),
     **BEAT_SCHEDULE,
 }
+
+import logging
+for _n in ("sentence_transformers", "transformers", "huggingface_hub",
+          "vector_store", "qdrant_client", "httpx", "urllib3", "aiogram"):
+    logging.getLogger(_n).setLevel(logging.WARNING)

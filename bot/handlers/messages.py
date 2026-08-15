@@ -48,6 +48,11 @@ async def handle_text_message(message: Message):
     Если это ответ на сообщение бота с задачей/встречей — создаёт комментарий.
     """
 
+    # ═══ Если пользователь сейчас вводит подзадачу/исполнителя — не обрабатываем как задачу ═══
+    from bot.handlers.subtasks import PENDING
+    if message.from_user.id in PENDING:
+        return
+
     @sync_to_async
     def save_message():
         db_user, _ = TelegramUser.objects.get_or_create(

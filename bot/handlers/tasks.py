@@ -22,6 +22,7 @@ from bot.keyboards.inline import (
 )
 from bot.states import EditTaskStates
 from core.services.recurrence_service import RecurrenceService
+from core.services.subtask_service import PROGRESS_BLOCKS
 
 recurrence_service = RecurrenceService()
 
@@ -37,7 +38,7 @@ def _get_open_tasks_for_private(db_user: TelegramUser) -> List[Task]:
             status="open",
         )
         .select_related("topic__chat", "creator")
-        .prefetch_related("assignees__user")
+        .prefetch_related("assignees__user", "subtasks__assignees")
         .order_by("due_date", "id")
         .distinct()
     )
@@ -49,7 +50,7 @@ def _get_all_tasks_for_private(db_user: TelegramUser) -> List[Task]:
             assignees__user=db_user,
         )
         .select_related("topic__chat", "creator")
-        .prefetch_related("assignees__user")
+        .prefetch_related("assignees__user", "subtasks__assignees")
         .order_by("due_date", "id")
         .distinct()
     )
@@ -62,7 +63,7 @@ def _get_open_tasks_for_chat(chat, topic=None) -> List[Task]:
     return list(
         Task.objects.filter(**filters)
         .select_related("creator")
-        .prefetch_related("assignees__user")
+        .prefetch_related("assignees__user", "subtasks__assignees")
         .order_by("due_date", "id")
         .distinct()
     )
@@ -75,7 +76,7 @@ def _get_all_tasks_for_chat(chat, topic=None) -> List[Task]:
     return list(
         Task.objects.filter(**filters)
         .select_related("creator")
-        .prefetch_related("assignees__user")
+        .prefetch_related("assignees__user", "subtasks__assignees")
         .order_by("due_date", "id")
         .distinct()
     )
@@ -138,6 +139,14 @@ def _build_task_text(task: Task, recurrence_text: str = None) -> str:
         f"{_format_due_date(task)}\n"
         f"📝 Назначил(а): {_format_creator(task.creator)}"
     )
+    # Прогресс-бар для задач с подзадачами
+    subs = list(task.subtasks.all())
+    if subs:
+        done = sum(1 for s in subs if s.status == "done")
+        pct = round(done / len(subs) * 100)
+        filled = round(pct / 100 * PROGRESS_BLOCKS)
+        bar = "█" * filled + "░" * (PROGRESS_BLOCKS - filled)
+        text += f"\n📊 [{bar}] {pct}%"
     if recurrence_text:
         text += f"\n🔄 {recurrence_text}"
     elif task.recurrence_group_id:
@@ -335,7 +344,7 @@ async def _respond_tasks(message: Message, chat, topic, db_user, filters: dict):
         await message.answer(
             f"{i}. {_build_task_text(task, rec_text)}",
             parse_mode="HTML",
-            reply_markup=task_keyboard(task.id, has_recurrence=has_rec, comment_count=c_count),
+            reply_markup=task_keyboard(task.id, has_recurrence=has_rec, comment_count=c_count, has_subtasks=bool(task.subtasks.all())),
         )
 
 
@@ -406,6 +415,13 @@ async def callback_task_done(callback: CallbackQuery):
     if not db_user:
         await callback.answer("Пользователь не найден в базе.", show_alert=True)
         return
+    # Задача с подзадачами закрывается только когда все подзадачи выполнены
+    task = await task_service.get_task_by_id(task_id)
+    if task and task.subtasks.exists() and not all(
+        s.status == "done" for s in task.subtasks.all()
+    ):
+        await callback.answer("❌ Сначала выполните все подзадачи.", show_alert=True)
+        return
     success = await task_service.mark_task_done(task_id, db_user)
     if success:
         await callback.answer("✅ Задача выполнена!")
@@ -438,7 +454,7 @@ async def callback_task_back(callback: CallbackQuery, state: FSMContext):
                     chat_id=orig_chat,
                     message_id=orig_msg,
                     parse_mode="HTML",
-                    reply_markup=task_keyboard(task_id),
+                    reply_markup=task_keyboard(task_id, has_subtasks=bool(task.subtasks.all())),
                 )
             except Exception as e:
                 logger.warning("Failed to restore task: %s", e)
@@ -672,7 +688,7 @@ async def process_edit_title(message: Message, state: FSMContext):
                         chat_id=orig_chat,
                         message_id=orig_msg,
                         parse_mode="HTML",
-                        reply_markup=task_keyboard(task_id),
+                        reply_markup=task_keyboard(task_id, has_subtasks=bool(task.subtasks.all())),
                     )
                 except Exception as e:
                     logger.warning("Failed to edit task: %s", e)
@@ -726,7 +742,7 @@ async def callback_task_edit_cancel(callback: CallbackQuery, state: FSMContext):
                     chat_id=orig_chat,
                     message_id=orig_msg,
                     parse_mode="HTML",
-                    reply_markup=task_keyboard(task_id),
+                    reply_markup=task_keyboard(task_id, has_subtasks=bool(task.subtasks.all())),
                 )
             except Exception as e:
                 logger.warning("Failed to restore task: %s", e)
@@ -788,7 +804,7 @@ async def process_edit_due_date(message: Message, state: FSMContext):
                         chat_id=orig_chat,
                         message_id=orig_msg,
                         parse_mode="HTML",
-                        reply_markup=task_keyboard(task_id),
+                        reply_markup=task_keyboard(task_id, has_subtasks=bool(task.subtasks.all())),
                     )
                 except Exception as e:
                     logger.warning("Failed to edit task: %s", e)
@@ -895,7 +911,7 @@ async def process_edit_assignee(message: Message, state: FSMContext):
                         chat_id=orig_chat,
                         message_id=orig_msg,
                         parse_mode="HTML",
-                        reply_markup=task_keyboard(task_id),
+                        reply_markup=task_keyboard(task_id, has_subtasks=bool(task.subtasks.all())),
                     )
                 except Exception as e:
                     logger.warning("Failed to edit task: %s", e)

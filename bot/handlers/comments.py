@@ -133,7 +133,7 @@ async def callback_task_info(callback: CallbackQuery):
     task = await sync_to_async(
         lambda: Task.objects.filter(id=task_id)
         .select_related("creator")
-        .prefetch_related("assignees__user")
+        .prefetch_related("assignees__user", "subtasks__assignees")
         .first()
     )()
     if not task:
@@ -195,7 +195,7 @@ async def cmd_task_info(message: Message):
     task = await sync_to_async(
         lambda: Task.objects.filter(id=task_id)
         .select_related("creator")
-        .prefetch_related("assignees__user")
+        .prefetch_related("assignees__user", "subtasks__assignees")
         .first()
     )()
     if not task:

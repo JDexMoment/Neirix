@@ -7,18 +7,25 @@ from aiogram.types import InlineKeyboardButton
 # ─────────────────────────────────────────────────────────────────────
 
 
-def task_keyboard(task_id: int, has_recurrence: bool = False, comment_count: int = 0):
-    """Кнопки 'Выполнено' и 'Редактировать' под каждой задачей.
-       Если задача — часть серии, добавляем 'Отменить серию'.
-       Если есть комментарии — добавляем кнопку '💬 (n)'."""
+def task_keyboard(task_id: int, has_recurrence: bool = False, comment_count: int = 0, has_subtasks: bool = False):
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(
-        text="✅ Выполнено",
-        callback_data=f"task_done:{task_id}",
-    ))
+    if has_subtasks:
+        builder.add(InlineKeyboardButton(
+            text="🗂 Подзадачи",
+            callback_data=f"task_subs:{task_id}",
+        ))
+    else:
+        builder.add(InlineKeyboardButton(
+            text="✅ Выполнено",
+            callback_data=f"task_done:{task_id}",
+        ))
     builder.add(InlineKeyboardButton(
         text="✏️ Редактировать",
         callback_data=f"task_edit:{task_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="➕ Подзадача",
+        callback_data=f"task_add_subtask:{task_id}",
     ))
     if has_recurrence:
         builder.add(InlineKeyboardButton(
@@ -30,15 +37,13 @@ def task_keyboard(task_id: int, has_recurrence: bool = False, comment_count: int
             text=f"💬 {comment_count}",
             callback_data=f"task_info:{task_id}",
         ))
-    if has_recurrence:
-        builder.adjust(2, 1, 1) if comment_count > 0 else builder.adjust(2, 1)
-    else:
-        builder.adjust(2, 1) if comment_count > 0 else builder.adjust(2)
+    # Раскладка: первая строка — 2 кнопки, дальше по одной
+    n_extra = (1 if has_recurrence else 0) + (1 if comment_count > 0 else 0)
+    builder.adjust(2, *([1] * (1 + n_extra)))
     return builder.as_markup()
 
 
 def task_edit_options_keyboard(task_id: int, has_recurrence: bool = False):
-    """Выбор: изменить срок, исполнителя или название."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="📅 Срок",
@@ -65,7 +70,6 @@ def task_edit_options_keyboard(task_id: int, has_recurrence: bool = False):
 
 
 def task_edit_cancel_keyboard():
-    """Кнопка отмены редактирования."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="↩️ Отмена",
@@ -75,7 +79,6 @@ def task_edit_cancel_keyboard():
 
 
 def task_assign_keyboard(task_id: int):
-    """Кнопка 'Назначить исполнителя' для задач без assignee."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="👤 Назначить исполнителя",
@@ -85,7 +88,6 @@ def task_assign_keyboard(task_id: int):
 
 
 def task_cancel_series_confirm_keyboard(task_id: int):
-    """Подтверждение отмены всей серии задач."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="✅ Да, отменить серию",
@@ -99,15 +101,30 @@ def task_cancel_series_confirm_keyboard(task_id: int):
     return builder.as_markup()
 
 
+def task_edit_series_choice_keyboard(task_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="✏️ Только эту",
+        callback_data=f"task_edit_single:{task_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="🔄 Всю серию",
+        callback_data=f"task_edit_series:{task_id}",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="↩️ Назад",
+        callback_data=f"task_back:{task_id}",
+    ))
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Встречи
 # ─────────────────────────────────────────────────────────────────────
 
 
 def meeting_keyboard(meeting_id: int, has_recurrence: bool = False, comment_count: int = 0):
-    """Кнопки 'Редактировать' и 'Отменить' под каждой встречей.
-       Если встреча часть серии — добавляем кнопку отмены всей серии.
-       Если есть комментарии — добавляем кнопку '💬 (n)'."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="✏️ Редактировать",
@@ -135,7 +152,6 @@ def meeting_keyboard(meeting_id: int, has_recurrence: bool = False, comment_coun
 
 
 def meeting_cancel_choice_keyboard(meeting_id: int, recurrence_id: int):
-    """Выбор: отменить одну встречу или всю серию."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="🗑 Отменить только эту",
@@ -154,7 +170,6 @@ def meeting_cancel_choice_keyboard(meeting_id: int, recurrence_id: int):
 
 
 def meeting_edit_options_keyboard(meeting_id: int, has_recurrence: bool = False):
-    """Выбор: изменить дату, участников или название."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="📅 Перенести",
@@ -168,8 +183,6 @@ def meeting_edit_options_keyboard(meeting_id: int, has_recurrence: bool = False)
         text="✏️ Название",
         callback_data=f"meeting_edit_title:{meeting_id}",
     ))
-    # ═══ В меню редактирования ВСЕЙ серии кнопка "Редактировать серию" не нужна ═══
-    # (она будет показана на этапе выбора)
     builder.add(InlineKeyboardButton(
         text="↩️ Назад к встрече",
         callback_data=f"meeting_back:{meeting_id}",
@@ -179,7 +192,6 @@ def meeting_edit_options_keyboard(meeting_id: int, has_recurrence: bool = False)
 
 
 def meeting_edit_cancel_keyboard():
-    """Кнопка отмены редактирования встречи."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="↩️ Отмена",
@@ -189,7 +201,6 @@ def meeting_edit_cancel_keyboard():
 
 
 def meeting_cancel_confirm_keyboard(meeting_id: int):
-    """Подтверждение отмены встречи."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="✅ Да, отменить",
@@ -204,7 +215,6 @@ def meeting_cancel_confirm_keyboard(meeting_id: int):
 
 
 def meeting_cancel_series_confirm_keyboard(meeting_id: int):
-    """Подтверждение отмены ВСЕЙ серии встреч."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="🛑 Да, отменить всю серию",
@@ -219,7 +229,6 @@ def meeting_cancel_series_confirm_keyboard(meeting_id: int):
 
 
 def meeting_edit_series_choice_keyboard(meeting_id: int):
-    """Выбор: редактировать одну встречу или всю серию."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="✏️ Только эту",
@@ -237,27 +246,7 @@ def meeting_edit_series_choice_keyboard(meeting_id: int):
     return builder.as_markup()
 
 
-def task_edit_series_choice_keyboard(task_id: int):
-    """Выбор: редактировать одну задачу или всю серию."""
-    builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(
-        text="✏️ Только эту",
-        callback_data=f"task_edit_single:{task_id}",
-    ))
-    builder.add(InlineKeyboardButton(
-        text="🔄 Всю серию",
-        callback_data=f"task_edit_series:{task_id}",
-    ))
-    builder.add(InlineKeyboardButton(
-        text="↩️ Назад",
-        callback_data=f"task_back:{task_id}",
-    ))
-    builder.adjust(2, 1)
-    return builder.as_markup()
-
-
 def meeting_reschedule_cancel_keyboard():
-    """Кнопка отмены переноса встречи."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="↩️ Отмена",
@@ -272,7 +261,6 @@ def meeting_reschedule_cancel_keyboard():
 
 
 def confirm_keyboard(action: str, item_id: int):
-    """Универсальная клавиатура подтверждения."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="✅ Да",
@@ -292,7 +280,6 @@ def confirm_keyboard(action: str, item_id: int):
 
 
 def settings_main_keyboard():
-    """Главная клавиатура настроек."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="🔔 Время напоминания о встрече",
@@ -319,7 +306,6 @@ def settings_main_keyboard():
 
 
 def settings_back_keyboard():
-    """Кнопка 'Назад к настройкам'."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="↩️ Назад к настройкам",
@@ -334,7 +320,6 @@ def settings_back_keyboard():
 
 
 def meeting_confirmation_keyboard(meeting_id: int):
-    """Кнопки подтверждения участия в напоминании."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="✅ Буду",
@@ -353,7 +338,6 @@ def meeting_confirmation_keyboard(meeting_id: int):
 
 
 def meeting_attendance_status_keyboard(meeting_id: int):
-    """Кнопка 'Назад' после просмотра статистики."""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
         text="↩️ Назад к встрече",

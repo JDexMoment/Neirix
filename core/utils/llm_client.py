@@ -25,9 +25,7 @@ def _load_json(filename: str) -> Any:
 
 
 DAY_FORMS: List[Dict] = _load_json("day_forms.json")
-TASK_RULES: Dict = _load_json("task_rules.json")
 COMBINED_RULES: Dict = _load_json("combined_rules.json")
-MEETING_RULES: Dict = _load_json("meeting_rules.json")
 SUMMARY_RULES: Dict = _load_json("summary_rules.json")
 
 # ─────────────────────────────────────────────────────────────────────────────

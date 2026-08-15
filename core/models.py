@@ -423,3 +423,36 @@ class Comment(models.Model):
     def __str__(self):
         target = self.task.title if self.task else (self.meeting.title if self.meeting else "?")
         return f"💬 {self.author} → {target}: {self.text[:50]}"
+
+
+class SubTask(models.Model):
+    STATUS_CHOICES = [
+        ("pending", "Ожидает"),
+        ("in_progress", "В процессе"),
+        ("done", "Выполнено"),
+    ]
+    parent_task = models.ForeignKey(
+        Task, on_delete=models.CASCADE, related_name="subtasks",
+        verbose_name="Родительская задача",
+    )
+    title = models.CharField(max_length=512, verbose_name="Название")
+    description = models.TextField(blank=True, default="", verbose_name="Описание")
+    due_date = models.DateTimeField(null=True, blank=True, verbose_name="Срок")
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default="pending", verbose_name="Статус"
+    )
+    order = models.PositiveIntegerField(default=0, verbose_name="Порядок")
+    assignees = models.ManyToManyField(
+        TelegramUser, blank=True, related_name="subtask_assignments",
+        verbose_name="Исполнители",
+    )
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name="Выполнено в")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Подзадача"
+        verbose_name_plural = "Подзадачи"
+        ordering = ["order", "id"]
+
+    def __str__(self):
+        return f"🔹 {self.title} ({self.get_status_display()})"

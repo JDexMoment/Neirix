@@ -24,6 +24,7 @@ from bot.handlers import summary, tasks, meetings, chat_link, chat_events, messa
 from bot.handlers.settings import router as settings_router
 from bot.handlers.comments import router as comments_router
 from bot.handlers.meeting_attendance import router as attendance_router
+from bot.handlers.subtasks import router as subtasks_router
 from bot.middlewares.fsm_timeout import FSMTimeoutMiddleware
 
 logging.basicConfig(level=logging.INFO)
@@ -72,6 +73,7 @@ async def main():
     dp.include_router(settings_router)
     dp.include_router(comments_router)
     dp.include_router(attendance_router)
+    dp.include_router(subtasks_router)
 
 
     @dp.message(Command("start"))
