@@ -67,13 +67,14 @@ async def main():
     dp.include_router(chat_link.router)
     dp.include_router(summary.router)
     dp.include_router(tasks.router)
+    dp.include_router(subtasks_router)
     dp.include_router(meetings.router)
     dp.include_router(messages.router)
     dp.include_router(roles.router)
     dp.include_router(settings_router)
     dp.include_router(comments_router)
     dp.include_router(attendance_router)
-    dp.include_router(subtasks_router)
+
 
 
     @dp.message(Command("start"))
