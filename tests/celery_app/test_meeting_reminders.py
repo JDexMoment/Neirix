@@ -3,8 +3,9 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
-def _make_user(telegram_id=999, username="testuser", full_name="Test", is_bot=False):
+def _make_user(telegram_id=999, username="testuser", full_name="Test", is_bot=False, id_counter=iter(range(1, 100))):
     u = MagicMock()
+    u.id = next(id_counter)  # Уникальный id для каждого пользователя
     u.telegram_id = telegram_id
     u.username = username
     u.full_name = full_name
@@ -12,8 +13,8 @@ def _make_user(telegram_id=999, username="testuser", full_name="Test", is_bot=Fa
     return u
 
 
-def _make_bot_user(telegram_id=888, username="Neirix1_bot"):
-    return _make_user(telegram_id=telegram_id, username=username, is_bot=True)
+def _make_bot_user(telegram_id=888, username="Neirix1_bot", id_counter=iter(range(100, 200))):
+    return _make_user(telegram_id=telegram_id, username=username, is_bot=True, id_counter=id_counter)
 
 
 def _make_meeting(participants=None, title="Test Meeting"):
@@ -24,7 +25,10 @@ def _make_meeting(participants=None, title="Test Meeting"):
     m.start_at = datetime.now(dt_timezone.utc) + timedelta(hours=1)
     m.reminder_sent = False
     m.save = MagicMock()
-    m.participants.all.return_value = participants or []
+    # Убедимся, что participants.all() возвращает правильный список
+    participants_manager_mock = MagicMock()
+    participants_manager_mock.all.return_value = participants or []
+    m.participants = participants_manager_mock
     m.topic = MagicMock()
     m.topic.chat = MagicMock(title="Test Chat")
     return m
@@ -38,9 +42,46 @@ def _mock_bot():
     return bot
 
 
+def _configure_queryset(mock_qs, meetings):
+    result = MagicMock()
+    
+    # Корректная реализация протокола итератора для list()
+    result.__iter__ = MagicMock(return_value=iter(meetings))
+    result.__aiter__ = MagicMock(return_value=iter(meetings))
+    
+    # Возвращаем сам результат для цепочки вызовов
+    result.select_related.return_value = result
+    result.prefetch_related.return_value = result
+    result.distinct.return_value = result
+    result.order_by.return_value = result
+    result.all.return_value = result
+    
+    # filter должен возвращать тот же замоканный queryset
+    mock_qs.filter.return_value = result
+    mock_qs.all.return_value = result
+
+def _mock_user_settings(enabled=True, meeting_minutes=60):
+    """Создает мок объекта UserNotificationSettings."""
+    settings_mock = MagicMock()
+    settings_mock.meeting_reminder_enabled = enabled
+    settings_mock.meeting_reminder_minutes = meeting_minutes
+    return settings_mock
+
+
 class TestSendMeetingReminders:
+    """Общий мок для UserNotificationSettings, возвращает None (дефолтные настройки)."""
+    @pytest.fixture(autouse=True)
+    def _patch_notification_settings(self):
+        mock_settings_qs = MagicMock()
+        mock_settings_qs.filter.return_value.first.return_value = None
+        with patch(
+            "celery_app.tasks.send_reminders.UserNotificationSettings.objects",
+            mock_settings_qs,
+        ):
+            yield
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db
     async def test_sends_to_participants(self):
         from celery_app.tasks.send_reminders import _send_meeting_1h_reminders_async
 
@@ -51,11 +92,7 @@ class TestSendMeetingReminders:
 
         with patch("celery_app.tasks.send_reminders.Meeting.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
-            mock_qs.filter.return_value \
-                .prefetch_related.return_value \
-                .select_related.return_value = [meeting]
-
+            _configure_queryset(mock_qs, [meeting])
             result = await _send_meeting_1h_reminders_async()
 
         assert result == 2
@@ -63,6 +100,7 @@ class TestSendMeetingReminders:
         meeting.save.assert_called_once_with(update_fields=["reminder_sent"])
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db
     async def test_skips_bot_participants(self):
         from celery_app.tasks.send_reminders import _send_meeting_1h_reminders_async
 
@@ -73,16 +111,14 @@ class TestSendMeetingReminders:
 
         with patch("celery_app.tasks.send_reminders.Meeting.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
-            mock_qs.filter.return_value \
-                .prefetch_related.return_value \
-                .select_related.return_value = [meeting]
-
+            _configure_queryset(mock_qs, [meeting])
             result = await _send_meeting_1h_reminders_async()
 
         assert result == 1
+        assert bot.send_message.call_count == 1
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db
     async def test_no_meetings(self):
         from celery_app.tasks.send_reminders import _send_meeting_1h_reminders_async
 
@@ -90,16 +126,14 @@ class TestSendMeetingReminders:
 
         with patch("celery_app.tasks.send_reminders.Meeting.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
-            mock_qs.filter.return_value \
-                .prefetch_related.return_value \
-                .select_related.return_value = []
-
+            _configure_queryset(mock_qs, [])
             result = await _send_meeting_1h_reminders_async()
 
         assert result == 0
+        bot.send_message.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db
     async def test_marks_reminder_sent(self):
         from celery_app.tasks.send_reminders import _send_meeting_1h_reminders_async
 
@@ -109,17 +143,14 @@ class TestSendMeetingReminders:
 
         with patch("celery_app.tasks.send_reminders.Meeting.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
-            mock_qs.filter.return_value \
-                .prefetch_related.return_value \
-                .select_related.return_value = [meeting]
-
+            _configure_queryset(mock_qs, [meeting])
             await _send_meeting_1h_reminders_async()
 
         assert meeting.reminder_sent is True
         meeting.save.assert_called_once_with(update_fields=["reminder_sent"])
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db
     async def test_send_failure_still_continues(self):
         from celery_app.tasks.send_reminders import _send_meeting_1h_reminders_async
 
@@ -127,21 +158,19 @@ class TestSendMeetingReminders:
         user2 = _make_user(telegram_id=222)
         meeting = _make_meeting(participants=[user1, user2])
         bot = _mock_bot()
+        # Первое сообщение падает, второе проходит успешно
         bot.send_message = AsyncMock(side_effect=[Exception("Network error"), None])
 
         with patch("celery_app.tasks.send_reminders.Meeting.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
-            mock_qs.filter.return_value \
-                .prefetch_related.return_value \
-                .select_related.return_value = [meeting]
-
+            _configure_queryset(mock_qs, [meeting])
             result = await _send_meeting_1h_reminders_async()
 
         assert result == 1
-        meeting.save.assert_called_once()
+        meeting.save.assert_called_once_with(update_fields=["reminder_sent"])
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db
     async def test_all_bots_zero_sent(self):
         from celery_app.tasks.send_reminders import _send_meeting_1h_reminders_async
 
@@ -151,17 +180,16 @@ class TestSendMeetingReminders:
 
         with patch("celery_app.tasks.send_reminders.Meeting.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
-            mock_qs.filter.return_value \
-                .prefetch_related.return_value \
-                .select_related.return_value = [meeting]
-
+            _configure_queryset(mock_qs, [meeting])
             result = await _send_meeting_1h_reminders_async()
 
         assert result == 0
-        meeting.save.assert_called_once()
+        bot.send_message.assert_not_called()
+        # save НЕ должен вызываться, так как sent_count == 0
+        meeting.save.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db
     async def test_empty_participants(self):
         from celery_app.tasks.send_reminders import _send_meeting_1h_reminders_async
 
@@ -170,11 +198,8 @@ class TestSendMeetingReminders:
 
         with patch("celery_app.tasks.send_reminders.Meeting.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
-            mock_qs.filter.return_value \
-                .prefetch_related.return_value \
-                .select_related.return_value = [meeting]
-
+            _configure_queryset(mock_qs, [meeting])
             result = await _send_meeting_1h_reminders_async()
 
         assert result == 0
+        meeting.save.assert_not_called()

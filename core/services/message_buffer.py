@@ -9,10 +9,11 @@ Redis-буфер сообщений для батч-обработки.
 
 import json
 import time
+import asyncio
 import logging
 from typing import Optional
 
-import redis
+import redis.asyncio as redis
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ def _ts_key(chat_id: int, topic_id: int) -> str:
 
 
 def _get_redis() -> redis.Redis:
-    return redis.Redis.from_url(
+    return redis.from_url(
         getattr(settings, "REDIS_URL", "redis://localhost:6379/0"),
         decode_responses=True,
     )
@@ -59,7 +60,7 @@ class MessageBuffer:
 
     # ── public API ───────────────────────────────────────────────
 
-    def add_message(
+    async def add_message(
         self,
         chat_id: int,
         topic_id: int,
@@ -77,7 +78,7 @@ class MessageBuffer:
         pipe.setnx(ts_key, str(time.time()))  # ставим ts только если ключа нет
         pipe.sadd(_ACTIVE_SET, f"{chat_id}:{topic_id}")
         pipe.llen(key)
-        results = pipe.execute()
+        results = await pipe.execute_async()
 
         current_size: int = results[-1]
         logger.debug(
@@ -85,7 +86,7 @@ class MessageBuffer:
         )
         return current_size
 
-    def should_flush(self, chat_id: int, topic_id: int) -> bool:
+    async def should_flush(self, chat_id: int, topic_id: int) -> bool:
         """
         Возвращает True, если буфер пора отправлять:
         — набрался MAX_BATCH_SIZE, или
@@ -94,20 +95,20 @@ class MessageBuffer:
         key = _buffer_key(chat_id, topic_id)
         ts_key = _ts_key(chat_id, topic_id)
 
-        size = self._r.llen(key)
+        size = await self._r.llen(key)
         if size == 0:
             return False
         if size >= MAX_BATCH_SIZE:
             return True
 
-        first_ts = self._r.get(ts_key)
+        first_ts = await self._r.get(ts_key)
         if first_ts is None:
             return False
 
         elapsed = time.time() - float(first_ts)
         return elapsed >= FLUSH_TIMEOUT_SEC
 
-    def flush(self, chat_id: int, topic_id: int) -> list[dict]:
+    async def flush(self, chat_id: int, topic_id: int) -> list[dict]:
         """
         Атомарно забирает все сообщения из буфера и очищает его.
         Возвращает список dict'ов.
@@ -120,7 +121,7 @@ class MessageBuffer:
         pipe.delete(key)
         pipe.delete(ts_key)
         pipe.srem(_ACTIVE_SET, f"{chat_id}:{topic_id}")
-        results = pipe.execute()
+        results = await pipe.execute_async()
 
         raw_items: list[str] = results[0]
         messages = []
@@ -131,12 +132,12 @@ class MessageBuffer:
                 logger.warning("Corrupted buffer entry: %s", raw[:200])
         return messages
 
-    def get_active_buffers(self) -> list[dict]:
+    async def get_active_buffers(self) -> list[dict]:
         """
         Возвращает список всех активных буферов
         [{"chat_id": int, "topic_id": int}, ...].
         """
-        members = self._r.smembers(_ACTIVE_SET)
+        members = await self._r.smembers(_ACTIVE_SET)
         result = []
         for member in members:
             try:
@@ -148,6 +149,6 @@ class MessageBuffer:
                 logger.warning("Bad active-set member: %s", member)
         return result
 
-    def peek_size(self, chat_id: int, topic_id: int) -> int:
+    async def peek_size(self, chat_id: int, topic_id: int) -> int:
         """Текущий размер буфера (без извлечения)."""
-        return self._r.llen(_buffer_key(chat_id, topic_id))
+        return await self._r.llen(_buffer_key(chat_id, topic_id))

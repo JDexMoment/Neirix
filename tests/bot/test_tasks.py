@@ -13,6 +13,18 @@ def _make_mock_task(key, title, task_id=1, due_date=None, assignees=None):
     task.title = title
     task.due_date = due_date
     task.status = "open"
+    task.priority = 'normal'
+    task.recurrence_group_id = None  # Явно задаем None, чтобы не было MagicMock
+    
+    # Мокаем создателя, чтобы в тексте не было <MagicMock>
+    task.creator = MagicMock()
+    task.creator.username = None
+    task.creator.full_name = "System"
+    
+    # Мокаем подзадачи, чтобы list() не падал
+    task.subtasks = MagicMock()
+    task.subtasks.all.return_value = [] 
+    
     links = []
     for user in (assignees or []):
         link = MagicMock()
@@ -29,17 +41,32 @@ def _make_mock_user(username=None, full_name="Unknown", user_id=1):
     u.full_name = full_name
     return u
 
+@pytest.fixture
+def mock_get_comment_counts():
+    """Мокает подсчет комментариев, чтобы не было реальных запросов к БД."""
+    with patch("bot.handlers.comments._get_comment_counts", new_callable=AsyncMock) as mock:
+        mock.return_value = {}
+        yield mock
+
+@pytest.fixture
+def mock_get_recurrence_text():
+    """Мокает загрузку текста повторения, чтобы не было реальных запросов к БД."""
+    with patch("bot.handlers.tasks._get_recurrence_text", new_callable=AsyncMock) as mock:
+        mock.return_value = None
+        yield mock
 
 @pytest.fixture
 def tasks_with_assignees():
     u1 = _make_mock_user(username="user1", full_name="User One")
     u2 = _make_mock_user(username=None, full_name="User Two")
+    # Задаем due_date для обеих задач, чтобы гарантировать предсказуемый порядок при сортировке
     return [
         _make_mock_task("report", "Сделать отчёт", task_id=1,
-                         due_date=datetime.now(dt_timezone.utc) + timedelta(days=2),
-                         assignees=[u1]),
+                        due_date=datetime.now(dt_timezone.utc) + timedelta(days=2),
+                        assignees=[u1]),
         _make_mock_task("pres", "Подготовить презентацию", task_id=2,
-                         assignees=[u1, u2]),
+                        due_date=datetime.now(dt_timezone.utc) + timedelta(days=3),
+                        assignees=[u1, u2]),
     ]
 
 
@@ -76,6 +103,7 @@ async def test_tasks_private_with_tasks(
     private_chat, telegram_user, now_dt,
     tasks_with_assignees,
     mock_get_chat_context_tasks, mock_sync_tasks,
+    mock_get_comment_counts, mock_get_recurrence_text,
 ):
     from bot.handlers.tasks import cmd_tasks
     msg = make_message(private_chat, telegram_user, "/tasks", now_dt)
@@ -111,6 +139,7 @@ async def test_tasks_group_with_tasks(
     group_chat, telegram_user, now_dt,
     tasks_with_assignees,
     mock_get_chat_context_tasks, mock_sync_tasks,
+    mock_get_comment_counts, mock_get_recurrence_text,
 ):
     from bot.handlers.tasks import cmd_tasks
     msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
@@ -131,6 +160,7 @@ async def test_tasks_no_assignees_shown(
     group_chat, telegram_user, now_dt,
     tasks_no_assignees,
     mock_get_chat_context_tasks, mock_sync_tasks,
+    mock_get_comment_counts, mock_get_recurrence_text,
 ):
     from bot.handlers.tasks import cmd_tasks
     msg = make_message(group_chat, telegram_user, "/tasks", now_dt)
@@ -161,6 +191,7 @@ async def test_tasks_no_user(
 async def test_tasks_due_date_formatted(
     private_chat, telegram_user, now_dt,
     mock_get_chat_context_tasks, mock_sync_tasks,
+    mock_get_comment_counts, mock_get_recurrence_text,
 ):
     from bot.handlers.tasks import cmd_tasks
     task = _make_mock_task("dated", "Задача со сроком", task_id=10,

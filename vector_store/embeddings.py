@@ -2,17 +2,18 @@
 Генерация и кэширование embeddings.
 
 Кэш: Redis, ключ = sha256(text), TTL = 24 часа.
-При batch-запросе сначала проверяем кэш для каждого текста,
+При batch-запросе сначала провераем кэш для каждого текста,
 вычисляем только отсутствующие, затем сохраняем новые в кэш.
 """
 
 import hashlib
 import json
+import asyncio
 import logging
 from typing import Optional
 
 import numpy as np
-import redis
+import redis.asyncio as redis
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ def _get_model():
 
 
 def _get_redis() -> redis.Redis:
-    return redis.Redis.from_url(
+    return redis.from_url(
         getattr(settings, "REDIS_URL", "redis://localhost:6379/0"),
         decode_responses=True,
     )
@@ -75,7 +76,7 @@ async def generate_embedding(text: str) -> Optional[list[float]]:
     key = _cache_key(text)
 
     # 1. Проверяем кэш
-    cached = r.get(key)
+    cached = await r.get(key)
     if cached is not None:
         logger.debug("Embedding cache HIT: %s…", text[:40])
         return _deserialize_embedding(cached)
@@ -87,7 +88,7 @@ async def generate_embedding(text: str) -> Optional[list[float]]:
 
     # 3. Сохраняем в кэш
     try:
-        r.setex(key, CACHE_TTL, _serialize_embedding(embedding))
+        await r.setex(key, CACHE_TTL, _serialize_embedding(embedding))
     except Exception as e:
         logger.warning("Failed to cache embedding: %s", e)
 
@@ -121,7 +122,7 @@ async def generate_embeddings_batch(texts: list[str]) -> list[Optional[list[floa
     non_empty_indices = [i for i, k in enumerate(cache_keys) if k]
     non_empty_keys = [cache_keys[i] for i in non_empty_indices]
 
-    cached_values = r.mget(non_empty_keys) if non_empty_keys else []
+    cached_values = await r.mget(non_empty_keys) if non_empty_keys else []
 
     # Раскладываем кэшированные значения
     to_compute_indices: list[int] = []  # индексы в texts, которые нужно вычислить
@@ -163,7 +164,7 @@ async def generate_embeddings_batch(texts: list[str]) -> list[Optional[list[floa
                 logger.warning("Failed to cache embedding idx=%s: %s", text_idx, e)
 
         try:
-            pipe.execute()
+            await pipe.execute_async()
         except Exception as e:
             logger.warning("Redis pipe execute failed: %s", e)
 

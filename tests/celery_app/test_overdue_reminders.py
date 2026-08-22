@@ -33,7 +33,7 @@ def _make_task(title="Task", due_date=None, assignees=None):
     t.save = MagicMock()
     t.topic = MagicMock()
     t.topic.chat = MagicMock(title="Chat")
-
+    
     links = []
     for u in (assignees or []):
         link = MagicMock()
@@ -47,10 +47,23 @@ def _mock_bot():
     bot = AsyncMock()
     bot.send_message = AsyncMock()
     bot.session = AsyncMock()
+    # ВАЖНО: мокаем close как AsyncMock, так как в коде есть `await bot.session.close()`
+    bot.session.close = AsyncMock()
     return bot
 
 
 class TestSendOverdueTaskReminders:
+    """Автоматически патчим UserNotificationSettings для всех тестов класса."""
+    @pytest.fixture(autouse=True)
+    def _patch_notification_settings(self):
+        mock_settings_qs = MagicMock()
+        # Возвращаем None, чтобы использовались дефолтные настройки и код не прерывался
+        mock_settings_qs.filter.return_value.first.return_value = None
+        with patch(
+            "celery_app.tasks.send_reminders.UserNotificationSettings.objects",
+            mock_settings_qs,
+        ):
+            yield
 
     @pytest.mark.asyncio
     async def test_sends_overdue_notifications(self):
@@ -66,9 +79,7 @@ class TestSendOverdueTaskReminders:
 
         with patch("celery_app.tasks.send_reminders.Task.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
             mock_qs.filter.return_value.prefetch_related.return_value.select_related.return_value = [task]
-
             result = await _send_overdue_task_reminders_async()
 
         assert result == 1
@@ -86,9 +97,7 @@ class TestSendOverdueTaskReminders:
 
         with patch("celery_app.tasks.send_reminders.Task.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
             mock_qs.filter.return_value.prefetch_related.return_value.select_related.return_value = [task]
-
             result = await _send_overdue_task_reminders_async()
 
         assert result == 0
@@ -101,9 +110,7 @@ class TestSendOverdueTaskReminders:
 
         with patch("celery_app.tasks.send_reminders.Task.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
             mock_qs.filter.return_value.prefetch_related.return_value.select_related.return_value = []
-
             result = await _send_overdue_task_reminders_async()
 
         assert result == 0
@@ -122,9 +129,7 @@ class TestSendOverdueTaskReminders:
 
         with patch("celery_app.tasks.send_reminders.Task.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
             mock_qs.filter.return_value.prefetch_related.return_value.select_related.return_value = [task]
-
             result = await _send_overdue_task_reminders_async()
 
         assert result == 2
@@ -142,9 +147,7 @@ class TestSendOverdueTaskReminders:
 
         with patch("celery_app.tasks.send_reminders.Task.objects") as mock_qs, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
-
             mock_qs.filter.return_value.prefetch_related.return_value.select_related.return_value = [task]
-
             await _send_overdue_task_reminders_async()
 
         assert task.overdue_reminder_sent is True

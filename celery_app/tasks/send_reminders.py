@@ -39,11 +39,8 @@ def _is_bot_user(user: TelegramUser) -> bool:
 async def _send_meeting_reminders_by_window_async(window_minutes: int, tolerance: int = 10):
     """
     Отправляет напоминания о встречах, которые начнутся через ~window_minutes минут.
-    Для каждого пользователя проверяет его настройки (meeting_reminder_minutes).
+    Для каждого пользователя проверяет его настройки (meeting_reminder_enabled).
     Если у пользователя стоит другое время — пропускаем (он получит напоминание в другой таске).
-
-    window_minutes: целевое время до встречи (15, 60 или 1440)
-    tolerance: разброс в минутах (по умолчанию ±10 минут)
     """
     bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
     sender = NotificationSender(bot)
@@ -62,9 +59,12 @@ async def _send_meeting_reminders_by_window_async(window_minutes: int, tolerance
             .select_related("topic__chat")
         )
 
-        sent_count = 0
+        total_sent_count = 0  # <--- Общий счетчик для всех встреч
+
         for meeting in meetings:
+            meeting_sent_count = 0  # <--- Локальный счетчик для ТЕКУЩЕЙ встречи
             participants = await sync_to_async(list)(meeting.participants.all())
+            
             for user in participants:
                 if _is_bot_user(user):
                     continue
@@ -85,43 +85,41 @@ async def _send_meeting_reminders_by_window_async(window_minutes: int, tolerance
                     continue
 
                 # Проверяем, не отправляли ли уже
-                reminder_field = None
                 if window_minutes == 1440:
-                    reminder_field = "daily_reminder_sent"
-                    already_sent = meeting.daily_reminder_sent
+                    already_sent = getattr(meeting, "daily_reminder_sent", False)
                 else:
-                    reminder_field = "reminder_sent"
-                    already_sent = meeting.reminder_sent
+                    already_sent = getattr(meeting, "reminder_sent", False)
 
                 if already_sent:
                     continue
 
-                # Отправляем с кнопками подтверждения
-                keyboard = meeting_confirmation_keyboard(meeting.id)
+                # Отправляем уведомление
                 if window_minutes == 1440:
                     success = await sender.send_meeting_in_24_hours(user, meeting)
                 else:
-                    # Пробуем отправить с клавиатурой (если sender её поддерживает)
                     success = await sender.send_meeting_in_1_hour(user, meeting)
 
                 if success:
-                    sent_count += 1
+                    meeting_sent_count += 1
 
-            # Отмечаем отправленным только если хоть один получил
+            # Накапливаем общий счетчик
+            total_sent_count += meeting_sent_count
+
+            # Отмечаем отправленным только если хоть один получил для ЭТОЙ встречи
             if window_minutes == 1440:
-                if not meeting.daily_reminder_sent and sent_count > 0:
+                if not getattr(meeting, "daily_reminder_sent", False) and meeting_sent_count > 0:
                     meeting.daily_reminder_sent = True
                     await sync_to_async(meeting.save)(update_fields=["daily_reminder_sent"])
             else:
-                if not meeting.reminder_sent and sent_count > 0:
+                if not getattr(meeting, "reminder_sent", False) and meeting_sent_count > 0:
                     meeting.reminder_sent = True
                     await sync_to_async(meeting.save)(update_fields=["reminder_sent"])
 
         logger.info(
             "Meeting reminders [%d min] total: %s",
-            window_minutes, sent_count,
+            window_minutes, total_sent_count,
         )
-        return sent_count
+        return total_sent_count
     finally:
         await bot.session.close()
 

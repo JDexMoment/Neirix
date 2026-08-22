@@ -280,7 +280,7 @@ async def _respond_meetings(message: Message, chat, topic, db_user, nlp_filters:
     chat_id = message.chat.id
     topic_id = message.message_thread_id if getattr(message.chat, 'is_forum', False) else 0
 
-    pending_messages = buffer.flush(chat_id, topic_id)
+    pending_messages = await buffer.flush(chat_id, topic_id)
     if pending_messages:
         result = await processor.process_batch(chat_id, topic_id, pending_messages)
         unassigned_task_ids = result.get("unassigned_task_ids", [])

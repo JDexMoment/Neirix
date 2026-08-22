@@ -53,9 +53,23 @@ def _mock_bot():
     return bot
 
 
+class _AsyncQuerySet(list):
+    def __aiter__(self):
+        self._async_index = 0
+        return self
+
+    async def __anext__(self):
+        if self._async_index >= len(self):
+            raise StopAsyncIteration
+        item = self[self._async_index]
+        self._async_index += 1
+        return item
+
+
 class TestSendDailyDigest:
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db
     async def test_sends_tasks_and_meetings(self):
         from celery_app.tasks.send_reminders import _send_daily_digest_async
 
@@ -72,14 +86,15 @@ class TestSendDailyDigest:
              patch("celery_app.tasks.send_reminders.Meeting.objects") as mock_m, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
 
-            mock_ta.filter.return_value.select_related.return_value.order_by.return_value = [ta]
-            mock_m.filter.return_value.prefetch_related.return_value.select_related.return_value.order_by.return_value = [meeting]
+            mock_ta.filter.return_value.select_related.return_value.order_by.return_value = _AsyncQuerySet([ta])
+            mock_m.filter.return_value.prefetch_related.return_value.select_related.return_value.order_by.return_value = _AsyncQuerySet([meeting])
 
             result = await _send_daily_digest_async()
 
         assert result == 2
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db
     async def test_skips_bots_in_tasks(self):
         from celery_app.tasks.send_reminders import _send_daily_digest_async
 
@@ -92,14 +107,15 @@ class TestSendDailyDigest:
              patch("celery_app.tasks.send_reminders.Meeting.objects") as mock_m, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
 
-            mock_ta.filter.return_value.select_related.return_value.order_by.return_value = [ta]
-            mock_m.filter.return_value.prefetch_related.return_value.select_related.return_value.order_by.return_value = []
+            mock_ta.filter.return_value.select_related.return_value.order_by.return_value = _AsyncQuerySet([ta])
+            mock_m.filter.return_value.prefetch_related.return_value.select_related.return_value.order_by.return_value = _AsyncQuerySet()
 
             result = await _send_daily_digest_async()
 
         assert result == 0
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db
     async def test_empty_day(self):
         from celery_app.tasks.send_reminders import _send_daily_digest_async
 
@@ -109,8 +125,8 @@ class TestSendDailyDigest:
              patch("celery_app.tasks.send_reminders.Meeting.objects") as mock_m, \
              patch("celery_app.tasks.send_reminders.Bot", return_value=bot):
 
-            mock_ta.filter.return_value.select_related.return_value.order_by.return_value = []
-            mock_m.filter.return_value.prefetch_related.return_value.select_related.return_value.order_by.return_value = []
+            mock_ta.filter.return_value.select_related.return_value.order_by.return_value = _AsyncQuerySet()
+            mock_m.filter.return_value.prefetch_related.return_value.select_related.return_value.order_by.return_value = _AsyncQuerySet()
 
             result = await _send_daily_digest_async()
 

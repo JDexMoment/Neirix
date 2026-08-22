@@ -7,11 +7,13 @@ from asgiref.sync import sync_to_async
 from tests.conftest import make_message
 
 
-def _make_mock_meeting(title, hours_ahead=1, participants=None):
+def _make_mock_meeting(title, hours_ahead=1, participants=None, meeting_id=1):
     meeting = MagicMock()
+    meeting.id = meeting_id  # Явно задаем ID, чтобы он не был MagicMock
     meeting.title = title
     meeting.start_at = datetime.now(dt_timezone.utc) + timedelta(hours=hours_ahead)
     meeting.participants.all.return_value = participants or []
+    meeting.recurrence_id = None  # Чтобы _has_recurrence корректно отрабатывал
     return meeting
 
 
@@ -27,9 +29,9 @@ def _make_participant(username=None, full_name="Unknown", user_id=1):
 def meetings_with_participants():
     return [
         _make_mock_meeting("Daily Standup", 1,
-                           [_make_participant("user1", "User One")]),
+            [_make_participant("user1", "User One", user_id=10)], meeting_id=101),
         _make_mock_meeting("Sprint Review", 24,
-                           [_make_participant(None, "User Two")]),
+            [_make_participant(None, "User Two", user_id=20)], meeting_id=102),
     ]
 
 
@@ -49,6 +51,36 @@ def mock_sync_meetings():
     with patch("bot.handlers.meetings.sync_to_async") as mock_s2a:
         yield mock_s2a
 
+@pytest.fixture
+def mock_buffer_and_processor():
+    """Мокает MessageBuffer и BatchProcessor, чтобы они не выполняли реальный код."""
+    with patch("bot.handlers.meetings.MessageBuffer") as MockBuffer, \
+         patch("bot.handlers.meetings.BatchProcessor") as MockProcessor:
+        
+        # flush должен быть асинхронным и возвращать пустой список
+        MockBuffer.return_value.flush = AsyncMock(return_value=[])
+        MockProcessor.return_value.process_batch = AsyncMock(return_value={
+            "tasks_created": 0, 
+            "meetings_created": 0,
+            "unassigned_task_ids": [],
+            "unassigned_meeting_ids": []
+        })
+        yield MockBuffer, MockProcessor
+
+@pytest.fixture
+def mock_load_attendance_icons():
+    """Мокает загрузку статусов подтверждения, чтобы не было реальных запросов к БД."""
+    with patch("bot.handlers.meetings._load_attendance_icons", new_callable=AsyncMock) as mock:
+        mock.return_value = {}
+        yield mock
+
+@pytest.fixture
+def mock_get_comment_counts():
+    """Мокает подсчет комментариев, чтобы не было реальных запросов к БД."""
+    # Патчим в том модуле, где функция определена изначально
+    with patch("bot.handlers.comments._get_comment_counts", new_callable=AsyncMock) as mock:
+        mock.return_value = {}
+        yield mock
 
 def _setup_sync_mock(mock_s2a, return_value):
     async def fake_fetch(*a, **kw):
@@ -66,6 +98,9 @@ async def test_meetings_private_with_meetings(
     private_chat, telegram_user, now_dt,
     meetings_with_participants,
     mock_get_chat_context_meetings, mock_sync_meetings,
+    mock_buffer_and_processor,
+    mock_load_attendance_icons,  # <--- Добавлено
+    mock_get_comment_counts,     # <--- Добавлено
 ):
     from bot.handlers.meetings import cmd_meetings
     msg = make_message(private_chat, telegram_user, "/meetings", now_dt)
@@ -73,8 +108,9 @@ async def test_meetings_private_with_meetings(
     mock_db_user = MagicMock()
     mock_get_chat_context_meetings.return_value = (mock_chat, None, mock_db_user)
     _setup_sync_mock(mock_sync_meetings, meetings_with_participants)
+    
     await cmd_meetings(msg)
-
+    
     assert msg.answer.call_count == 3
     texts = [c.args[0] if c.args else c.kwargs.get("text", "")
              for c in msg.answer.call_args_list]
@@ -86,23 +122,13 @@ async def test_meetings_private_with_meetings(
 
 
 @pytest.mark.asyncio
-async def test_meetings_private_no_meetings(
-    private_chat, telegram_user, now_dt,
-    mock_get_chat_context_meetings, mock_sync_meetings,
-):
-    from bot.handlers.meetings import cmd_meetings
-    msg = make_message(private_chat, telegram_user, "/meetings", now_dt)
-    mock_get_chat_context_meetings.return_value = (MagicMock(), None, MagicMock())
-    _setup_sync_mock(mock_sync_meetings, [])
-    await cmd_meetings(msg)
-    assert "Нет встреч" in msg.answer.call_args[0][0]
-
-
-@pytest.mark.asyncio
 async def test_meetings_group_with_meetings(
     group_chat, telegram_user, now_dt,
     meetings_with_participants,
     mock_get_chat_context_meetings, mock_sync_meetings,
+    mock_buffer_and_processor,
+    mock_load_attendance_icons,  # <--- Добавлено
+    mock_get_comment_counts,     # <--- Добавлено
 ):
     from bot.handlers.meetings import cmd_meetings
     msg = make_message(group_chat, telegram_user, "/meetings", now_dt)
@@ -110,39 +136,48 @@ async def test_meetings_group_with_meetings(
     mock_chat.title = "Test Group"
     mock_get_chat_context_meetings.return_value = (mock_chat, None, MagicMock())
     _setup_sync_mock(mock_sync_meetings, meetings_with_participants)
+    
     await cmd_meetings(msg)
-
+    
     assert msg.answer.call_count == 3
     texts = [c.args[0] if c.args else "" for c in msg.answer.call_args_list]
     assert "📅 Встречи чата Test Group" in texts[0]
     assert "Daily Standup" in texts[1]
     assert "Sprint Review" in texts[2]
 
+@pytest.mark.asyncio
+async def test_meetings_private_no_meetings(
+    private_chat, telegram_user, now_dt,
+    mock_get_chat_context_meetings, mock_sync_meetings,
+    mock_buffer_and_processor,  # <--- Добавлено
+):
+    from bot.handlers.meetings import cmd_meetings
+    msg = make_message(private_chat, telegram_user, "/meetings", now_dt)
+    mock_get_chat_context_meetings.return_value = (MagicMock(), None, MagicMock())
+    _setup_sync_mock(mock_sync_meetings, [])
+    
+    await cmd_meetings(msg)
+    
+    assert "Нет встреч" in msg.answer.call_args[0][0]
 
 @pytest.mark.asyncio
 async def test_meetings_no_user(
     group_chat, telegram_user, now_dt,
     mock_get_chat_context_meetings,
+    mock_buffer_and_processor,  # <--- Добавлено
 ):
     from bot.handlers.meetings import cmd_meetings
     msg = make_message(group_chat, telegram_user, "/meetings", now_dt)
     mock_get_chat_context_meetings.return_value = (MagicMock(), None, None)
+    
     await cmd_meetings(msg)
+    
     assert "Не удалось определить пользователя" in msg.answer.call_args[0][0]
 
 
 # ══════════════════════════════════════════════════════════════════
 # BATCH MEETING EXTRACTION TESTS  (всё замокано)
 # ══════════════════════════════════════════════════════════════════
-
-
-def _make_proper_sync_to_async():
-    """Правильный мок sync_to_async — передаёт аргументы в функцию."""
-    def proper_s2a(func):
-        async def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
-        return wrapper
-    return proper_s2a
 
 
 @pytest.fixture

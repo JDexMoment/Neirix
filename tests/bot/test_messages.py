@@ -10,6 +10,27 @@ from core.models import TelegramChat, TelegramUser, Topic, Message as DBMessage
 @pytest.mark.django_db(transaction=True)
 class TestMessageHandlerForumFlag:
 
+    @staticmethod
+    def _make_fake_message(chat_id, user_id, text, *, title="Тестовый чат", username="tester", full_name="Test User", is_forum=None, thread_id=None):
+        fake_message = MagicMock()
+        fake_message.message_id = 1
+        fake_message.text = text
+        fake_message.date = timezone.now()
+        fake_message.message_thread_id = thread_id
+        fake_message.reply_to_message = None
+
+        fake_message.from_user.id = user_id
+        fake_message.from_user.username = username
+        fake_message.from_user.full_name = full_name
+        fake_message.from_user.is_bot = False
+
+        fake_message.chat.id = chat_id
+        fake_message.chat.title = title
+        fake_message.chat.type = "supergroup"
+        fake_message.chat.is_forum = is_forum
+
+        return fake_message
+
     def test_handle_text_message_supergroup_with_none_is_forum_saved_as_false(self, monkeypatch):
         """
         Если Telegram прислал chat.is_forum=None для supergroup,
@@ -19,21 +40,16 @@ class TestMessageHandlerForumFlag:
         from bot.handlers import messages as messages_handler
         from core.models import TelegramUser, TelegramChat, UserRole
 
-        fake_message = MagicMock()
-        fake_message.message_id = 101
-        fake_message.text = "завтра встреча"
-        fake_message.date = timezone.now()
-        fake_message.message_thread_id = None
-
-        fake_message.from_user.id = 1111
-        fake_message.from_user.username = "evgeny"
-        fake_message.from_user.full_name = "Евгений"
-        fake_message.from_user.is_bot = False
-
-        fake_message.chat.id = -100123456
-        fake_message.chat.title = "Тестовый чат"
-        fake_message.chat.type = "supergroup"
-        fake_message.chat.is_forum = None
+        fake_message = self._make_fake_message(
+            chat_id=-100123456,
+            user_id=1111,
+            text="завтра встреча",
+            title="Тестовый чат",
+            username="evgeny",
+            full_name="Евгений",
+            is_forum=None,
+            thread_id=None,
+        )
 
         # 👇 ДОБАВИТЬ — создаём роль ДО вызова хендлера
         user_obj, _ = TelegramUser.objects.get_or_create(
@@ -59,23 +75,6 @@ class TestMessageHandlerForumFlag:
         with patch.object(messages_handler.process_target_buffer, "apply_async") as apply_async_mock:
             with patch.object(messages_handler.process_target_buffer, "delay") as delay_mock:
                 async_to_sync(messages_handler.handle_text_message)(fake_message)
-
-        chat = TelegramChat.objects.get(chat_id=-100123456)
-
-        # Создаём роль ДО вызова хендлера
-        user_obj, _ = TelegramUser.objects.get_or_create(
-            telegram_id=1111,
-            defaults={"username": "evgeny", "full_name": "Евгений", "is_bot": False},
-        )
-        chat_obj, _ = TelegramChat.objects.get_or_create(
-            chat_id=-100123456,
-            defaults={"title": "", "type": "supergroup"},
-        )
-        UserRole.objects.get_or_create(
-            user=user_obj,
-            chat=chat_obj,
-            defaults={"role": "admin"},
-        )
 
         chat = TelegramChat.objects.get(chat_id=-100123456)
         assert chat.type == "supergroup"
@@ -112,21 +111,16 @@ class TestMessageHandlerForumFlag:
             is_forum=False,
         )
 
-        fake_message = MagicMock()
-        fake_message.message_id = 202
-        fake_message.text = "ещё одно сообщение"
-        fake_message.date = timezone.now()
-        fake_message.message_thread_id = None
-
-        fake_message.from_user.id = 2222
-        fake_message.from_user.username = "tester"
-        fake_message.from_user.full_name = "Test User"
-        fake_message.from_user.is_bot = False
-
-        fake_message.chat.id = existing_chat.chat_id
-        fake_message.chat.title = "Новое название чата"
-        fake_message.chat.type = "supergroup"
-        fake_message.chat.is_forum = None
+        fake_message = self._make_fake_message(
+            chat_id=existing_chat.chat_id,
+            user_id=2222,
+            text="ещё одно сообщение",
+            title="Новое название чата",
+            username="tester",
+            full_name="Test User",
+            is_forum=None,
+            thread_id=None,
+        )
 
         monkeypatch.setattr(
             messages_handler.message_buffer,
@@ -134,29 +128,20 @@ class TestMessageHandlerForumFlag:
             MagicMock(return_value=1),  # первое сообщение в батче
         )
 
-        with patch.object(messages_handler.process_target_buffer, "apply_async") as apply_async_mock:
-            with patch.object(messages_handler.process_target_buffer, "delay") as delay_mock:
-                # 👇 ДОБАВИТЬ — создаём роль ДО вызова хендлера
-                user_obj2, _ = TelegramUser.objects.get_or_create(
-                    telegram_id=2222,
-                    defaults={"username": "tester", "full_name": "Test User", "is_bot": False},
-                )
-                UserRole.objects.get_or_create(
-                    user=user_obj2,
-                    chat=existing_chat,
-                    defaults={"role": "admin"},
-                )
-                async_to_sync(messages_handler.handle_text_message)(fake_message)
-
-        TelegramUser.objects.get_or_create(
+        # 👇 ДОБАВИТЬ — создаём роль ДО вызова хендлера
+        user_obj2, _ = TelegramUser.objects.get_or_create(
             telegram_id=2222,
             defaults={"username": "tester", "full_name": "Test User", "is_bot": False},
         )
         UserRole.objects.get_or_create(
-            user=TelegramUser.objects.get(telegram_id=2222),
+            user=user_obj2,
             chat=existing_chat,
             defaults={"role": "admin"},
         )
+
+        with patch.object(messages_handler.process_target_buffer, "apply_async") as apply_async_mock:
+            with patch.object(messages_handler.process_target_buffer, "delay") as delay_mock:
+                async_to_sync(messages_handler.handle_text_message)(fake_message)
     
         existing_chat.refresh_from_db()
 

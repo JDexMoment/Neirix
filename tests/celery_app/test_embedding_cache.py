@@ -5,16 +5,23 @@
 import json
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
+import asyncio
 
 
 @pytest.fixture
 def mock_redis():
     r = MagicMock()
-    r.get.return_value = None
-    r.mget.return_value = []
-    r.setex = MagicMock()
-    r.pipeline.return_value = r
-    r.execute.return_value = []
+    # Redis methods are asynchronous in the application.
+    r.get = AsyncMock(return_value=None)
+    r.mget = AsyncMock(return_value=[])
+    r.setex = AsyncMock()
+    # Создаем pipe_mock заранее
+    pipe_mock = MagicMock()
+    pipe_mock.execute_async = AsyncMock(return_value=[])
+    # Настраиваем r.pipeline так, чтобы он всегда возвращал этот pipe_mock
+    r.pipeline.return_value = pipe_mock
+    # Для других потенциальных вызовов execute_async на самом r
+    r.execute_async = AsyncMock(return_value=[])
     return r
 
 
@@ -112,7 +119,7 @@ class TestEmbeddingCache:
 
     @pytest.mark.asyncio
     async def test_batch_none_cached(self, mock_redis, mock_model):
-        """Ничего в кэше → всё вычисляется."""
+        """Ничего в кэша → всё вычисляется."""
         import numpy as np
 
         mock_redis.mget.return_value = [None, None, None]
