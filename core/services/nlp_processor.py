@@ -164,52 +164,104 @@ async def _get_context(chat_id: int, user_telegram_id: int, text: str):
 #  Поиск
 # ══════════════════════════════════════════════════════════════════
 
-async def _find_tasks(chat_id: int, title: str, user_telegram_id: int = 0) -> list:
-    from core.models import Task
-    effective_chat_id = await _resolve_chat_id(chat_id, user_telegram_id) if user_telegram_id else chat_id
-    tasks = await sync_to_async(
-        lambda: list(Task.objects.filter(
-            topic__chat__chat_id=effective_chat_id, status="open", title__icontains=title
-        ).select_related("creator").prefetch_related("assignees__user", "subtasks__assignees").order_by("-id"))
-    )()
-    if tasks:
-        return tasks
-    words = [w.strip().lower() for w in title.split() if len(w.strip()) > 2]
-    if words:
-        all_tasks = await sync_to_async(
-            lambda: list(Task.objects.filter(
-                topic__chat__chat_id=effective_chat_id, status="open"
-            ).select_related("creator").prefetch_related("assignees__user", "subtasks__assignees"))
+# ═══════════════════════════════════════════════════════════════
+# Поиск
+# ═══════════════════════════════════════════════════════════════
+async def _find_tasks(chat_id: int, title: str, user_telegram_id: int = 0,
+                      keywords: list = None, usernames: list = None,
+                      scope: str = "all") -> list:
+    from core.models import Task, TelegramUser
+    from django.db.models import Q
+
+    qs = Task.objects.filter(status__in=["open", "done"])
+
+    # ═══ Контекст поиска ═══
+    if scope == "user" and user_telegram_id:
+        db_user = await sync_to_async(
+            lambda: TelegramUser.objects.filter(telegram_id=user_telegram_id).first()
         )()
-        scored = [(sum(1 for w in words if w in t.title.lower()), t) for t in all_tasks if sum(1 for w in words if w in t.title.lower()) > 0]
-        scored.sort(key=lambda x: -x[0])
-        if scored:
-            return [t for _, t in scored]
-    return []
+        if db_user:
+            qs = qs.filter(assignees__user=db_user)
+    else:
+        effective_chat_id = await _resolve_chat_id(chat_id, user_telegram_id) if user_telegram_id else chat_id
+        qs = qs.filter(topic__chat__chat_id=effective_chat_id)
+
+    # ═══ По названию ═══
+    if title:
+        qs = qs.filter(Q(title__icontains=title) | Q(description__icontains=title))
+
+    # ═══ По ключевым словам ═══
+    if keywords:
+        kw_q = Q()
+        for kw in keywords:
+            kw_q |= Q(title__icontains=kw) | Q(description__icontains=kw)
+        qs = qs.filter(kw_q)
+
+    # ═══ По @username (ответственные или создатель) ═══
+    if usernames:
+        user_q = Q()
+        for uname in usernames:
+            clean = uname.lstrip("@").strip()
+            user_q |= Q(assignees__user__username__iexact=clean)
+            user_q |= Q(assignees__user__full_name__icontains=clean)
+            user_q |= Q(creator__username__iexact=clean)
+            user_q |= Q(creator__full_name__icontains=clean)
+        qs = qs.filter(user_q)
+
+    return await sync_to_async(lambda: list(
+        qs.select_related("creator", "topic__chat")
+          .prefetch_related("assignees__user", "subtasks__assignees")
+          .order_by("-id")[:10]
+    ))()
 
 
-async def _find_meetings(chat_id: int, title: str, user_telegram_id: int = 0) -> list:
-    from core.models import Meeting
-    effective_chat_id = await _resolve_chat_id(chat_id, user_telegram_id) if user_telegram_id else chat_id
-    meetings = await sync_to_async(
-        lambda: list(Meeting.objects.filter(
-            topic__chat__chat_id=effective_chat_id, status="active", title__icontains=title
-        ).select_related("creator").prefetch_related("participants").order_by("-id"))
-    )()
-    if meetings:
-        return meetings
-    words = [w.strip().lower() for w in title.split() if len(w.strip()) > 2]
-    if words:
-        all_m = await sync_to_async(
-            lambda: list(Meeting.objects.filter(
-                topic__chat__chat_id=effective_chat_id, status="active"
-            ).select_related("creator").prefetch_related("participants"))
+async def _find_meetings(chat_id: int, title: str, user_telegram_id: int = 0,
+                         keywords: list = None, usernames: list = None,
+                         scope: str = "all") -> list:
+    from core.models import Meeting, TelegramUser  # ← ИСПРАВЛЕНО: Meeting, не Task
+    from django.db.models import Q
+
+    qs = Meeting.objects.filter(status="active")  # ← ИСПРАВЛЕНО: Meeting, status="active"
+
+    # ═══ Контекст поиска ═══
+    if scope == "user" and user_telegram_id:
+        db_user = await sync_to_async(
+            lambda: TelegramUser.objects.filter(telegram_id=user_telegram_id).first()
         )()
-        scored = [(sum(1 for w in words if w in m.title.lower()), m) for m in all_m if sum(1 for w in words if w in m.title.lower()) > 0]
-        scored.sort(key=lambda x: -x[0])
-        if scored:
-            return [m for _, m in scored]
-    return []
+        if db_user:
+            qs = qs.filter(participants=db_user)  # ← ИСПРАВЛЕНО: без __user
+    else:
+        effective_chat_id = await _resolve_chat_id(chat_id, user_telegram_id) if user_telegram_id else chat_id
+        qs = qs.filter(topic__chat__chat_id=effective_chat_id)
+
+    # ═══ По названию ═══
+    if title:
+        qs = qs.filter(Q(title__icontains=title) | Q(description__icontains=title))
+
+    # ═══ По ключевым словам ═══
+    if keywords:
+        kw_q = Q()
+        for kw in keywords:
+            kw_q |= Q(title__icontains=kw) | Q(description__icontains=kw)
+        qs = qs.filter(kw_q)
+
+    # ═══ По @username (участники или создатель) ═══
+    if usernames:
+        user_q = Q()
+        for uname in usernames:
+            clean = uname.lstrip("@").strip()
+            # ← ИСПРАВЛЕНО: participants напрямую к TelegramUser, без __user
+            user_q |= Q(participants__username__iexact=clean)
+            user_q |= Q(participants__full_name__icontains=clean)
+            user_q |= Q(creator__username__iexact=clean)
+            user_q |= Q(creator__full_name__icontains=clean)
+        qs = qs.filter(user_q)
+
+    return await sync_to_async(lambda: list(
+        qs.select_related("creator", "topic__chat", "recurrence")
+          .prefetch_related("participants")
+          .order_by("start_at", "id")[:10]
+    ))()
 
 
 async def _find_last_task(chat_id: int, user_telegram_id: int = 0):
@@ -289,6 +341,58 @@ async def detect_intent(text: str) -> Optional[dict]:
         logger.error("NLP processor detect failed: %s", e)
         return None
 
+async def _show_search_results(bot, chat_id, tasks, meetings, query_text,
+                              thread_id=None, user_telegram_id=0):
+    """Показывает список найденных задач и встреч."""
+    from bot.keyboards.inline import task_keyboard as _task_kb
+    from bot.keyboards.inline import meeting_keyboard as _meeting_kb
+    from bot.handlers.meetings import _load_attendance_icons
+    from bot.handlers.comments import _get_comment_counts
+
+    if not tasks and not meetings:
+        await _send(bot, chat_id,
+                    f"🔍 По запросу «{query_text}» ничего не найдено.",
+                    thread_id=thread_id)
+        return
+
+    header_parts = []
+    if tasks:
+        w = "а" if len(tasks) == 1 else ("и" if len(tasks) < 5 else "")
+        header_parts.append(f"{len(tasks)} задач{w}")
+    if meetings:
+        w = "а" if len(meetings) == 1 else ("и" if len(meetings) < 5 else "")
+        header_parts.append(f"{len(meetings)} встреч{w}")
+
+    await _send(bot, chat_id,
+                f"🔍 Найдено: {', '.join(header_parts)}",
+                thread_id=thread_id)
+
+    # Задачи
+    if tasks:
+        task_ids = [t.id for t in tasks]
+        task_comment_counts = await _get_comment_counts(task_ids=task_ids)
+        for t in tasks:
+            has_rec = t.recurrence_group_id is not None
+            c_count = task_comment_counts.get(t.id, 0)
+            markup = _task_kb(t.id, has_recurrence=has_rec,
+                              comment_count=c_count,
+                              has_subtasks=bool(t.subtasks.all()))
+            await _send(bot, chat_id, _build_task_text(t), parse_mode="HTML",
+                        reply_markup=markup, thread_id=thread_id)
+
+    # Встречи
+    if meetings:
+        attendance_data = await _load_attendance_icons(meetings)
+        meeting_ids = [m.id for m in meetings]
+        meeting_comment_counts = await _get_comment_counts(meeting_ids=meeting_ids)
+        for m in meetings:
+            has_rec = bool(getattr(m, 'recurrence_id', None))
+            icons = attendance_data.get(m.id)
+            c_count = meeting_comment_counts.get(m.id, 0)
+            markup = _meeting_kb(m.id, has_recurrence=has_rec, comment_count=c_count)
+            await _send(bot, chat_id, _build_meeting_text(m, icons),
+                        parse_mode="HTML",
+                        reply_markup=markup, thread_id=thread_id)
 
 # ══════════════════════════════════════════════════════════════════
 #  ГЛАВНАЯ ТОЧКА ВХОДА
@@ -356,6 +460,36 @@ async def process_nlp_message_standalone(
 
     if intent == "show_summary":
         await _send(bot, chat_id, "ℹ️ Саммари пока доступно только через бота.", **kwargs)
+        return True
+
+    if intent == "search":
+        keywords = nlp_result.get("keywords", [])
+        usernames = nlp_result.get("usernames", [])
+        title = nlp_result.get("title", "")
+        scope = nlp_result.get("scope", "all")
+        
+        # В ЛС ищем по пользователю, в группе — по чату
+        search_scope = "user" if chat_id > 0 else "chat"  # chat_id > 0 = private
+        if scope != "all":
+            search_scope = scope
+        
+        tasks = await _find_tasks(chat_id, title, user_telegram_id,
+                                keywords=keywords, usernames=usernames,
+                                scope=search_scope) \
+                if scope in ("all", "tasks") else []
+        meetings = await _find_meetings(chat_id, title, user_telegram_id,
+                                        keywords=keywords, usernames=usernames,
+                                        scope=search_scope) \
+                if scope in ("all", "meetings") else []
+        
+        query_parts = keywords + [f"@{u}" for u in usernames]
+        if title:
+            query_parts.append(title)
+        query_text = " ".join(query_parts) or "всё"
+        
+        await _show_search_results(bot, chat_id, tasks, meetings, query_text,
+                                thread_id=message_thread_id, 
+                                user_telegram_id=user_telegram_id)
         return True
 
     return False
