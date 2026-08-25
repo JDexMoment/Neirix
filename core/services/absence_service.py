@@ -103,10 +103,10 @@ class AbsenceService:
 # ── Парсер дат для /away ─────────────────────────────────────
 def parse_absence_duration(text: str) -> Optional[datetime]:
     """
-    Парсит аргумент /away и возвращает дату окончания (23:59).
+    Парсит аргумент /away и возвращает дату окончания.
     Поддерживает:
       до 25.05 / до 25.05.2027 / до 2027-05-25
-      на 3 дня / на 2 недели / на неделю / на месяц
+      на 3 дня / на 2 недели / на неделю / на месяц / на 5 часов
     """
     import re
     text = (text or "").strip().lower()
@@ -146,7 +146,7 @@ def parse_absence_duration(text: str) -> Optional[datetime]:
             end_date.replace(hour=23, minute=59, second=0, microsecond=0), tz
         )
 
-    # ── "до завтра / послезавтра" ──
+    # ── Относительные периоды ──
     if "до послезавтра" in text:
         end_date = now + timedelta(days=2)
     elif "до завтра" in text:
@@ -162,13 +162,13 @@ def parse_absence_duration(text: str) -> Optional[datetime]:
     elif re.search(r"\bна\s+месяц", text):
         end_date = now + timedelta(days=30)
     elif re.search(r"\bна\s+(\d+)\s+час", text):
+        # ═══ ЧАСЫ: now уже aware → НЕ оборачиваем в make_aware ═══
         hours = int(re.search(r"\bна\s+(\d+)\s+час", text).group(1))
-        return timezone.make_aware(
-            (now + timedelta(hours=hours)).replace(second=0, microsecond=0), tz
-        )
+        return (now + timedelta(hours=hours)).replace(second=0, microsecond=0)
 
     if end_date is None:
         return None
 
+    # Дни/недели/месяц → конец дня (23:59)
     naive = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 0)
     return timezone.make_aware(naive, tz)

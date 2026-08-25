@@ -170,6 +170,7 @@ class Meeting(models.Model):
 
     title = models.CharField(max_length=300)
     topic = models.ForeignKey(Topic, on_delete=models.CASCADE)
+    description = models.TextField(blank=True, default="") 
     start_at = models.DateTimeField()
     participants = models.ManyToManyField(TelegramUser, blank=True)
 

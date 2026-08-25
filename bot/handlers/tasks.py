@@ -1101,11 +1101,20 @@ def _notify_task_changed(task, old_due=None, new_due=None, old_assign=None, new_
     send_task_changed_notification.delay(task.id, "\n".join(changes))
 
 def _format_assignees(task: Task) -> str:
-    from core.services.absence_service import get_absent_users_sync
     assignee_list = [a.user for a in task.assignees.all()]
     if not assignee_list:
         return "не назначен"
-    absent = {u.id for u in get_absent_users_sync(assignee_list)}
+
+    # ═══ Безопасная проверка недоступных пользователей ═══
+    absent = set()
+    try:
+        from core.services.absence_service import get_absent_users_sync
+        absent = {u.id for u in get_absent_users_sync(assignee_list)}
+    except Exception:
+        # Если не удалось проверить (моки, нет таблицы, ошибка БД) —
+        # просто не показываем иконку недоступности
+        pass
+
     parts = []
     for u in assignee_list:
         name = f"@{u.username}" if u.username else (u.full_name or f"id={u.id}")

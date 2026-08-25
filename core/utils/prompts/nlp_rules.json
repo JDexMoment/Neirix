@@ -33,8 +33,7 @@
     "Если пользователь говорит что он в отпуске/недоступен/болеет/офф («я в отпуске до 25.05», «я недоступен до пятницы», «уеду на неделю») — верни intent \"set_away\" и new_date (YYYY-MM-DD) — дату окончания. Если говорит что вернулся/доступен — intent \"away_cancel\".",
     "Если сообщение не связано с делами → unknown."
   ],
-
-  "response_format_version_1": {
+  "response_format": {
     "intent": "edit_task",
     "title": "название",
     "new_title": "новое название",
@@ -43,16 +42,12 @@
     "new_time": "18:00",
     "filter": "week",
     "username": "ivanov",
+    "keywords": ["ключевое", "слово"],
+    "usernames": ["username1", "username2"],
+    "scope": "all",
     "subtasks": [
       {"title": "подзадача 1", "assignees": ["@user"], "due_date": "YYYY-MM-DD"},
       {"title": "подзадача 2", "assignees": [], "due_date": null}
     ]
-  },
-  "response_format_version_2": { 
-    "intent": "search",
-    "title": "название для поиска",
-    "keywords": ["ключевое", "слово"],
-    "usernames": ["username1", "username2"],
-    "scope": "all"
   }
 }
