@@ -1099,3 +1099,17 @@ def _notify_task_changed(task, old_due=None, new_due=None, old_assign=None, new_
         return
     from celery_app.tasks.send_reminders import send_task_changed_notification
     send_task_changed_notification.delay(task.id, "\n".join(changes))
+
+def _format_assignees(task: Task) -> str:
+    from core.services.absence_service import get_absent_users_sync
+    assignee_list = [a.user for a in task.assignees.all()]
+    if not assignee_list:
+        return "не назначен"
+    absent = {u.id for u in get_absent_users_sync(assignee_list)}
+    parts = []
+    for u in assignee_list:
+        name = f"@{u.username}" if u.username else (u.full_name or f"id={u.id}")
+        if u.id in absent:
+            name += " 🚫"
+        parts.append(name)
+    return ", ".join(parts)

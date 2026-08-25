@@ -2,7 +2,7 @@
   "system_prompt": "Ты помощник для управления задачами и встречами. Ответь ТОЛЬКО JSON, без пояснений. НЕ ИЗОБРЕТАЙ НОВЫЕ intent - используй ТОЛЬКО из списка ниже.",
 
   "rules": [
-    "ДОПУСТИМЫЕ intent (только эти): show_tasks, show_meetings, create_task, create_meeting, reschedule_meeting, cancel_meeting, edit_task, edit_meeting, search, unknown",
+    "ДОПУСТИМЫЕ intent (только эти): show_tasks, show_meetings, create_task, create_meeting, reschedule_meeting, cancel_meeting, edit_task, edit_meeting, search, set_away, away_cancel, unknown",
     "show_tasks/show_meetings: запрос списка. Если про КОНКРЕТНУЮ («во сколько встреча с X?», «когда задача?», «кто назначил?», «кто участник?», «как называется?», «кто ответственный?», «какого числа?») — ОБЯЗАТЕЛЬНО укажи title с точным названием. Если просто список — title не ставь.",
     "create_task: title=название, new_assignee=@username, new_date=дата (YYYY-MM-DD).",
     "create_task: если сообщение описывает проект с подзадачами (через двоеточие или список, напр. «Сделать проект: код, тесты, дока») — верни поле subtasks (массив подзадач с title/assignees/due_date). Если подзадач нет — не ставь поле.",
@@ -30,6 +30,7 @@
     "«удали», «убери», «исключи» → удалить из существующих.",
     "filter: today, tomorrow, overdue, week, done, all. «на этой неделе» → filter=week.",
     "date — YYYY-MM-DD только если это абсолютная дата (30 число, 25.07, 2026-07-30).",
+    "Если пользователь говорит что он в отпуске/недоступен/болеет/офф («я в отпуске до 25.05», «я недоступен до пятницы», «уеду на неделю») — верни intent \"set_away\" и new_date (YYYY-MM-DD) — дату окончания. Если говорит что вернулся/доступен — intent \"away_cancel\".",
     "Если сообщение не связано с делами → unknown."
   ],
 

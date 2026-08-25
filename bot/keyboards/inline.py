@@ -301,6 +301,18 @@ def settings_main_keyboard():
         text="🔔 Напоминания о встречах: вкл/выкл",
         callback_data="settings_toggle_meeting",
     ))
+    builder.add(InlineKeyboardButton(
+        text="🌙 Тихие часы: вкл/выкл",
+        callback_data="settings_toggle_quiet",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="🕰 Границы тихих часов",
+        callback_data="settings_cycle_quiet_range",
+    ))
+    builder.add(InlineKeyboardButton(
+        text="📆 Пропуск выходных: вкл/выкл",
+        callback_data="settings_toggle_weekends",
+    ))
     builder.adjust(1)
     return builder.as_markup()
 
@@ -342,5 +354,38 @@ def meeting_attendance_status_keyboard(meeting_id: int):
     builder.add(InlineKeyboardButton(
         text="↩️ Назад к встрече",
         callback_data=f"meeting_back_single:{meeting_id}",
+    ))
+    return builder.as_markup()
+
+# ─────────────────────────────────────────────────────────────
+# Недоступность пользователей (отложенные назначения)
+# ─────────────────────────────────────────────────────────────
+def force_assign_keyboard(pending_id: int, kind: str):
+    """Кнопки «всё равно назначить/участвует» при недоступном пользователе."""
+    builder = InlineKeyboardBuilder()
+    if kind == "task":
+        builder.add(InlineKeyboardButton(
+            text="💪 Всё равно назначить",
+            callback_data=f"force_assign_task:{pending_id}",
+        ))
+    else:
+        builder.add(InlineKeyboardButton(
+            text="💪 Всё равно участвует",
+            callback_data=f"force_assign_meeting:{pending_id}",
+        ))
+    builder.add(InlineKeyboardButton(
+        text="↩️ Пропустить",
+        callback_data=f"force_assign_skip:{pending_id}",
+    ))
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def absence_cancel_keyboard(absence_id: int):
+    """Кнопка отмены недоступности в /away."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="✅ Я снова доступен",
+        callback_data=f"absence_cancel:{absence_id}",
     ))
     return builder.as_markup()

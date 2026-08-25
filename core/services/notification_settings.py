@@ -109,10 +109,54 @@ def format_settings_text(settings: UserNotificationSettings) -> str:
     meeting_time_str = format_meeting_reminder_minutes(settings.meeting_reminder_minutes)
     digest_time_str = format_digest_time(settings.digest_time)
 
+    quiet_status = "✅" if settings.quiet_hours_enabled else "❌"
+    quiet_range = f"{settings.quiet_start.strftime('%H:%M')}–{settings.quiet_end.strftime('%H:%M')}"
+    weekend_status = "✅" if settings.skip_weekends else "❌"
+
     return (
         f"⚙️ <b>Настройки уведомлений</b>\n\n"
         f"{meeting_status} Напоминания о встречах — {meeting_time_str}\n"
         f"{digest_status} Ежедневный дайджест — {digest_time_str}\n"
         f"{task_status} Напоминания о задачах\n\n"
         f"<i>Нажми на кнопку, чтобы изменить настройку</i>"
+        f"{quiet_status} Тихие часы — {quiet_range}\n"
+        f"{weekend_status} Пропуск выходных"
     )
+
+@sync_to_async
+def toggle_quiet_hours(user: TelegramUser) -> bool:
+    settings, _ = UserNotificationSettings.objects.get_or_create(user=user)
+    settings.quiet_hours_enabled = not settings.quiet_hours_enabled
+    settings.save(update_fields=["quiet_hours_enabled"])
+    return settings.quiet_hours_enabled
+
+
+_QUIET_PRESETS = [
+    (dtime(20, 0), dtime(8, 0)),
+    (dtime(22, 0), dtime(9, 0)),
+    (dtime(23, 0), dtime(7, 0)),
+    (dtime(21, 0), dtime(10, 0)),
+]
+
+
+@sync_to_async
+def cycle_quiet_hours(user: TelegramUser) -> tuple:
+    """Циклически переключает пресеты тихих часов."""
+    settings, _ = UserNotificationSettings.objects.get_or_create(user=user)
+    current = (settings.quiet_start, settings.quiet_end)
+    try:
+        idx = _QUIET_PRESETS.index(current)
+        next_idx = (idx + 1) % len(_QUIET_PRESETS)
+    except ValueError:
+        next_idx = 0
+    settings.quiet_start, settings.quiet_end = _QUIET_PRESETS[next_idx]
+    settings.save(update_fields=["quiet_start", "quiet_end"])
+    return settings.quiet_start, settings.quiet_end
+
+
+@sync_to_async
+def toggle_skip_weekends(user: TelegramUser) -> bool:
+    settings, _ = UserNotificationSettings.objects.get_or_create(user=user)
+    settings.skip_weekends = not settings.skip_weekends
+    settings.save(update_fields=["skip_weekends"])
+    return settings.skip_weekends

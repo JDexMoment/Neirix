@@ -211,6 +211,19 @@ class MeetingService:
                     except Exception:
                         logger.warning("Failed to create placeholder for %s", clean_name)
 
+            # ═══ Недоступные участники → отложенное назначение ═══
+            try:
+                from core.services.absence_service import AbsenceService
+                from core.models import PendingAssignment
+                absence_svc = AbsenceService()
+                absent_users = await absence_svc.filter_absent_assignees(participant_objects)
+                for absent_user in absent_users:
+                    await sync_to_async(PendingAssignment.objects.create)(
+                        kind="meeting", meeting=meeting, user=absent_user,
+                    )
+            except Exception as e:
+                logger.warning("Absence check failed: %s", e)
+
             # Проверка дубликата
             existing = await sync_to_async(self._check_duplicate_meeting)(
                 clean_title, start_at, topic, participant_objects,
@@ -238,7 +251,7 @@ class MeetingService:
                 for user in participant_objects:
                     await sync_to_async(meeting.participants.add)(user)
 
-                    # ════════════════════════════════════════════════════════════
+            # ════════════════════════════════════════════════════════════
             # Повторяющиеся встречи: если LLM вернула recurrence
             # ════════════════════════════════════════════════════════════
             recurrence_raw = meeting_data.get("recurrence")

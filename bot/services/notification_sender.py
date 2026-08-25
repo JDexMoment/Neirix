@@ -25,12 +25,47 @@ class NotificationSender:
         text: str,
         parse_mode: str = "HTML",
         message_thread_id: int | None = None,
+        reply_markup=None,
     ) -> bool:
         """
         Отправка сообщения в личку пользователю.
-        Если передан message_thread_id — в конкретную ветку диалога.
+        Учитывает политику доставки: тихие часы, выходные, недоступность.
         """
         if not user or not user.telegram_id:
+            return False
+
+        # ═══ Политика доставки ═══
+        from core.services.notification_policy import evaluate, Decision
+        try:
+            decision = await evaluate(user)
+        except Exception as e:
+            logger.warning("Notification policy check failed, sending anyway: %s", e)
+            decision = Decision.SEND
+
+        if decision == Decision.SKIP:
+            logger.info("Notification skipped (user absent) | user=%s", user.telegram_id)
+            return False
+
+        if decision == Decision.DEFER:
+            from core.services.notification_policy import next_delivery_time
+            eta = await next_delivery_time()
+            try:
+                from celery_app.tasks.deferred_notifications import send_deferred_notification
+                send_deferred_notification.apply_async(
+                    kwargs={
+                        "user_telegram_id": user.telegram_id,
+                        "text": text,
+                        "parse_mode": parse_mode,
+                        "message_thread_id": message_thread_id,
+                    },
+                    eta=eta,
+                )
+                logger.info(
+                    "Notification deferred | user=%s until=%s",
+                    user.telegram_id, eta,
+                )
+            except Exception as e:
+                logger.error("Failed to defer notification: %s", e)
             return False
 
         try:
@@ -39,17 +74,16 @@ class NotificationSender:
                 "text": text,
                 "parse_mode": parse_mode,
             }
-
             if message_thread_id is not None:
                 send_kwargs["message_thread_id"] = message_thread_id
-
+            if reply_markup is not None:
+                send_kwargs["reply_markup"] = reply_markup
             await self.bot.send_message(**send_kwargs)
             logger.info(
                 "Notification sent to user=%s thread=%s",
                 user.telegram_id, message_thread_id,
             )
             return True
-
         except TelegramForbiddenError:
             logger.warning("User %s blocked bot", user.telegram_id)
             return False

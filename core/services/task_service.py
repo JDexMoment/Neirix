@@ -216,6 +216,25 @@ class TaskService:
                 await sync_to_async(TaskAssignee.objects.create)(task=task, user=user)
 
             # ════════════════════════════════════════════════════════════
+            # Недоступные исполнители: предупреждение + отложенное назначение
+            # ════════════════════════════════════════════════════════════
+            try:
+                from core.services.absence_service import AbsenceService
+                from core.models import PendingAssignment
+                absence_svc = AbsenceService()
+                absent_users = await absence_svc.filter_absent_assignees(assignee_objects)
+                for absent_user in absent_users:
+                    await sync_to_async(PendingAssignment.objects.create)(
+                        kind="task", task=task, user=absent_user,
+                    )
+                    logger.info(
+                        "Assignee absent, pending created | task_id=%s user=%s",
+                        task.id, absent_user,
+                    )
+            except Exception as e:
+                logger.warning("Absence check failed: %s", e)
+
+            # ════════════════════════════════════════════════════════════
             # Подзадачи (переданы явно, напр. для проекта)
             # ════════════════════════════════════════════════════════════
             subtasks_data = task_data.get("subtasks")

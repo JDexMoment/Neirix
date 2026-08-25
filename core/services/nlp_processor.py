@@ -433,6 +433,40 @@ async def process_nlp_message_standalone(
             await _show_meetings_list(bot, chat_id, text, **user_kwargs)
         return True
 
+    if intent == "set_away":
+        from core.services.absence_service import AbsenceService
+        from core.models import TelegramUser
+        date_str = nlp_result.get("new_date", "")
+        if not date_str:
+            await _send(bot, chat_id, "Укажите дату окончания, например: «до 25.05».", **kwargs)
+            return True
+        try:
+            end_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=23, minute=59)
+            end_dt = timezone.make_aware(end_dt, timezone.get_current_timezone())
+        except ValueError:
+            await _send(bot, chat_id, "Не удалось распознать дату.", **kwargs)
+            return True
+        db_user = await sync_to_async(
+            lambda: TelegramUser.objects.filter(telegram_id=user_telegram_id).first()
+        )()
+        if db_user:
+            await AbsenceService().create_absence(db_user, timezone.now(), end_dt)
+            await _send(bot, chat_id,
+                f"🚫 Вы недоступны до {end_dt.strftime('%d.%m.%Y')}. /back — вернуться.",
+                **kwargs)
+        return True
+
+    if intent == "away_cancel":
+        from core.services.absence_service import AbsenceService
+        from core.models import TelegramUser
+        db_user = await sync_to_async(
+            lambda: TelegramUser.objects.filter(telegram_id=user_telegram_id).first()
+        )()
+        if db_user:
+            await AbsenceService().cancel_all_active(db_user)
+        await _send(bot, chat_id, "✅ Вы снова доступны!", **kwargs)
+        return True
+
     if intent == "create_task":
         await _handle_create_task(bot, chat_id, user_telegram_id, text, db_message_id, telegram_msg_id, nlp_result, **kwargs)
         return True

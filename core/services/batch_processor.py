@@ -96,6 +96,11 @@ class BatchProcessor:
                         if task:
                             tasks_created += 1
                             logger.info("Task created | id=%s title=%s", task.id, task.title)
+                            # ═══ Предупреждение о недоступных исполнителях ═══
+                            try:
+                                await self._notify_absent_assignees(task, source_message)
+                            except Exception as e:
+                                logger.warning("Absent warning failed: %s", e)
                             # Проверяем, нужен ли исполнитель
                             assignee_count = await sync_to_async(
                                 lambda: task.assignees.count()
@@ -192,3 +197,42 @@ class BatchProcessor:
                 await sync_to_async(self.vector_client.upsert_message)(msg.id, emb, payload)
             except Exception as e:
                 logger.error("Qdrant upsert failed msg=%s: %s", msg.id, e)
+
+    async def _notify_absent_assignees(self, task, source_message):
+        """Шлёт создателю предупреждение о недоступных исполнителях с кнопкой."""
+        from core.models import PendingAssignment
+        from bot.keyboards.inline import force_assign_keyboard
+        from core.services.absence_service import format_absence
+        from django.conf import settings
+        from aiogram import Bot
+
+        pendings = await sync_to_async(lambda: list(
+            PendingAssignment.objects.filter(task=task).select_related("user")
+        ))()
+        if not pendings:
+            return
+
+        creator = task.creator
+        if not creator or not creator.telegram_id:
+            return
+
+        bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+        try:
+            for p in pendings:
+                absence_text = format_absence(
+                    await sync_to_async(lambda p=p: p.user.absences.order_by("-end").first())()
+                ) if False else ""
+                # Проще — получить актуальную недоступность
+                from core.services.absence_service import AbsenceService
+                absence = await AbsenceService().is_absent(p.user)
+                abs_str = format_absence(absence) if absence else "недоступен"
+
+                await bot.send_message(
+                    creator.telegram_id,
+                    f"⚠️ @{p.user.username or p.user.full_name} {abs_str}.\n"
+                    f"Задача «{task.title}» создана без него.\n"
+                    f"Назначить всё равно?",
+                    reply_markup=force_assign_keyboard(p.id, "task"),
+                )
+        finally:
+            await bot.session.close()

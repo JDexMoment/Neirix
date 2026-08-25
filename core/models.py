@@ -349,6 +349,19 @@ class UserNotificationSettings(models.Model):
         null=True, blank=True, default=dtime(9, 0),
         verbose_name="Время дайджеста",
     )
+        # ── Тихие часы ──
+    quiet_hours_enabled = models.BooleanField(
+        default=True, verbose_name="Тихие часы включены",
+    )
+    quiet_start = models.TimeField(
+        default=dtime(20, 0), verbose_name="Начало тихих часов",
+    )
+    quiet_end = models.TimeField(
+        default=dtime(8, 0), verbose_name="Конец тихих часов",
+    )
+    skip_weekends = models.BooleanField(
+        default=True, verbose_name="Не беспокоить в выходные",
+    )
     digest_enabled = models.BooleanField(default=True, verbose_name="Дайджест включён")
     task_reminder_enabled = models.BooleanField(default=True, verbose_name="Напоминания о задачах")
     meeting_reminder_enabled = models.BooleanField(default=True, verbose_name="Напоминания о встречах")
@@ -456,3 +469,59 @@ class SubTask(models.Model):
 
     def __str__(self):
         return f"🔹 {self.title} ({self.get_status_display()})"
+
+
+class UserAbsence(models.Model):
+    """Период недоступности пользователя (отпуск, больничный, офф).
+    Разрешено несколько пересекающихся записей."""
+    user = models.ForeignKey(
+        TelegramUser, on_delete=models.CASCADE,
+        related_name="absences", verbose_name="Пользователь",
+    )
+    start = models.DateTimeField(verbose_name="Начало недоступности")
+    end = models.DateTimeField(verbose_name="Конец недоступности")
+    reason = models.CharField(
+        max_length=255, blank=True, default="", verbose_name="Причина",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Недоступность пользователя"
+        verbose_name_plural = "Недоступности пользователей"
+        indexes = [
+            models.Index(fields=["user", "start", "end"]),
+            models.Index(fields=["end"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} недоступен до {self.end:%d.%m.%Y}"
+
+
+class PendingAssignment(models.Model):
+    """Отложенное назначение: пользователь был недоступен при создании
+    задачи/встречи. Ждёт кнопки «Всё равно назначить».
+    """
+    KIND_CHOICES = [("task", "Задача"), ("meeting", "Встреча")]
+
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES)
+    task = models.ForeignKey(
+        "Task", null=True, blank=True,
+        on_delete=models.CASCADE, related_name="pending_assignments",
+    )
+    meeting = models.ForeignKey(
+        "Meeting", null=True, blank=True,
+        on_delete=models.CASCADE, related_name="pending_assignments",
+    )
+    user = models.ForeignKey(
+        TelegramUser, on_delete=models.CASCADE,
+        related_name="pending_assignments",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Отложенное назначение"
+        verbose_name_plural = "Отложенные назначения"
+
+    def __str__(self):
+        target = self.task.title if self.task else (self.meeting.title if self.meeting else "?")
+        return f"{self.kind}: {target} → {self.user}"
